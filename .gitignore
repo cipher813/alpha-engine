@@ -45,3 +45,8 @@ PROJECT_PLAN.md
 alpha-engine-design-*.md
 alpha-engine-tasks-*.md
 CLAUDE.md
+
+# Gitleaks config (symlink to shared config)
+.gitleaks.toml
+
+.gitleaksbaseline.json
