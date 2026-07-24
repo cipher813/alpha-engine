@@ -17,4 +17,4 @@ permissions:
 
 jobs:
   gate-label-guard:
-    uses: nousergon/nousergon-lib/.github/workflows/gate-label-guard.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/gate-label-guard.yml@v1
