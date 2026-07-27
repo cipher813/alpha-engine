@@ -11,6 +11,7 @@ IB Gateway must be running locally on port 4002 in paper mode.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from datetime import datetime
@@ -21,15 +22,34 @@ from executor.retry import retry
 
 logger = logging.getLogger(__name__)
 
+ACCOUNT_SUMMARY_TIMEOUT_SECONDS = 30.0
+"""Bounded wait for the one-shot ``reqAccountSummary`` handshake.
+
+IB answers a healthy request in ~250 ms, so 30 s is two orders of
+magnitude of headroom — long enough that a merely slow gateway is never
+mistaken for a stalled one, short enough that all
+``ACCOUNT_SUMMARY_ATTEMPTS`` attempts plus backoff finish well inside the
+morning planner's 600 s SSM ``executionTimeout``."""
+
+ACCOUNT_SUMMARY_ATTEMPTS = 3
+"""Attempts before the stall is raised as a hard failure.
+
+Each retry reconnects first, which is what actually clears the condition:
+the stalled subscription is registered against this clientId on the
+gateway, so a fresh request on the same socket inherits the stall."""
+
 
 class IBKRClient:
-    def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 1,
-                 reconnect_attempts: int = 3):
+    def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 1, reconnect_attempts: int = 3):
         self.ib = IB()
         self._host = host
         self._port = port
         self._client_id = client_id
         self._reconnect_attempts = reconnect_attempts
+        # Cleared on every (re)connect — ib_insync drops its cached
+        # wrapper.acctSummary on disconnect, so a reconnected client must
+        # re-issue the request rather than trust a stale prime.
+        self._account_summary_primed = False
         logger.info(f"Connecting to IB Gateway at {host}:{port} (clientId={client_id})")
         self._connect()
         logger.info("Connected to IB Gateway")
@@ -55,26 +75,99 @@ class IBKRClient:
         Raises loud after all attempts are exhausted — a genuinely-down gateway
         must still surface (no silent degrade).
         """
-        @retry(max_attempts=self._reconnect_attempts, retryable=(Exception,),
-               label="ibkr_connect")
+
+        @retry(max_attempts=self._reconnect_attempts, retryable=(Exception,), label="ibkr_connect")
         def _attempt() -> None:
             if self.ib.isConnected():
                 return
             # idempotent on a fresh/clean IB object; clears half-open state
             # left by a timed-out handshake so the reconnect's clientId is free
             self.ib.disconnect()
-            self.ib.connect(self._host, self._port,
-                            clientId=self._client_id, timeout=20)
+            self.ib.connect(self._host, self._port, clientId=self._client_id, timeout=20)
             if not self.ib.isConnected():
                 raise RuntimeError("IB Gateway connect returned but isConnected() is False")
 
         _attempt()
+        # A new socket means a new (empty) wrapper cache on the gateway side.
+        self._account_summary_primed = False
 
     # ── Account ───────────────────────────────────────────────────────────────
+
+    def _prime_account_summary(self) -> None:
+        """Issue the one-shot ``reqAccountSummary`` under a bounded wait.
+
+        ``ib_insync``'s ``IB.accountSummary()`` lazily issues
+        ``reqAccountSummary`` on first use and awaits ``accountSummaryEnd``
+        with **no timeout** (``reqAccountSummaryAsync`` is a bare
+        ``await future``). When IB Gateway accepts the connection and
+        streams positions/portfolio normally but never answers the
+        account-summary request, that await blocks forever while the event
+        loop keeps dispatching ``updatePortfolio`` callbacks — no error, no
+        log line, no progress.
+
+        Live consequence (2026-07-24 and 2026-07-27): the morning planner
+        connected, logged "Connected to IB Gateway", and then emitted
+        nothing but ``updatePortfolio`` until SSM killed it at the 600 s
+        ``executionTimeout``. ``ne-preopen-trading-pipeline`` failed at
+        ``MorningPlannerPollTimeout`` both days, so no order book was
+        written and the daemon never started — a full lost trading day
+        each time, from a call whose healthy latency is ~250 ms.
+
+        This is the same failure class ``_connect`` already guards for the
+        2026-06-05 ``reqExecutions`` mid-handshake stall; the guard simply
+        did not extend to the first call *after* the handshake. Bounding it
+        here converts an indefinite silent hang into a fast, loud,
+        retryable failure, and the reconnect between attempts is what
+        clears the stalled subscription (it is registered against this
+        clientId on the gateway, so retrying on the same socket inherits
+        the stall).
+
+        Raises ``RuntimeError`` after ``ACCOUNT_SUMMARY_ATTEMPTS`` — a
+        gateway that cannot answer an account-summary request must surface
+        loudly. NAV is load-bearing for position sizing and the drawdown
+        circuit breaker, so degrading to a stale or assumed NAV would risk
+        sizing real orders off a wrong number.
+        """
+        if self._account_summary_primed:
+            return
+
+        for attempt in range(1, ACCOUNT_SUMMARY_ATTEMPTS + 1):
+            try:
+                self.ib.run(
+                    asyncio.wait_for(
+                        self.ib.reqAccountSummaryAsync(),
+                        ACCOUNT_SUMMARY_TIMEOUT_SECONDS,
+                    )
+                )
+            except TimeoutError:  # asyncio.TimeoutError is this alias on 3.11+
+                logger.warning(
+                    "[ibkr] reqAccountSummary stalled >%.0fs (attempt %d/%d) — "
+                    "gateway accepted the connection but never sent "
+                    "accountSummaryEnd; reconnecting to clear the subscription",
+                    ACCOUNT_SUMMARY_TIMEOUT_SECONDS,
+                    attempt,
+                    ACCOUNT_SUMMARY_ATTEMPTS,
+                )
+                if attempt == ACCOUNT_SUMMARY_ATTEMPTS:
+                    raise RuntimeError(
+                        f"IB Gateway account summary stalled on all "
+                        f"{ACCOUNT_SUMMARY_ATTEMPTS} attempts "
+                        f"({ACCOUNT_SUMMARY_TIMEOUT_SECONDS:.0f}s each). The "
+                        f"gateway is connected but not answering "
+                        f"reqAccountSummary — restart IB Gateway before "
+                        f"rerunning."
+                    ) from None
+                # Drop the socket so the retry gets a clean subscription.
+                self.ib.disconnect()
+                self._connect()
+            else:
+                self._account_summary_primed = True
+                return
 
     def get_portfolio_nav(self) -> float:
         """Return current Net Liquidation Value from account summary."""
         self.ensure_connected()
+        self._prime_account_summary()
         summary = {s.tag: s for s in self.ib.accountSummary()}
         nav = float(summary["NetLiquidation"].value)
         logger.info(f"Portfolio NAV: ${nav:,.2f}")
@@ -87,6 +180,7 @@ class IBKRClient:
         accrued interest, etc. Use these as the basis for EOD metrics.
         """
         self.ensure_connected()
+        self._prime_account_summary()
         summary = {s.tag: s for s in self.ib.accountSummary()}
 
         def _float(tag: str) -> float | None:
@@ -207,8 +301,7 @@ class IBKRClient:
 
         if price is None:
             logger.warning(
-                f"No valid price for {ticker} after {waited:.1f}s "
-                f"(last={ticker_data.last} close={ticker_data.close})"
+                f"No valid price for {ticker} after {waited:.1f}s (last={ticker_data.last} close={ticker_data.close})"
             )
             return None
 
@@ -360,10 +453,10 @@ class IBKRClient:
 
         bar = bars[-1]
         return {
-            "open":  float(bar.open),
+            "open": float(bar.open),
             "close": float(bar.close),
-            "high":  float(bar.high),
-            "low":   float(bar.low),
+            "high": float(bar.high),
+            "low": float(bar.low),
         }
 
     # ── Peak NAV ──────────────────────────────────────────────────────────────
@@ -374,9 +467,7 @@ class IBKRClient:
         Used for drawdown circuit breaker.
         Falls back to current NAV if no history.
         """
-        row = db_conn.execute(
-            "SELECT MAX(portfolio_nav_at_order) FROM trades"
-        ).fetchone()
+        row = db_conn.execute("SELECT MAX(portfolio_nav_at_order) FROM trades").fetchone()
         if row and row[0]:
             return float(row[0])
         return self.get_portfolio_nav()
@@ -466,7 +557,7 @@ class SimulatedIBKRClient:
     """
 
     def __init__(self, prices: dict[str, float], nav: float = 1_000_000.0):
-        self._prices = prices      # {ticker: price} — swapped per date by backtester
+        self._prices = prices  # {ticker: price} — swapped per date by backtester
         self._cash = nav
         self._positions: dict = {}
         self._simulation_date: str | None = None  # set by backtester before each iteration
@@ -474,8 +565,7 @@ class SimulatedIBKRClient:
 
     def get_portfolio_nav(self) -> float:
         mtm = sum(
-            pos["shares"] * self._prices.get(ticker, pos.get("avg_cost", 0))
-            for ticker, pos in self._positions.items()
+            pos["shares"] * self._prices.get(ticker, pos.get("avg_cost", 0)) for ticker, pos in self._positions.items()
         )
         nav = self._cash + mtm
         self._peak_nav = max(self._peak_nav, nav)
