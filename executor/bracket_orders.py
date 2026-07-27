@@ -63,7 +63,9 @@ def place_bracket_with_stop(
 
     trail_amount = round(atr_value * atr_multiple, 2)
     if trail_amount <= 0:
-        logger.warning(f"Trail amount <= 0 for {ticker} (ATR={atr_value}, mult={atr_multiple}) — placing plain market order")
+        logger.warning(
+            f"Trail amount <= 0 for {ticker} (ATR={atr_value}, mult={atr_multiple}) — placing plain market order"
+        )
         result = ib_client.place_market_order(ticker, "BUY", quantity, timeout_seconds)
         return {**result, "stop_order_id": None, "trail_amount": None}
 
@@ -99,10 +101,7 @@ def place_bracket_with_stop(
         total_cost = sum(f.execution.shares * f.execution.price for f in buy_trade.fills)
         fill_price = round(total_cost / total_qty, 4) if total_qty > 0 else None
         filled_shares = int(total_qty)
-        fill_time = (
-            buy_trade.fills[-1].execution.time.isoformat()
-            if buy_trade.fills[-1].execution.time else None
-        )
+        fill_time = buy_trade.fills[-1].execution.time.isoformat() if buy_trade.fills[-1].execution.time else None
 
     # Normalize status
     if status == "Filled":
@@ -125,18 +124,31 @@ def place_bracket_with_stop(
         stop.orderType = "TRAIL"
         stop.totalQuantity = filled_shares
         stop.auxPrice = trail_amount
+        # Same explicit routing fields as the BUY leg above and
+        # ibkr.py:place_market_order — without them the paper-account order
+        # preset reinterprets the order and cancels it with Error 10349
+        # ("Order TIF was set to DAY based on order preset") before
+        # re-submitting. Observed live 2026-07-27 16:17:21Z on the AMD
+        # trailing stop: Cancelled → PreSubmitted in the same millisecond.
+        # The stop survived that round trip, but a cancel is a cancel — the
+        # protective stop is briefly absent, and the daemon's own order-state
+        # tracking sees a Cancelled it did not ask for.
+        #
+        # NOT a behavior change: the preset was already forcing TIF=DAY, so
+        # the stop's effective lifetime is unchanged. Whether a protective
+        # trailing stop SHOULD be GTC rather than DAY is a separate strategy
+        # question, deliberately out of scope here.
+        stop.tif = "DAY"
+        stop.outsideRth = False
+        stop.transmit = True
 
         ib.placeOrder(contract, stop)
         stop_order_id = stop.orderId
         logger.info(
-            f"Trailing stop placed: SELL {filled_shares} {ticker} "
-            f"trail=${trail_amount:.2f} | orderId={stop_order_id}"
+            f"Trailing stop placed: SELL {filled_shares} {ticker} trail=${trail_amount:.2f} | orderId={stop_order_id}"
         )
 
-    logger.info(
-        f"BUY {result_status}: {quantity} {ticker} "
-        f"| fill_price={fill_price} trail=${trail_amount:.2f}"
-    )
+    logger.info(f"BUY {result_status}: {quantity} {ticker} | fill_price={fill_price} trail=${trail_amount:.2f}")
 
     return {
         "ib_order_id": buy_order.orderId,

@@ -83,8 +83,12 @@ def test_bracket_with_stop_filled_places_trailing_stop():
     client = _ib_client(ib)
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="AAPL", quantity=100,
-        atr_value=2.50, atr_multiple=2.0, timeout_seconds=10,
+        ib_client=client,
+        ticker="AAPL",
+        quantity=100,
+        atr_value=2.50,
+        atr_multiple=2.0,
+        timeout_seconds=10,
     )
 
     assert result["status"] == "Filled"
@@ -100,17 +104,22 @@ def test_bracket_with_stop_filled_places_trailing_stop():
 def test_bracket_zero_trail_falls_back_to_market_order():
     ib = _make_ib()
     client = _ib_client(ib)
-    client.place_market_order = MagicMock(return_value={
-        "ib_order_id": 99,
-        "status": "Filled",
-        "fill_price": 100.0,
-        "filled_shares": 50,
-        "fill_time": "2026-04-15T14:30:00",
-    })
+    client.place_market_order = MagicMock(
+        return_value={
+            "ib_order_id": 99,
+            "status": "Filled",
+            "fill_price": 100.0,
+            "filled_shares": 50,
+            "fill_time": "2026-04-15T14:30:00",
+        }
+    )
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="AAPL", quantity=50,
-        atr_value=0.0, atr_multiple=2.0,
+        ib_client=client,
+        ticker="AAPL",
+        quantity=50,
+        atr_value=0.0,
+        atr_multiple=2.0,
     )
 
     assert result["stop_order_id"] is None
@@ -124,7 +133,9 @@ def test_bracket_qualify_failure_returns_rejected():
     client = _ib_client(ib, qualify_raises=True)
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="XYZ", quantity=100,
+        ib_client=client,
+        ticker="XYZ",
+        quantity=100,
         atr_value=1.0,
     )
 
@@ -139,7 +150,9 @@ def test_bracket_cancelled_status_normalized_to_rejected():
     client = _ib_client(ib)
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="AAPL", quantity=100,
+        ib_client=client,
+        ticker="AAPL",
+        quantity=100,
         atr_value=2.0,
     )
 
@@ -166,8 +179,11 @@ def test_bracket_partial_fill_returned_as_partial():
     client = _ib_client(ib)
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="AAPL", quantity=100,
-        atr_value=2.0, timeout_seconds=1.5,
+        ib_client=client,
+        ticker="AAPL",
+        quantity=100,
+        atr_value=2.0,
+        timeout_seconds=1.5,
     )
 
     assert result["status"] == "PartialFill"
@@ -191,8 +207,11 @@ def test_bracket_timeout_returns_timeout_status():
     client = _ib_client(ib)
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="AAPL", quantity=100,
-        atr_value=2.0, timeout_seconds=2.0,
+        ib_client=client,
+        ticker="AAPL",
+        quantity=100,
+        atr_value=2.0,
+        timeout_seconds=2.0,
     )
 
     assert result["status"] == "Timeout"
@@ -209,8 +228,11 @@ def test_bracket_fill_price_rounded_to_4dp():
     client = _ib_client(ib)
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="AAPL", quantity=1,
-        atr_value=1.0, atr_multiple=2.0,
+        ib_client=client,
+        ticker="AAPL",
+        quantity=1,
+        atr_value=1.0,
+        atr_multiple=2.0,
     )
 
     assert result["fill_price"] == 100.1235  # rounded to 4dp
@@ -228,10 +250,44 @@ def test_bracket_no_fills_when_status_filled_has_zero_total_qty():
     client = _ib_client(ib)
 
     result = place_bracket_with_stop(
-        ib_client=client, ticker="AAPL", quantity=100,
+        ib_client=client,
+        ticker="AAPL",
+        quantity=100,
         atr_value=1.0,
     )
 
     assert result["fill_price"] is None
     # filled_shares = int(0) = 0 → falsy → no stop placed
     assert result["stop_order_id"] is None
+
+
+def test_trailing_stop_carries_explicit_routing_fields():
+    """The TRAIL stop must set tif/outsideRth/transmit like every other
+    order this repo places.
+
+    Regression for 2026-07-27 16:17:21Z: the AMD trailing stop went
+    Cancelled -> PreSubmitted in the same millisecond with Error 10349
+    ("Order TIF was set to DAY based on order preset"). The paper-account
+    preset reinterprets an order that leaves these fields unset. The BUY leg
+    and ibkr.py:place_market_order already set them; the stop was the one
+    placement site that did not, leaving the protective stop momentarily
+    cancelled and surfacing a Cancelled the daemon never requested.
+    """
+    fill_time = datetime(2026, 4, 15, 14, 30, 0)
+    ib = _make_ib(buy_status="Filled", fills=[_FakeFill(100, 100.50, fill_time)])
+    client = _ib_client(ib)
+
+    place_bracket_with_stop(
+        ib_client=client,
+        ticker="AAPL",
+        quantity=100,
+        atr_value=2.50,
+        atr_multiple=2.0,
+        timeout_seconds=10,
+    )
+
+    stop = ib.placeOrder.call_args_list[-1][0][1]
+    assert stop.orderType == "TRAIL"
+    assert stop.tif == "DAY"
+    assert stop.outsideRth is False
+    assert stop.transmit is True
