@@ -521,30 +521,43 @@ fi
 # in /var/log/boot-pull.log are the fallback signal, and we still exit 1.
 if [ "$PULL_FAILURES" -gt 0 ]; then
     log "=== boot-pull completed with $PULL_FAILURES failure(s): ${FAILED_REPOS[*]} ==="
-    FD_VENV="/home/ec2-user/alpha-engine/.venv/bin/python"
-    FD_CFG="/home/ec2-user/alpha-engine/flow-doctor.yaml"
-    if [ -x "$FD_VENV" ] && [ -f "$FD_CFG" ]; then
-        "$FD_VENV" - <<PYEOF 2>> "$LOG" || true
-import os
-import sys
-sys.path.insert(0, "/home/ec2-user/alpha-engine")
-try:
-    from nousergon_lib.secrets import get_secret
-    for _name in ("EMAIL_SENDER", "EMAIL_RECIPIENTS", "GMAIL_APP_PASSWORD", "FLOW_DOCTOR_GITHUB_TOKEN"):
-        _val = get_secret(_name, required=False)
-        if _val is not None and _name not in os.environ:
-            os.environ[_name] = _val
-    import flow_doctor
-    fd = flow_doctor.init(config_path="/home/ec2-user/alpha-engine/flow-doctor.yaml")
-    fd.report(
-        RuntimeError("boot-pull failed: ${FAILED_REPOS[*]}"),
-        severity="error",
-        context={"site": "boot-pull", "host": "trading", "failures": "${FAILED_REPOS[*]}"},
-    )
-except Exception as e:
-    print(f"[boot-pull] flow-doctor report failed: {e}", file=sys.stderr)
-PYEOF
+
+    # This used to construct flow-doctor by hand in a heredoc. It had been
+    # BROKEN for an unknown length of time and nobody knew, because the thing
+    # that was broken was the failure reporter itself
+    # (alpha-engine-config-I4509). Two independent faults, either one fatal:
+    #
+    #   1. `flow_doctor.init()` does not exist. flow-doctor 0.8.7 exports
+    #      FlowDoctor/FlowDoctorBuilder and no `init`; the call raised
+    #      AttributeError every time, leaving one stderr line in a log nobody
+    #      reads.
+    #   2. The env hydration was incomplete anyway — flow-doctor.yaml
+    #      references more ${VAR}s than the heredoc hydrated, so even with the
+    #      API call fixed, construction fails with ConfigError.
+    #
+    # This matters more here than on the dashboard box: THIS is the trading
+    # box, boot-pull is what guarantees it runs current code on a trading day,
+    # and it runs once at boot on an instance that only exists during the
+    # trading window — so a failure has a one-day blast radius and then the
+    # evidence disappears with the instance. It was observed failing for 3+
+    # days straight with zero signal.
+    #
+    # `krepis.alerts` is the canonical alert CLI (config#1649) and resolves its
+    # own secrets, so there is no hydration list here to drift.
+    ALERT_PY="/home/ec2-user/alpha-engine/.venv/bin/python"
+    if [ -x "$ALERT_PY" ]; then
+        _dkey="boot-pull-trading-$(printf '%s' "${FAILED_REPOS[*]}" | tr ' /' '__' | cut -c1-72)"
+        "$ALERT_PY" -m krepis.alerts publish \
+            --message "boot-pull FAILED on the TRADING box: ${PULL_FAILURES} repo(s) could not be updated — ${FAILED_REPOS[*]}. The executor may be running stale code for today's session. See /var/log/boot-pull.log." \
+            --severity error \
+            --source boot-pull \
+            --dedup-key "$_dkey" \
+            --dedup-window-min 1440 \
+            || log "ALERT PUBLISH FAILED — boot-pull failure is UNREPORTED"
+    else
+        log "ALERT PUBLISH SKIPPED — $ALERT_PY missing; boot-pull failure is UNREPORTED"
     fi
+
     log "=== boot-pull complete (with failures) ==="
     exit 1
 fi
