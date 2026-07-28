@@ -88,7 +88,7 @@ jsonschema-specifications==2025.9.1
     # via jsonschema
 korean-lunar-calendar==0.4.0
     # via exchange-calendars
-krepis==0.16.2
+krepis==0.18.8
     # via
     #   -r requirements.in
     #   nousergon-lib
