@@ -134,6 +134,21 @@ for repo in "${REPOS[@]}"; do
     if [ "$CURRENT_BRANCH" != "main" ]; then
         log "NOTE $repo — on branch '$CURRENT_BRANCH', will reset to origin/main (policy: boot always tracks main)"
     fi
+
+    # Fix stale remote URL (post-org-transfer: cipher813/alpha-engine-config →
+    # nousergon/alpha-engine-config). Only the config repo was cloned pre-transfer
+    # and carries the old path; sibling repos point at nousergon/ directly.
+    if [ "$repo" = "/home/ec2-user/alpha-engine-config" ]; then
+        _CURRENT_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+        _EXPECTED_URL="https://github.com/nousergon/alpha-engine-config.git"
+        if [ -n "$_CURRENT_URL" ] && [ "$_CURRENT_URL" != "$_EXPECTED_URL" ]; then
+            log "FIX $repo — remote.origin.url corrected: $_CURRENT_URL -> $_EXPECTED_URL"
+            git remote set-url origin "$_EXPECTED_URL" >> "$LOG" 2>&1 \
+                || log "WARN $repo — remote set-url failed"
+        fi
+        unset _CURRENT_URL _EXPECTED_URL
+    fi
+
     # Serialize the index-mutating git ops behind the shared flock (config#1944)
     # so this boot-pull can't race the weekday CodeFreshnessGate /
     # ChronicGapSelfHeal on .git/index.lock. flock holds the lock for the whole
@@ -141,26 +156,54 @@ for repo in "${REPOS[@]}"; do
     # timeout (fail-loud -> else branch below). The ownership reclaim above runs
     # OUTSIDE the lock deliberately (it is not a git-index op; a test pins that
     # the reclaim still precedes the reset).
-    if flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c 'git fetch origin && git checkout -f main && git reset --hard origin/main' >> "$LOG" 2>&1; then
-        NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
-        log "OK   $repo — $(git log --oneline -1)"
+    #
+    # config-I4997: fetch ONLY the main branch (git fetch origin main), not all
+    # refs (the default). The default refspec (+refs/heads/*:refs/remotes/origin/*)
+    # fetches every branch — when hundreds of stale groom/dependabot branches hit a
+    # compare-and-swap failure on an unrelated ref, the entire fetch exits non-zero
+    # and the && chain short-circuits before checkout -f main / reset --hard
+    # origin/main ever run. The self-heal (reset to origin/main) and the stale-code
+    # guard (the subsequent post-condition check) are BOTH suppressed by a failure
+    # mode that has nothing to do with main being stale. CodeFreshnessGate already
+    # uses this scoped fetch pattern (git fetch --quiet origin main); boot-pull now
+    # matches it.
+    #
+    # Gate on the POST-CONDITION, not on git fetch's exit code: after the sync,
+    # assert branch == main && HEAD == origin/main. PULL_FAILURES++ only if the
+    # assertion fails — a fetch that exits 0 but somehow leaves the checkout in an
+    # unexpected state is still caught; a fetch that exits non-zero on an unrelated
+    # CAS but fetched main successfully is no longer a false failure.
+    if flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c 'git fetch origin main --prune && git checkout -f main && git reset --hard origin/main' >> "$LOG" 2>&1; then
+        # Post-condition: verify the checkout is on main at origin/main.
+        _HEAD_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        _HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+        _ORIGIN_MAIN_SHA=$(git rev-parse origin/main 2>/dev/null || echo "")
+        if [ "$_HEAD_BRANCH" != "main" ] || [ "$_HEAD_SHA" != "$_ORIGIN_MAIN_SHA" ]; then
+            log "FAIL $repo — post-condition failed: branch=$_HEAD_BRANCH HEAD=$_HEAD_SHA origin/main=$_ORIGIN_MAIN_SHA"
+            PULL_FAILURES=$((PULL_FAILURES + 1))
+            FAILED_REPOS+=("$repo (post-condition)")
+        else
+            NEW_SHA=$_HEAD_SHA
+            log "OK   $repo — $(git log --oneline -1)"
 
-        # Deploy gate: import smoke test (catches syntax + transitive ImportErrors;
-        # no IB Gateway connection needed). Imports pull the full transitive module
-        # graph, so a broken dependency in any executor module surfaces here pre-
-        # planner, not at runtime.
-        if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
-            if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
-                log "GATE $repo — running import smoke test..."
-                if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
-                    log "OK   $repo — import smoke test passed"
-                else
-                    log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
-                    git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
-                    log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
+            # Deploy gate: import smoke test (catches syntax + transitive
+            # ImportErrors; no IB Gateway connection needed). Imports pull the full
+            # transitive module graph, so a broken dependency in any executor module
+            # surfaces here pre-planner, not at runtime.
+            if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
+                if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
+                    log "GATE $repo — running import smoke test..."
+                    if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
+                        log "OK   $repo — import smoke test passed"
+                    else
+                        log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
+                        git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
+                        log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
+                    fi
                 fi
             fi
         fi
+        unset _HEAD_BRANCH _HEAD_SHA _ORIGIN_MAIN_SHA
     else
         log "FAIL $repo — git-sync under flock failed (fetch/checkout/reset error OR ${GIT_SYNC_LOCK_WAIT}s lock timeout on $GIT_SYNC_LOCK); last git lines: $(tail -3 "$LOG" | tr '\n' ';')"
         PULL_FAILURES=$((PULL_FAILURES + 1))
