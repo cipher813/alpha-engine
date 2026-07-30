@@ -93,9 +93,29 @@ sync_repo_to_main() {
     # satisfied by two equally-old refs. That is precisely the stale-code case
     # this whole alert exists to catch.
     #
+    # A failed fetch is RETRIED ONCE, scoped to main, before it is believed.
+    # This is what separates the two causes, and it does so by construction:
+    #
+    #   ref-CAS race        — transient. The retry finds the ref already at the
+    #                         value it wanted, so it succeeds.
+    #   unreachable remote  — auth/network. The retry fails the same way.
+    #
+    # Measured on the trading box 2026-07-30: `refs/remotes/origin/main` itself
+    # was among the refs failing CAS ("is at 876b73b7 but expected 7aa716e6"),
+    # i.e. something had already advanced origin/main between this fetch's ref
+    # negotiation and its ref update. That is precisely the transient a retry
+    # absorbs and an exit code cannot.
+    #
+    # A remote read (`git ls-remote`) was the obvious alternative and is WORSE
+    # here: `alpha-engine-config` takes merges continuously, so comparing HEAD
+    # against a freshly-read remote tip fails whenever main advances in the
+    # second between the reset and the read — reporting a correctly-synced box
+    # as stale. The retry asks the question that actually matters ("can we reach
+    # the remote and get main?") without racing anything.
+    #
     # Exit code contract for the inner script:
-    #   0  fetch + checkout + reset all clean
-    #   10 fetch failed, checkout/reset fine (ref-CAS race OR unreachable remote)
+    #   0  fetch (possibly on retry) + checkout + reset all clean
+    #   10 fetch failed TWICE — remote genuinely unreachable
     #   2  checkout/reset failed
     #   3  cd failed
     # flock's own `-w` timeout surfaces as 1, which is why 10 is used for the
@@ -103,7 +123,10 @@ sync_repo_to_main() {
     flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c '
         cd "$1" || exit 3
         fetch_rc=0
-        git fetch origin main --prune || fetch_rc=10
+        if ! git fetch origin main --prune; then
+            echo "boot-pull: fetch reported an error; retrying main once" >&2
+            git fetch origin main || fetch_rc=10
+        fi
         git checkout -f main && git reset --hard origin/main || exit 2
         exit $fetch_rc
     ' _ "$repo" >> "$LOG" 2>&1 || rc=$?
@@ -131,22 +154,14 @@ sync_repo_to_main() {
         return 1
     fi
 
+    # HEAD == origin/main is necessary but NOT sufficient. If the fetch never
+    # reached the remote, origin/main is stale too and the comparison above is
+    # satisfied by two equally-old LOCAL refs — a false OK in exactly the
+    # stale-code case this alert exists for. rc != 0 here means the fetch failed
+    # twice, so nothing local can be trusted as current.
     if [ "$rc" -ne 0 ]; then
-        # HEAD == origin/main, but the sync reported an error, so origin/main is
-        # not trustworthy as the reference point. One authoritative remote read
-        # separates the benign case from the dangerous one — paid ONLY on the
-        # error path, so a clean boot adds no network round-trip.
-        local remote_main_sha
-        remote_main_sha=$(git -C "$repo" ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}')
-        if [ -z "$remote_main_sha" ]; then
-            log "FAIL $repo — sync rc=$rc and the remote is unreachable; cannot prove HEAD=$head_sha is current"
-            return 1
-        fi
-        if [ "$remote_main_sha" != "$head_sha" ]; then
-            log "FAIL $repo — sync rc=$rc left the checkout STALE: HEAD=$head_sha but remote main=$remote_main_sha"
-            return 1
-        fi
-        log "NOTE $repo — sync exited $rc but the checkout is provably current: HEAD=$head_sha == remote main"
+        log "FAIL $repo — sync rc=$rc (fetch failed twice / checkout unusable); HEAD=$head_sha cannot be shown to be current"
+        return 1
     fi
 
     log "OK   $repo — $(git -C "$repo" log --oneline -1)"
