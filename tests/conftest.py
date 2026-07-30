@@ -7,9 +7,16 @@ never the real SSM Parameter Store.
 """
 import os
 import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
+
+# Mock arcticdb before any executor module is imported — executor/__init__.py
+# imports arcticdb at module level (the macOS allocator-priming fix), but
+# arcticdb has no prebuilt wheel for aarch64+py312 on this CI runner.
+_arcticdb_stub = types.ModuleType("arcticdb")
+sys.modules["arcticdb"] = _arcticdb_stub
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
