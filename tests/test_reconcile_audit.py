@@ -3,7 +3,7 @@ that were frozen pre-settlement (config#1276)."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from executor import reconcile_audit
 from executor.reconcile_audit import _window_dates, audit_window
@@ -264,3 +264,84 @@ class TestAuditWindow:
         run_mock.assert_not_called()
         assert res["checked"] == 0
         assert res["skipped"] and res["skipped"][0]["reason"] == "no_settled_close"
+
+    # ── accepted-gap handling (alpha-engine-config#5570) ────────────────────────
+
+    def test_accepted_gap_reported_at_info_not_paged(self, tmp_path):
+        """An accepted gap must appear in ``gaps`` with ``accepted=True`` and must
+        NOT trigger a flow-doctor page."""
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
+        settled = {"2026-06-24": 733.24}
+        accepted_registry = {
+            "2026-06-24": {
+                "reason": "CaptureSnapshot permanently failed",
+                "ruling_ref": "alpha-engine-config#5325",
+            }
+        }
+
+        fd_mock = MagicMock()
+        # Patch the source module (accepted_gaps.load_accepted_gaps), not the
+        # lazy import target (reconcile_audit) — the import happens inside
+        # audit_window() and Python resolves it at the module level.
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock), \
+             patch("executor.accepted_gaps.load_accepted_gaps",
+                   return_value=accepted_registry):
+            res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
+        run_mock.assert_not_called()
+        fd_mock.report.assert_not_called()
+        assert len(res["gaps"]) == 1
+        g = res["gaps"][0]
+        assert g["date"] == "2026-06-24"
+        assert g.get("accepted") is True
+        assert g.get("ruling_ref") == "alpha-engine-config#5325"
+
+    def test_accepted_gap_load_error_fails_safe(self, tmp_path):
+        """When the accepted-gaps registry fails to load, the error is caught
+        and the gap is still flagged for manual backfill (fail-safe)."""
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
+        settled = {"2026-06-24": 733.24}
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch("executor.accepted_gaps.load_accepted_gaps",
+                   side_effect=RuntimeError("S3 outage")), \
+             patch("executor.auto_backfill_gap.check_gate",
+                   return_value={"eligible": False, "reason": "zero-fill check failed",
+                                 "prior_date": None, "prior_snapshot": None,
+                                 "closes": {}, "offending_fills": []}), \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
+        run_mock.assert_not_called()
+        # Must still page — fail-safe means the gap is NOT silently accepted
+        assert fd_mock.report.call_count == 1
+        assert len(res["gaps"]) == 1
+        assert res["gaps"][0].get("accepted") is None or res["gaps"][0].get("accepted") is False
+
+    def test_non_accepted_gap_still_pages(self, tmp_path):
+        """A gap NOT in the accepted-gaps registry still pages flow-doctor with
+        a manual-backfill warning — the accepted-gap feature must not suppress
+        pages for gaps that have NOT been accepted."""
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
+        settled = {"2026-06-24": 733.24}
+
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch("executor.accepted_gaps.load_accepted_gaps", return_value={}), \
+             patch("executor.auto_backfill_gap.check_gate",
+                   return_value={"eligible": False, "reason": "zero-fill check failed",
+                                 "prior_date": None, "prior_snapshot": None,
+                                 "closes": {}, "offending_fills": []}), \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
+        run_mock.assert_not_called()
+        assert fd_mock.report.call_count == 1
+        assert fd_mock.report.call_args.kwargs["severity"] == "warning"
+        assert len(res["gaps"]) == 1
+        assert res["gaps"][0].get("accepted") is None or res["gaps"][0].get("accepted") is False
