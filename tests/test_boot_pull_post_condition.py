@@ -107,35 +107,39 @@ def _shim_dir(tmp_path: Path, name: str) -> Path:
     return d
 
 
-def _install_git_shim(tmp_path: Path, *, fetch_really_runs: bool,
-                      break_ls_remote: bool = False) -> Path:
+def _install_git_shim(tmp_path: Path, *, fail_every_fetch: bool) -> Path:
     """A PATH-shadowing `git` that fails `fetch`, passing everything else through.
 
     This reproduces the observed production condition rather than simulating it
-    at a distance: `git fetch` exits non-zero, and the caller must decide what
-    that means. `fetch_really_runs` picks which real-world cause is in play —
-    a benign ref-CAS race (the fetch DID update main, then reported an error) or
-    an unreachable remote (the fetch did nothing at all).
+    at a distance: `git fetch` exits non-zero with the real ref-lock message, and
+    the caller must decide what that means.
     """
     real_git = shutil.which("git")
     assert real_git, "git must be on PATH"
-    shim_dir = _shim_dir(
-        tmp_path, f"shim-{int(fetch_really_runs)}-{int(break_ls_remote)}")
-    do_fetch = f'"{real_git}" "$@" >/dev/null 2>&1 || true' if fetch_really_runs else "true"
-    # Matched against the whole argument list, not $1: boot-pull calls the
-    # freshness read as `git -C <repo> ls-remote ...`, so $1 is `-C`.
-    ls_remote_body = ("    exit 1\n" if break_ls_remote
-                      else f'    exec "{real_git}" "$@"\n')
+    shim_dir = _shim_dir(tmp_path, f"shim-{int(fail_every_fetch)}")
+    counter = shim_dir / "fetch_count"
+    # `fail_every_fetch` picks which real-world cause is being modelled, and the
+    # distinction is the whole point of the retry:
+    #   False — a ref compare-and-swap race. The FIRST fetch fails; the retry
+    #           succeeds, because the racing writer has finished. Production
+    #           behaviour observed on the trading box.
+    #   True  — an unreachable remote (auth/network). EVERY fetch fails, and no
+    #           number of retries changes that.
+    retry_branch = ("    exit 1\n" if fail_every_fetch else
+                    f'    exec "{real_git}" "$@"\n')
     (shim_dir / "git").write_text(
         "#!/bin/sh\n"
+        f'COUNT_FILE="{counter}"\n'
         'case " $* " in\n'
         "*\" fetch \"*)\n"
-        f"    {do_fetch}\n"
-        "    echo \"error: cannot lock ref 'refs/remotes/origin/main'\" >&2\n"
-        "    exit 1\n"
-        "    ;;\n"
-        "*\" ls-remote \"*)\n"
-        f"{ls_remote_body}"
+        '    n=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)\n'
+        '    n=$((n + 1))\n'
+        '    echo "$n" > "$COUNT_FILE"\n'
+        '    if [ "$n" -eq 1 ]; then\n'
+        "        echo \"error: cannot lock ref 'refs/remotes/origin/main'\" >&2\n"
+        "        exit 1\n"
+        "    fi\n"
+        f"{retry_branch}"
         "    ;;\n"
         "esac\n"
         f'exec "{real_git}" "$@"\n'
@@ -173,45 +177,42 @@ def test_clean_boot_fast_forwards_to_remote_main(box):
 
 
 def test_benign_ref_cas_failure_still_self_heals(box):
-    """THE REGRESSION. A `git fetch` that updates main and THEN reports a
-    ref-lock error must not suppress the reset or raise a stale-code failure.
+    """THE REGRESSION. A `git fetch` that fails a ref compare-and-swap must not
+    suppress the reset or raise a stale-code failure — the retry gets main.
 
     Under the `&&` chain this returns non-zero with the checkout left on the old
-    commit — a false "executor may be running stale code" alert every weekday
-    boot, and the self-heal genuinely skipped.
+    commit: a false "executor may be running stale code" alert on every weekday
+    boot, and the self-heal genuinely skipped. Measured on the trading box
+    2026-07-30, `refs/remotes/origin/main` itself was among the failing refs.
     """
-    shim = _install_git_shim(box["tmp"], fetch_really_runs=True)
+    shim = _install_git_shim(box["tmp"], fail_every_fetch=False)
     rc, log = _sync(box["checkout"], box["tmp"], shim=shim)
 
-    assert rc == 0, f"a benign ref-CAS error must not FAIL the repo; log:\n{log}"
+    assert rc == 0, f"a ref-CAS race must not FAIL the repo; log:\n{log}"
     assert _git("rev-parse", "HEAD", cwd=box["checkout"]) == box["new_sha"], (
         "the self-heal must still run — this is the part that was skipped"
     )
 
 
-def test_stale_checkout_with_reachable_remote_fails(box):
-    """A fetch that never reached the remote leaves origin/main stale, so
-    `HEAD == origin/main` is satisfied by two equally-old refs. The guard must
-    consult the remote and FAIL rather than report OK.
+def test_unreachable_remote_fails_even_though_head_matches_origin(box):
+    """The false OK that matters most.
+
+    When the fetch cannot reach the remote, `origin/main` is stale too, so
+    `HEAD == origin/main` is satisfied by two equally-old LOCAL refs. A guard
+    that stopped at the post-condition would report OK on a genuinely stale box
+    — the precise case this alert exists for. Retrying and still failing is what
+    makes it detectable: "cannot verify" must never read as "safe".
     """
-    shim = _install_git_shim(box["tmp"], fetch_really_runs=False)
-    rc, log = _sync(box["checkout"], box["tmp"], shim=shim)
-
-    assert rc != 0, f"a genuinely stale checkout must FAIL; log:\n{log}"
-    assert "STALE" in log
-    assert _git("rev-parse", "HEAD", cwd=box["checkout"]) == box["old_sha"]
-
-
-def test_stale_checkout_with_unreachable_remote_fails(box):
-    """Remote unreachable AND the checkout stale: freshness cannot be proven, so
-    the only honest answer is FAIL. "Cannot verify" must never read as "safe".
-    """
-    shim = _install_git_shim(box["tmp"], fetch_really_runs=False,
-                             break_ls_remote=True)
+    shim = _install_git_shim(box["tmp"], fail_every_fetch=True)
     rc, log = _sync(box["checkout"], box["tmp"], shim=shim)
 
     assert rc != 0, f"unprovable freshness must FAIL; log:\n{log}"
-    assert "unreachable" in log
+    assert "cannot be shown to be current" in log
+    # The checkout is left on the OLD commit, and HEAD == origin/main holds —
+    # which is exactly why the post-condition alone cannot catch this.
+    assert _git("rev-parse", "HEAD", cwd=box["checkout"]) == box["old_sha"]
+    assert (_git("rev-parse", "HEAD", cwd=box["checkout"])
+            == _git("rev-parse", "origin/main", cwd=box["checkout"]))
 
 
 def test_wrong_branch_fails_even_when_sync_reports_success(box):
