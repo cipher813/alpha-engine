@@ -9,7 +9,9 @@
 
 set -uo pipefail
 
-LOG="/var/log/boot-pull.log"
+# AE_BOOT_PULL_LOG exists so tests can source this file and exercise
+# sync_repo_to_main() without needing write access to /var/log.
+LOG="${AE_BOOT_PULL_LOG:-/var/log/boot-pull.log}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
@@ -42,6 +44,121 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 # via flow-doctor + the FAIL log lines). Never swallow a lock timeout.
 GIT_SYNC_LOCK="${AE_GIT_SYNC_LOCK:-/home/ec2-user/.ae-git-sync.lock}"
 GIT_SYNC_LOCK_WAIT="${AE_GIT_SYNC_LOCK_WAIT:-150}"
+
+# ── Sync one checkout to origin/main, judged on the post-condition ──────────
+# Returns 0 when the checkout provably sits on the remote's current main, 1
+# otherwise. Extracted as a function (config-I4978) for two reasons: the main
+# loop reads as one decision instead of four nested branches, and the decision
+# becomes directly testable — every prior guard on this logic was a regex over
+# this file's source text, which is exactly why the control-flow defect below
+# shipped and then survived a review.
+#
+# THE DEFECT THIS CLOSES. `git fetch` exits non-zero when ANY ref fails to
+# update, and the previous shape chained `git fetch origin ... && git checkout
+# -f main && git reset --hard origin/main`. So a ref-update failure skipped the
+# self-heal AND raised "the executor may be running stale code" — on every
+# weekday boot for at least 7 days (07-22 through 07-28 confirmed in
+# /var/log/boot-pull.log).
+#
+# Scoping the fetch to `origin main` narrows the blast radius but does NOT close
+# it: the ref observed failing its compare-and-swap on 2026-07-28 was
+# `refs/remotes/origin/main` ITSELF —
+#
+#   error: cannot lock ref 'refs/remotes/origin/main': is at 01a279f...
+#          but expected a3b5971...
+#    ! a3b5971..01a279f  main -> origin/main  (unable to update local ref)
+#
+# — while that same fetch had already fast-forwarded origin/main to 01a279f
+# (`git reflog show refs/remotes/origin/main` confirms). The error was benign
+# and the exit code still suppressed the self-heal. A concurrent git writer on
+# this box wins that race whenever it interleaves, so the exit code cannot be
+# the gate no matter how narrow the refspec is.
+sync_repo_to_main() {
+    local repo="$1"
+    local rc=0
+
+    # The fetch's status is captured SEPARATELY from the checkout/reset, and the
+    # two are chained with `;` rather than `&&`, for a reason the group's single
+    # exit code cannot express. Two distinct failures need two distinct answers:
+    #
+    #   fetch failed  -> origin/main may be STALE, so no comparison between two
+    #                    LOCAL refs can prove the checkout is current. Needs an
+    #                    authoritative remote read.
+    #   reset failed  -> the tree is not where we put it. Post-condition catches
+    #                    it directly.
+    #
+    # Collapsing them (the previous `&&` chain, and a plain `;` too) produces the
+    # false OK that matters most: a fetch that cannot reach the remote, followed
+    # by a reset onto the stale origin/main, exits 0 with HEAD == origin/main
+    # satisfied by two equally-old refs. That is precisely the stale-code case
+    # this whole alert exists to catch.
+    #
+    # Exit code contract for the inner script:
+    #   0  fetch + checkout + reset all clean
+    #   10 fetch failed, checkout/reset fine (ref-CAS race OR unreachable remote)
+    #   2  checkout/reset failed
+    #   3  cd failed
+    # flock's own `-w` timeout surfaces as 1, which is why 10 is used for the
+    # fetch rather than 1 — the two must stay distinguishable.
+    flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c '
+        cd "$1" || exit 3
+        fetch_rc=0
+        git fetch origin main --prune || fetch_rc=10
+        git checkout -f main && git reset --hard origin/main || exit 2
+        exit $fetch_rc
+    ' _ "$repo" >> "$LOG" 2>&1 || rc=$?
+
+    # A flock timeout keeps its established fail-loud semantics (config#1944): a
+    # stuck git writer on this box is worth an alert on its own, independent of
+    # whether the code happens to be current.
+    if [ "$rc" -eq 1 ]; then
+        log "FAIL $repo — git-sync flock timed out after ${GIT_SYNC_LOCK_WAIT}s on $GIT_SYNC_LOCK (a git writer is stuck)"
+        return 1
+    fi
+
+    local head_branch head_sha origin_main_sha
+    head_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")
+    origin_main_sha=$(git -C "$repo" rev-parse origin/main 2>/dev/null || echo "")
+
+    # Judge on the POST-CONDITION, evaluated UNCONDITIONALLY. The invariant that
+    # matters is "this checkout is on main at the remote's current main"; the
+    # sync's exit code is only ever a proxy for it, and it is a proxy that is
+    # wrong in both directions.
+    if [ "$head_branch" != "main" ] || [ -z "$head_sha" ] \
+            || [ "$head_sha" != "$origin_main_sha" ]; then
+        log "FAIL $repo — post-condition failed: branch=$head_branch HEAD=$head_sha origin/main=$origin_main_sha (sync rc=$rc)"
+        return 1
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        # HEAD == origin/main, but the sync reported an error, so origin/main is
+        # not trustworthy as the reference point. One authoritative remote read
+        # separates the benign case from the dangerous one — paid ONLY on the
+        # error path, so a clean boot adds no network round-trip.
+        local remote_main_sha
+        remote_main_sha=$(git -C "$repo" ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}')
+        if [ -z "$remote_main_sha" ]; then
+            log "FAIL $repo — sync rc=$rc and the remote is unreachable; cannot prove HEAD=$head_sha is current"
+            return 1
+        fi
+        if [ "$remote_main_sha" != "$head_sha" ]; then
+            log "FAIL $repo — sync rc=$rc left the checkout STALE: HEAD=$head_sha but remote main=$remote_main_sha"
+            return 1
+        fi
+        log "NOTE $repo — sync exited $rc but the checkout is provably current: HEAD=$head_sha == remote main"
+    fi
+
+    log "OK   $repo — $(git -C "$repo" log --oneline -1)"
+    return 0
+}
+
+# Tests source this file for sync_repo_to_main() and must not execute the boot
+# sequence (SSM reads, sudo, systemctl). Everything above this line is pure
+# definition; everything below has side effects.
+if [ "${AE_BOOT_PULL_LIB_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 log "=== boot-pull started ==="
 
@@ -149,63 +266,33 @@ for repo in "${REPOS[@]}"; do
         unset _CURRENT_URL _EXPECTED_URL
     fi
 
-    # Serialize the index-mutating git ops behind the shared flock (config#1944)
-    # so this boot-pull can't race the weekday CodeFreshnessGate /
-    # ChronicGapSelfHeal on .git/index.lock. flock holds the lock for the whole
-    # fetch+checkout+reset group (window-free) and returns non-zero on a -w
-    # timeout (fail-loud -> else branch below). The ownership reclaim above runs
-    # OUTSIDE the lock deliberately (it is not a git-index op; a test pins that
-    # the reclaim still precedes the reset).
-    #
-    # config-I4997: fetch ONLY the main branch (git fetch origin main), not all
-    # refs (the default). The default refspec (+refs/heads/*:refs/remotes/origin/*)
-    # fetches every branch — when hundreds of stale groom/dependabot branches hit a
-    # compare-and-swap failure on an unrelated ref, the entire fetch exits non-zero
-    # and the && chain short-circuits before checkout -f main / reset --hard
-    # origin/main ever run. The self-heal (reset to origin/main) and the stale-code
-    # guard (the subsequent post-condition check) are BOTH suppressed by a failure
-    # mode that has nothing to do with main being stale. CodeFreshnessGate already
-    # uses this scoped fetch pattern (git fetch --quiet origin main); boot-pull now
-    # matches it.
-    #
-    # Gate on the POST-CONDITION, not on git fetch's exit code: after the sync,
-    # assert branch == main && HEAD == origin/main. PULL_FAILURES++ only if the
-    # assertion fails — a fetch that exits 0 but somehow leaves the checkout in an
-    # unexpected state is still caught; a fetch that exits non-zero on an unrelated
-    # CAS but fetched main successfully is no longer a false failure.
-    if flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c 'git fetch origin main --prune && git checkout -f main && git reset --hard origin/main' >> "$LOG" 2>&1; then
-        # Post-condition: verify the checkout is on main at origin/main.
-        _HEAD_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-        _HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
-        _ORIGIN_MAIN_SHA=$(git rev-parse origin/main 2>/dev/null || echo "")
-        if [ "$_HEAD_BRANCH" != "main" ] || [ "$_HEAD_SHA" != "$_ORIGIN_MAIN_SHA" ]; then
-            log "FAIL $repo — post-condition failed: branch=$_HEAD_BRANCH HEAD=$_HEAD_SHA origin/main=$_ORIGIN_MAIN_SHA"
-            PULL_FAILURES=$((PULL_FAILURES + 1))
-            FAILED_REPOS+=("$repo (post-condition)")
-        else
-            NEW_SHA=$_HEAD_SHA
-            log "OK   $repo — $(git log --oneline -1)"
+    # The sync + its post-condition live in sync_repo_to_main() (defined at the
+    # top of this file, where the full rationale is). It serializes the
+    # index-mutating git ops behind the shared flock (config#1944) so this cannot
+    # race the weekday CodeFreshnessGate / ChronicGapSelfHeal on .git/index.lock,
+    # and it judges success on the post-condition rather than on git's exit code.
+    # The ownership reclaim above runs OUTSIDE the lock deliberately (it is not a
+    # git-index op; a test pins that the reclaim still precedes the sync).
+    if sync_repo_to_main "$repo"; then
+        NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
 
-            # Deploy gate: import smoke test (catches syntax + transitive
-            # ImportErrors; no IB Gateway connection needed). Imports pull the full
-            # transitive module graph, so a broken dependency in any executor module
-            # surfaces here pre-planner, not at runtime.
-            if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
-                if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
-                    log "GATE $repo — running import smoke test..."
-                    if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
-                        log "OK   $repo — import smoke test passed"
-                    else
-                        log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
-                        git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
-                        log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
-                    fi
+        # Deploy gate: import smoke test (catches syntax + transitive
+        # ImportErrors; no IB Gateway connection needed). Imports pull the full
+        # transitive module graph, so a broken dependency in any executor module
+        # surfaces here pre-planner, not at runtime.
+        if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
+            if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
+                log "GATE $repo — running import smoke test..."
+                if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
+                    log "OK   $repo — import smoke test passed"
+                else
+                    log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
+                    git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
+                    log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
                 fi
             fi
         fi
-        unset _HEAD_BRANCH _HEAD_SHA _ORIGIN_MAIN_SHA
     else
-        log "FAIL $repo — git-sync under flock failed (fetch/checkout/reset error OR ${GIT_SYNC_LOCK_WAIT}s lock timeout on $GIT_SYNC_LOCK); last git lines: $(tail -3 "$LOG" | tr '\n' ';')"
         PULL_FAILURES=$((PULL_FAILURES + 1))
         FAILED_REPOS+=("$repo (git)")
     fi
