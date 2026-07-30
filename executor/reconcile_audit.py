@@ -55,6 +55,12 @@ from nousergon_lib.dates import now_dual
 from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.trading_calendar import previous_trading_day
 
+# S3 key for the durable accepted-gaps registry.
+# Consumed by reconcile_audit and any downstream alpha/return consumer that
+# needs to treat an accepted-gap date as MISSING rather than zero.
+# Schema: {"gaps": {"YYYY-MM-DD": {"reason": str, "ruling_ref": str, ...}}}
+ACCEPTED_GAPS_KEY = "trades/accepted_gaps.json"
+
 from executor.config_loader import load_config
 from executor.eod_reconcile import _spy_close
 from executor.eod_reconcile import run as eod_run
@@ -148,12 +154,52 @@ def _write_audit_record(
         return None
 
 
+def _load_accepted_gaps(trades_bucket: str, region: str = "us-east-1") -> dict[str, dict]:
+    """Load the durable accepted-gaps registry from S3.
+
+    Returns a dict mapping ``date`` → gap record (with keys like ``reason``,
+    ``ruling_ref``, ``ruled_at``). Returns ``{}`` when no registry exists yet
+    (the common case — most gaps are eventual-recoverable, not permanent).
+
+    The registry is additive-only per the alpha-engine-config-I5570 gotcha: an
+    accepted gap must not become a way to silence real gaps. Adding a record is
+    an operator action tied to a ruling, never something an automated pass can
+    do to clear its own alert.
+
+    Schema (``trades/accepted_gaps.json``)::
+
+        {
+          "gaps": {
+            "2026-07-27": {
+              "reason": "CaptureSnapshot failed — no snapshot ever existed",
+              "ruling_ref": "alpha-engine-config-I5325",
+              "ruled_at": "2026-07-29",
+              "accepted_at": "2026-07-29"
+            }
+          }
+        }
+    """
+    if not trades_bucket:
+        return {}
+    try:
+        s3 = boto3.client("s3", region_name=region)
+        obj = s3.get_object(Bucket=trades_bucket, Key=ACCEPTED_GAPS_KEY)
+        data = json.loads(obj["Body"].read())
+        gaps = data.get("gaps", {}) if isinstance(data, dict) else {}
+        if not isinstance(gaps, dict):
+            return {}
+        return {str(k): v for k, v in gaps.items() if isinstance(v, dict)}
+    except Exception:  # noqa: BLE001 — no registry yet, or transient read failure
+        return {}
+
+
 def audit_window(
     *,
     trailing_days: int = DEFAULT_TRAILING_DAYS,
     start: str | None = None,
     end: str | None = None,
     exclude_dates: set[str] | frozenset[str] = frozenset(),
+    accepted_gaps: dict[str, dict] | None = None,
     tolerance_bps: float = DEFAULT_TOLERANCE_BPS,
     page_threshold_bps: float = PAGE_THRESHOLD_BPS,
     dry_run: bool = False,
@@ -174,6 +220,13 @@ def audit_window(
         fd = get_flow_doctor()
     except Exception:  # noqa: BLE001 — flow-doctor optional / not configured
         fd = None
+
+    # Load accepted gaps from the durable registry (or from the explicit
+    # parameter for testing). An accepted gap is a date whose eod_pnl row
+    # is permanently unrecoverable per a prior operator ruling — not
+    # flagged as actionable, but still recorded in the gaps output.
+    if accepted_gaps is None:
+        accepted_gaps = _load_accepted_gaps(trades_bucket, region)
 
     corrected: list[dict] = []
     skipped: list[dict] = []
@@ -235,6 +288,28 @@ def audit_window(
                             f"{auto_result['gate'].get('prior_date')}."),
                         severity="warning",
                         context={"site": "reconcile_audit_gap_auto_backfilled", "run_date": d})
+                continue
+
+            # ── Accepted-gap check (alpha-engine-config-I5570) ────────────────
+            # If this date is recorded in the durable accepted-gaps registry,
+            # the gap is permanently unrecoverable per a prior operator ruling.
+            # Report at INFO (never paging/SEVERITY=warning) and record in the
+            # gaps output with accepted=True so downstream consumers can
+            # exclude it. A gap suppressed without a ruling is a corrupted
+            # alpha series with evidence deleted.
+            if d in accepted_gaps:
+                logger.info(
+                    "[reconcile_audit] %s is an ACCEPTED gap — reported at info "
+                    "(not paged). Reason: %s. Ruling: %s.",
+                    d, accepted_gaps[d].get("reason", "unspecified"),
+                    accepted_gaps[d].get("ruling_ref", "n/a"),
+                )
+                gaps.append({
+                    "date": d, "settled_spy_close": settled,
+                    "accepted": True,
+                    "accepted_gap": accepted_gaps[d],
+                    "auto_backfill_reason": auto_result["reason"],
+                })
                 continue
 
             logger.warning(

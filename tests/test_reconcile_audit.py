@@ -250,6 +250,73 @@ class TestAuditWindow:
         assert res["corrected"][1]["paged"] is True   # second: recurrence in same pass
         assert fd_mock.report.call_count == 1
 
+        # ── accepted-gap registry (alpha-engine-config-I5570) ──────────────────────
+
+    def test_accepted_gap_suppressed_from_paging(self, tmp_path):
+        """An accepted gap must NOT page (reported at info, not warning)."""
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
+        settled = {"2026-07-27": 720.00}
+        accepted = {
+            "2026-07-27": {
+                "reason": "CaptureSnapshot failed — no snapshot ever existed",
+                "ruling_ref": "alpha-engine-config-I5325",
+                "ruled_at": "2026-07-29",
+            }
+        }
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-07-27", end="2026-07-27",
+                               accepted_gaps=accepted, config=_cfg(db))
+        bf_mock.assert_not_called()
+        run_mock.assert_not_called()
+        assert res["checked"] == 1
+        assert len(res["gaps"]) == 1
+        g = res["gaps"][0]
+        assert g["date"] == "2026-07-27"
+        assert g["accepted"] is True
+        assert g["accepted_gap"]["ruling_ref"] == "alpha-engine-config-I5325"
+
+    def test_accepted_gap_still_in_gaps_output(self, tmp_path):
+        """An accepted gap must still appear in the gaps output (never
+        suppressed from the record), even though it's not paged."""
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
+        settled = {"2026-07-27": 720.00}
+        accepted = {"2026-07-27": {"reason": "test", "ruling_ref": "I5325"}}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-07-27", end="2026-07-27",
+                               accepted_gaps=accepted, config=_cfg(db))
+        assert any(g["date"] == "2026-07-27" for g in res["gaps"])
+
+    def test_non_accepted_gap_still_pages(self, tmp_path):
+        """A gap NOT in the accepted registry must still page normally."""
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
+        settled = {"2026-07-27": 720.00}
+        # Pass empty accepted gaps — date is NOT accepted.
+        fd_mock = MagicMock()
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-07-27", end="2026-07-27",
+                               accepted_gaps={}, config=_cfg(db))
+        assert len(res["gaps"]) == 1
+        assert res["gaps"][0].get("accepted") is not True
+        fd_mock.report.assert_called_once()
+
+    def test_load_accepted_gaps_empty_when_no_registry(self, tmp_path):
+        """_load_accepted_gaps returns {} when no registry file exists."""
+        from executor.reconcile_audit import _load_accepted_gaps
+        result = _load_accepted_gaps("", "us-east-1")
+        assert result == {}
+
     def test_no_settled_close_skips_gracefully(self, tmp_path):
         db = str(tmp_path / "t.db")
         _seed_eod(db, [("2026-06-25", 733.50, -0.01, 1.52)])
