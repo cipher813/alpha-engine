@@ -38,14 +38,24 @@ def test_boot_pull_reclaims_foreign_owned_files_before_git_reset():
     code on a stray branch, and the day's pipeline burned ~40 min before the
     executor's deploy-drift preflight refused. The reclaim block makes that
     failure mode structurally impossible; this test pins its presence AND
-    its ordering (reclaim before reset — after would be useless).
+    its ordering (reclaim before the sync — after would be useless).
+
+    Ordering is measured against the per-repo loop's CALL to
+    sync_repo_to_main, not against the first textual occurrence of `git reset
+    --hard origin/main`. Since config-I4978 extracted the sync into a function
+    defined above the loop, that string now appears near the top of the file
+    and a raw text index would compare the reclaim against a function
+    *definition* rather than against the point the reset actually runs —
+    silently inverting this guard's meaning while still passing.
     """
     src = _BOOT_PULL.read_text()
     assert "-not -user ec2-user" in src, "foreign-ownership detection missing"
     assert 'chown -R ec2-user:ec2-user "$repo"' in src, "ownership reclaim missing"
     reclaim_pos = src.index("-not -user ec2-user")
-    reset_pos = src.index("git reset --hard origin/main")
-    assert reclaim_pos < reset_pos, "ownership reclaim must run BEFORE git reset"
+    sync_call_pos = src.index('sync_repo_to_main "$repo"')
+    assert reclaim_pos < sync_call_pos, (
+        "ownership reclaim must run BEFORE the git sync"
+    )
 
 
 def test_boot_pull_git_sync_runs_under_shared_flock():
