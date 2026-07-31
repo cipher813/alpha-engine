@@ -11,7 +11,7 @@ by any automatic path. Per Brian's 2026-07-29 ruling on alpha-engine-config#5325
 the gap is accepted rather than requiring a hand-built NAV.
 
 This is a ONE-TIME bootstrap script. After seeding, all future accepted-gap
-additions are operator actions via PRs that update the accepted_gaps module
+additions are operator actions via PRs that update the accepted_gaps registry
 and the S3 record — never an automated pass (same guard as the ``default-ok``
 label, alpha-engine-config#1925).
 """
@@ -28,18 +28,18 @@ import boto3
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from executor.accepted_gaps import load_accepted_gaps
+from executor.accepted_gaps import ACCEPTED_GAPS_KEY, load_accepted_gaps
 from executor.config_loader import load_config
 
 logger = logging.getLogger(__name__)
-ACCEPTED_GAPS_KEY = "trades/accepted_gaps.json"
 SCHEMA_VERSION = 1
 
 
 def seed(region: str = "us-east-1", trades_bucket: str | None = None, dry_run: bool = False) -> dict:
     """Seed the initial accepted gap for 2026-07-27.
 
-    Reads existing registry first (if any), merges the new gap, and writes back.
+    Reads existing registry first (if any), merges the new gap, and writes back
+    in the list-based schema used by ``load_accepted_gaps``.
     """
     config = load_config()
     bucket = trades_bucket or config["trades_bucket"]
@@ -47,31 +47,31 @@ def seed(region: str = "us-east-1", trades_bucket: str | None = None, dry_run: b
     s3 = boto3.client("s3", region_name=region)
 
     # Load existing (may be empty dict if file doesn't exist yet)
-    existing = load_accepted_gaps(bucket, region, s3_client=s3)
+    existing = load_accepted_gaps(bucket, region)
 
-    # Build the 2026-07-27 gap
+    # Build the 2026-07-27 gap entry (list-format schema per accepted_gaps.py)
     gap_date = "2026-07-27"
-    gap_record = {
+    gap_entry = {
+        "date": gap_date,
         "reason": (
-            "CaptureSnapshot permanently failed before midnight on 2026-07- — "
+            "CaptureSnapshot permanently failed before midnight — "
             "snapshot never written, unrecoverable by any automatic path "
             "(alpha-engine-config#5569). Accepted per Brian's 2026-07-29 "
             "ruling on alpha-engine-config#5325."
         ),
-        "ruling_ref": "alpha-engine-config#5325",
+        "ruling": "nousergon/alpha-engine-config#5325",
         "accepted_at": datetime.now(UTC).isoformat(),
-        "accepted_by": "seed-accepted-gaps",
     }
 
     # Merge: only add if not already present (idempotent)
-    gaps = dict(existing)
-    already_present = gap_date in gaps
+    gaps_list = list(existing.values())
+    already_present = gap_date in existing
     if not already_present:
-        gaps[gap_date] = gap_record
+        gaps_list.append(gap_entry)
 
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "gaps": gaps,
+        "gaps": gaps_list,
     }
 
     key = ACCEPTED_GAPS_KEY
@@ -98,7 +98,7 @@ def main() -> None:
     if not dry_run:
         print("Accepted-gaps registry seeded. Verify:")
         print(f"  aws s3 cp s3://$(python3 -c 'from executor.config_loader import load_config; c=load_config(); print(c[\"trades_bucket\"])')/{ACCEPTED_GAPS_KEY} -")
-        print("  aws s3 ls s3://$(python3 -c 'from executor.config_loader import load_config; c=load_config(); print(c[\"trades_bucket\"])')/trades/accepted_gaps.json")
+        print(f"  aws s3 ls s3://$(python3 -c 'from executor.config_loader import load_config; c=load_config(); print(c[\"trades_bucket\"])')/{ACCEPTED_GAPS_KEY}")
 
 
 if __name__ == "__main__":

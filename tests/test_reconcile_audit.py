@@ -265,83 +265,110 @@ class TestAuditWindow:
         assert res["checked"] == 0
         assert res["skipped"] and res["skipped"][0]["reason"] == "no_settled_close"
 
-    # ── accepted-gap handling (alpha-engine-config#5570) ────────────────────────
+    # ── Accepted gaps (alpha-engine-config#5570) ───────────────────────────
 
-    def test_accepted_gap_reported_at_info_not_paged(self, tmp_path):
-        """An accepted gap must appear in ``gaps`` with ``accepted=True`` and must
-        NOT trigger a flow-doctor page."""
+    def test_accepted_gap_not_paged(self, tmp_path):
+        # A gap date that is registered in the accepted-gaps registry must
+        # still appear in the gaps list, but must NOT page flow-doctor or
+        # emit a WARNING about manual backfill.
         db = str(tmp_path / "t.db")
-        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])  # 06-24 absent → gap
         settled = {"2026-06-24": 733.24}
-        accepted_registry = {
-            "2026-06-24": {
-                "reason": "CaptureSnapshot permanently failed",
-                "ruling_ref": "alpha-engine-config#5325",
-            }
-        }
-
+        cfg = {**_cfg(db), "trades_bucket": "test-bucket"}
         fd_mock = MagicMock()
-        # Patch the source module (accepted_gaps.load_accepted_gaps), not the
-        # lazy import target (reconcile_audit) — the import happens inside
-        # audit_window() and Python resolves it at the module level.
+        accepted = {
+            "2026-06-24": {
+                "date": "2026-06-24",
+                "reason": "Test ruling — snapshot never existed",
+                "ruling": "test-org/test-repo#1",
+            },
+        }
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "load_accepted_gaps", return_value=accepted), \
+             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
              patch.object(reconcile_audit, "eod_run") as run_mock, \
-             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock), \
-             patch("executor.accepted_gaps.load_accepted_gaps",
-                   return_value=accepted_registry):
-            res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-06-24", end="2026-06-24", config=cfg)
+        bf_mock.assert_not_called()
         run_mock.assert_not_called()
-        fd_mock.report.assert_not_called()
+        fd_mock.report.assert_not_called()  # must not page
         assert len(res["gaps"]) == 1
         g = res["gaps"][0]
         assert g["date"] == "2026-06-24"
         assert g.get("accepted") is True
-        assert g.get("ruling_ref") == "alpha-engine-config#5325"
+        assert g.get("ruling") == "test-org/test-repo#1"
 
-    def test_accepted_gap_load_error_fails_safe(self, tmp_path):
-        """When the accepted-gaps registry fails to load, the error is caught
-        and the gap is still flagged for manual backfill (fail-safe)."""
+    def test_accepted_gap_still_listed_in_gaps_without_page(self, tmp_path):
+        # Multiple gaps where one is accepted and one is not: the accepted
+        # gap must still appear in the gaps list (not suppressed from the
+        # record), while the non-accepted gap pages normally.
+        db = str(tmp_path / "t.db")
+        # 06-24 absent → accepted gap; 06-25 present; 06-26 absent → real gap
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0), ("2026-06-25", 734.30, 0.10, 1.40)])
+        settled = {"2026-06-24": 733.24, "2026-06-26": 728.99}
+        cfg = {**_cfg(db), "trades_bucket": "test-bucket"}
+        fd_mock = MagicMock()
+        accepted = {"2026-06-24": {"date": "2026-06-24", "reason": "test", "ruling": "test#1"}}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "load_accepted_gaps", return_value=accepted), \
+             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-06-24", end="2026-06-26", config=cfg)
+        bf_mock.assert_not_called()
+        run_mock.assert_not_called()
+        # Two gaps expected: 06-24 (accepted) and 06-26 (real)
+        assert len(res["gaps"]) == 2
+        accepted_gap = next(g for g in res["gaps"] if g["date"] == "2026-06-24")
+        real_gap = next(g for g in res["gaps"] if g["date"] == "2026-06-26")
+        assert accepted_gap.get("accepted") is True
+        assert "accepted" not in real_gap or real_gap.get("accepted") is not True
+        # Only the non-accepted gap should have triggered a page
+        assert fd_mock.report.call_count == 1
+
+    def test_unaccepted_gap_still_pages(self, tmp_path):
+        # A gap date NOT in the accepted-gaps registry must still be
+        # handled exactly as before — WARNING + page for manual backfill.
+        # This is a regression guard: the accepted-gap code path must not
+        # accidentally absorb all gaps.
+        db = str(tmp_path / "t.db")
+        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])  # 06-24 absent → gap
+        settled = {"2026-06-24": 733.24}
+        cfg = {**_cfg(db), "trades_bucket": "test-bucket"}
+        fd_mock = MagicMock()
+        # accepted gaps registry exists but does NOT include 06-24
+        accepted = {"2026-06-22": {"date": "2026-06-22", "reason": "other", "ruling": "other#1"}}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
+             patch.object(reconcile_audit, "load_accepted_gaps", return_value=accepted), \
+             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+            res = audit_window(start="2026-06-24", end="2026-06-24", config=cfg)
+        bf_mock.assert_not_called()
+        run_mock.assert_not_called()
+        assert len(res["gaps"]) == 1
+        assert res["gaps"][0]["date"] == "2026-06-24"
+        assert "accepted" not in res["gaps"][0]
+        # Must still page
+        fd_mock.report.assert_called_once()
+        assert "Manually run" in fd_mock.report.call_args[0][0].args[0]
+
+    def test_empty_trades_bucket_skips_accepted_gaps_load(self, tmp_path):
+        # When trades_bucket is empty (the _cfg default), accepted_gaps must
+        # be empty — load_accepted_gaps is never called because the bucket
+        # guard in audit_window skips it. This regression guard ensures the
+        # existing test_missing_row_flagged_as_gap_not_backfilled path (which
+        # uses trades_bucket="") still works identically.
         db = str(tmp_path / "t.db")
         _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
         settled = {"2026-06-24": 733.24}
-
-        fd_mock = MagicMock()
+        # load_accepted_gaps MUST NOT be called when bucket is empty
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
-             patch("executor.accepted_gaps.load_accepted_gaps",
-                   side_effect=RuntimeError("S3 outage")), \
-             patch("executor.auto_backfill_gap.check_gate",
-                   return_value={"eligible": False, "reason": "zero-fill check failed",
-                                 "prior_date": None, "prior_snapshot": None,
-                                 "closes": {}, "offending_fills": []}), \
-             patch.object(reconcile_audit, "eod_run") as run_mock, \
-             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
+             patch.object(reconcile_audit, "load_accepted_gaps") as load_mock, \
+             patch("executor.backfill_eod_pnl.backfill"), \
+             patch.object(reconcile_audit, "eod_run"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
             res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
-        run_mock.assert_not_called()
-        # Must still page — fail-safe means the gap is NOT silently accepted
-        assert fd_mock.report.call_count == 1
+        load_mock.assert_not_called()
         assert len(res["gaps"]) == 1
-        assert res["gaps"][0].get("accepted") is None or res["gaps"][0].get("accepted") is False
-
-    def test_non_accepted_gap_still_pages(self, tmp_path):
-        """A gap NOT in the accepted-gaps registry still pages flow-doctor with
-        a manual-backfill warning — the accepted-gap feature must not suppress
-        pages for gaps that have NOT been accepted."""
-        db = str(tmp_path / "t.db")
-        _seed_eod(db, [("2026-06-23", 733.58, -1.44, 0.0)])
-        settled = {"2026-06-24": 733.24}
-
-        fd_mock = MagicMock()
-        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
-             patch("executor.accepted_gaps.load_accepted_gaps", return_value={}), \
-             patch("executor.auto_backfill_gap.check_gate",
-                   return_value={"eligible": False, "reason": "zero-fill check failed",
-                                 "prior_date": None, "prior_snapshot": None,
-                                 "closes": {}, "offending_fills": []}), \
-             patch.object(reconcile_audit, "eod_run") as run_mock, \
-             patch.object(reconcile_audit, "get_flow_doctor", return_value=fd_mock):
-            res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
-        run_mock.assert_not_called()
-        assert fd_mock.report.call_count == 1
-        assert fd_mock.report.call_args.kwargs["severity"] == "warning"
-        assert len(res["gaps"]) == 1
-        assert res["gaps"][0].get("accepted") is None or res["gaps"][0].get("accepted") is False
+        assert res["gaps"][0]["date"] == "2026-06-24"

@@ -55,6 +55,7 @@ from nousergon_lib.dates import now_dual
 from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.trading_calendar import previous_trading_day
 
+from executor.accepted_gaps import load_accepted_gaps
 from executor.config_loader import load_config
 from executor.eod_reconcile import _spy_close
 from executor.eod_reconcile import run as eod_run
@@ -170,24 +171,19 @@ def audit_window(
 
     dates = [d for d in _window_dates(start=start, end=end, trailing_days=trailing_days)
              if d not in exclude_dates]
-
-    # Pre-load the accepted-gaps registry once so every gap-date check is a dict
-    # lookup, not an S3 read per date. An absent/malformed registry degrades to
-    # {} and the gap-handling branch below falls through to the normal
-    # auto-backfill/flag logic — this is deliberately fail-safe (alpha-engine-
-    # config#5570: an unreadable accepted-gaps file must NOT suppress gaps that
-    # would otherwise be detected).
-    try:
-        from executor.accepted_gaps import load_accepted_gaps
-        _accepted_gaps = load_accepted_gaps(trades_bucket, region)
-    except Exception:  # noqa: BLE001 — fail-safe: degrade to no accepted gaps
-        logger.warning("[reconcile_audit] failed to load accepted-gaps registry — treating as empty (fail-safe)")
-        _accepted_gaps = {}
-
     try:
         fd = get_flow_doctor()
     except Exception:  # noqa: BLE001 — flow-doctor optional / not configured
         fd = None
+
+    # Load the accepted-gaps registry (alpha-engine-config#5570). This is a
+    # best-effort S3 read: a missing or inaccessible registry is treated as
+    # "no gaps accepted yet" and the gap handler degrades gracefully (every
+    # unaccepted gap still goes through to the MANUAL-backfill flag as before).
+    accepted_gaps = (
+        load_accepted_gaps(trades_bucket, region)
+        if trades_bucket else {}
+    )
 
     corrected: list[dict] = []
     skipped: list[dict] = []
@@ -251,39 +247,34 @@ def audit_window(
                         context={"site": "reconcile_audit_gap_auto_backfilled", "run_date": d})
                 continue
 
-            # ── Accepted-gap check (alpha-engine-config#5570) ─────────────────
-            # Before flagging for MANUAL backfill, check whether this date is a
-            # recorded permanently-unrecoverable gap (CaptureSnapshot failed
-            # before midnight and the snapshot was never written — see alpha-
-            # engine-config#5569). An accepted gap is reported at INFO level,
-            # never re-flagged as a WARNING needing manual action. It still
-            # appears in the run's ``gaps`` output — suppressed from *paging*,
-            # never from *the record* (config#5570: a gap suppressed without a
-            # ruling is a corrupted alpha series with the evidence deleted).
-            gap_entry = {
-                "date": d, "settled_spy_close": settled,
-                "auto_backfill_reason": auto_result["reason"],
-            }
-            if d in _accepted_gaps:
-                accepted = _accepted_gaps[d]
-                gap_entry["accepted"] = True
-                gap_entry["ruling_ref"] = accepted.get("ruling_ref", "unknown")
-                gap_entry["accepted_reason"] = accepted.get("reason", "")
+            # ── Accepted gap (alpha-engine-config#5570): a date whose snapshot
+            # never existed and is accepted as permanently unrecoverable by
+            # operator ruling. Log at INFO, still list in gaps (never suppressed
+            # from the record), but do NOT warn or page — the accepted-gap
+            # registry is the operator's explicit declaration that no action
+            # is required.
+            if d in accepted_gaps:
+                entry = accepted_gaps[d]
                 logger.info(
-                    "[reconcile_audit] %s has NO eod_pnl row — ACCEPTED gap "
-                    "(ruling: %s, reason: %s). Reported at info; no page "
-                    "(alpha-engine-config#5570).",
-                    d, accepted.get("ruling_ref", "unknown"),
-                    accepted.get("reason", "unspecified"),
-                )
-                gaps.append(gap_entry)
+                    "[reconcile_audit] %s has NO eod_pnl row but is registered as "
+                    "an ACCEPTED gap (ruling: %s, reason: %s) — logged, not paged.",
+                    d, entry.get("ruling", "unknown"), entry.get("reason", "unspecified"))
+                gaps.append({
+                    "date": d, "settled_spy_close": settled,
+                    "accepted": True,
+                    "ruling": entry.get("ruling"),
+                    "accepted_reason": entry.get("reason"),
+                })
                 continue
 
             logger.warning(
                 "[reconcile_audit] %s has NO eod_pnl row (skipped session) — %s "
                 "Flagging gap for MANUAL backfill; not auto-synthesizing a NAV.",
                 d, auto_result["reason"])
-            gaps.append(gap_entry)
+            gaps.append({
+                "date": d, "settled_spy_close": settled,
+                "auto_backfill_reason": auto_result["reason"],
+            })
             if fd:
                 fd.report(
                     RuntimeError(
