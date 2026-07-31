@@ -55,6 +55,7 @@ from nousergon_lib.dates import now_dual
 from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.trading_calendar import previous_trading_day
 
+from executor.accepted_gaps import load_accepted_gaps
 from executor.config_loader import load_config
 from executor.eod_reconcile import _spy_close
 from executor.eod_reconcile import run as eod_run
@@ -175,6 +176,15 @@ def audit_window(
     except Exception:  # noqa: BLE001 — flow-doctor optional / not configured
         fd = None
 
+    # Load the accepted-gaps registry (alpha-engine-config#5570). This is a
+    # best-effort S3 read: a missing or inaccessible registry is treated as
+    # "no gaps accepted yet" and the gap handler degrades gracefully (every
+    # unaccepted gap still goes through to the MANUAL-backfill flag as before).
+    accepted_gaps = (
+        load_accepted_gaps(trades_bucket, region)
+        if trades_bucket else {}
+    )
+
     corrected: list[dict] = []
     skipped: list[dict] = []
     gaps: list[dict] = []
@@ -235,6 +245,26 @@ def audit_window(
                             f"{auto_result['gate'].get('prior_date')}."),
                         severity="warning",
                         context={"site": "reconcile_audit_gap_auto_backfilled", "run_date": d})
+                continue
+
+            # ── Accepted gap (alpha-engine-config#5570): a date whose snapshot
+            # never existed and is accepted as permanently unrecoverable by
+            # operator ruling. Log at INFO, still list in gaps (never suppressed
+            # from the record), but do NOT warn or page — the accepted-gap
+            # registry is the operator's explicit declaration that no action
+            # is required.
+            if d in accepted_gaps:
+                entry = accepted_gaps[d]
+                logger.info(
+                    "[reconcile_audit] %s has NO eod_pnl row but is registered as "
+                    "an ACCEPTED gap (ruling: %s, reason: %s) — logged, not paged.",
+                    d, entry.get("ruling", "unknown"), entry.get("reason", "unspecified"))
+                gaps.append({
+                    "date": d, "settled_spy_close": settled,
+                    "accepted": True,
+                    "ruling": entry.get("ruling"),
+                    "accepted_reason": entry.get("reason"),
+                })
                 continue
 
             logger.warning(
