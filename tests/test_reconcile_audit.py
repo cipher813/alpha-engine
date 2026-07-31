@@ -365,8 +365,8 @@ class TestAuditWindow:
         # load_accepted_gaps MUST NOT be called when bucket is empty
         with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled[d]), \
              patch.object(reconcile_audit, "load_accepted_gaps") as load_mock, \
-             patch("executor.backfill_eod_pnl.backfill") as bf_mock, \
-             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch("executor.backfill_eod_pnl.backfill"), \
+             patch.object(reconcile_audit, "eod_run"), \
              patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
             res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
         load_mock.assert_not_called()
