@@ -4,10 +4,9 @@ eod_pnl (alpha-engine-config#5570)."""
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from executor.accepted_gaps import (
-    _ACCEPTED_GAPS_KEY,
     _SCHEMA_VERSION,
     build_seed_gap,
     is_accepted_gap,
@@ -40,7 +39,7 @@ class TestLoadAcceptedGaps:
         err.response = {"Error": {"Code": "AccessDenied"}}
         s3.get_object.side_effect = err
         import pytest
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="AccessDenied"):
             load_accepted_gaps("my-bucket", s3_client=s3)
 
     def test_parses_valid_registry(self):

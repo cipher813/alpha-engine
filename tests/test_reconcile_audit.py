@@ -3,7 +3,7 @@ that were frozen pre-settlement (config#1276)."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 
 from executor import reconcile_audit
 from executor.reconcile_audit import _window_dates, audit_window

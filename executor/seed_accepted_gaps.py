@@ -28,7 +28,7 @@ import boto3
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from executor.accepted_gaps import build_seed_gap, load_accepted_gaps
+from executor.accepted_gaps import load_accepted_gaps
 from executor.config_loader import load_config
 
 logger = logging.getLogger(__name__)
