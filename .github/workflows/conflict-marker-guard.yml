@@ -1,0 +1,44 @@
+name: Conflict marker guard
+
+# A committed merge-conflict marker in a workflow file is invisible to normal
+# CI: GitHub cannot parse the YAML, so the run is a startup_failure with ZERO
+# jobs and ZERO logs. `gh run view --log-failed` returns "log not found". The
+# check does not fail — it never runs, which reads as "red for some reason"
+# rather than "this workflow is dead".
+#
+# That is exactly what happened to ruff.yml: a `<<<<<<< HEAD` landed on main in
+# 595601f (a Dependabot merge) and the blocking ruff lint silently did not
+# execute on any commit afterwards.
+#
+# This guard is deliberately a plain grep over the whole tree, not just
+# workflows — a marker committed anywhere is a defect, and the cost of checking
+# everything is a couple of seconds.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  conflict-markers:
+    name: conflict-markers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Fail on committed merge-conflict markers
+        run: |
+          set -uo pipefail
+          # Anchored to line start, and the 7-char form git actually writes, so
+          # prose mentioning "<<<<<<<" inline does not trip it.
+          if git grep -nE '^(<{7}|={7}|>{7})( |$)' -- . ':!.github/workflows/conflict-marker-guard.yml'; then
+            echo "::error::Committed merge-conflict marker(s) found (listed above)."
+            echo "A marker in a workflow file makes the run a startup_failure —"
+            echo "zero jobs, zero logs — so the check silently stops running."
+            exit 1
+          fi
+          echo "No conflict markers found."

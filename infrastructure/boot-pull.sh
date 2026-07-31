@@ -9,7 +9,9 @@
 
 set -uo pipefail
 
-LOG="/var/log/boot-pull.log"
+# AE_BOOT_PULL_LOG exists so tests can source this file and exercise
+# sync_repo_to_main() without needing write access to /var/log.
+LOG="${AE_BOOT_PULL_LOG:-/var/log/boot-pull.log}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
@@ -42,6 +44,136 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 # via flow-doctor + the FAIL log lines). Never swallow a lock timeout.
 GIT_SYNC_LOCK="${AE_GIT_SYNC_LOCK:-/home/ec2-user/.ae-git-sync.lock}"
 GIT_SYNC_LOCK_WAIT="${AE_GIT_SYNC_LOCK_WAIT:-150}"
+
+# ── Sync one checkout to origin/main, judged on the post-condition ──────────
+# Returns 0 when the checkout provably sits on the remote's current main, 1
+# otherwise. Extracted as a function (config-I4978) for two reasons: the main
+# loop reads as one decision instead of four nested branches, and the decision
+# becomes directly testable — every prior guard on this logic was a regex over
+# this file's source text, which is exactly why the control-flow defect below
+# shipped and then survived a review.
+#
+# THE DEFECT THIS CLOSES. `git fetch` exits non-zero when ANY ref fails to
+# update, and the previous shape chained `git fetch origin ... && git checkout
+# -f main && git reset --hard origin/main`. So a ref-update failure skipped the
+# self-heal AND raised "the executor may be running stale code" — on every
+# weekday boot for at least 7 days (07-22 through 07-28 confirmed in
+# /var/log/boot-pull.log).
+#
+# Scoping the fetch to `origin main` narrows the blast radius but does NOT close
+# it: the ref observed failing its compare-and-swap on 2026-07-28 was
+# `refs/remotes/origin/main` ITSELF —
+#
+#   error: cannot lock ref 'refs/remotes/origin/main': is at 01a279f...
+#          but expected a3b5971...
+#    ! a3b5971..01a279f  main -> origin/main  (unable to update local ref)
+#
+# — while that same fetch had already fast-forwarded origin/main to 01a279f
+# (`git reflog show refs/remotes/origin/main` confirms). The error was benign
+# and the exit code still suppressed the self-heal. A concurrent git writer on
+# this box wins that race whenever it interleaves, so the exit code cannot be
+# the gate no matter how narrow the refspec is.
+sync_repo_to_main() {
+    local repo="$1"
+    local rc=0
+
+    # The fetch's status is captured SEPARATELY from the checkout/reset, and the
+    # two are chained with `;` rather than `&&`, for a reason the group's single
+    # exit code cannot express. Two distinct failures need two distinct answers:
+    #
+    #   fetch failed  -> origin/main may be STALE, so no comparison between two
+    #                    LOCAL refs can prove the checkout is current. Needs an
+    #                    authoritative remote read.
+    #   reset failed  -> the tree is not where we put it. Post-condition catches
+    #                    it directly.
+    #
+    # Collapsing them (the previous `&&` chain, and a plain `;` too) produces the
+    # false OK that matters most: a fetch that cannot reach the remote, followed
+    # by a reset onto the stale origin/main, exits 0 with HEAD == origin/main
+    # satisfied by two equally-old refs. That is precisely the stale-code case
+    # this whole alert exists to catch.
+    #
+    # A failed fetch is RETRIED ONCE, scoped to main, before it is believed.
+    # This is what separates the two causes, and it does so by construction:
+    #
+    #   ref-CAS race        — transient. The retry finds the ref already at the
+    #                         value it wanted, so it succeeds.
+    #   unreachable remote  — auth/network. The retry fails the same way.
+    #
+    # Measured on the trading box 2026-07-30: `refs/remotes/origin/main` itself
+    # was among the refs failing CAS ("is at 876b73b7 but expected 7aa716e6"),
+    # i.e. something had already advanced origin/main between this fetch's ref
+    # negotiation and its ref update. That is precisely the transient a retry
+    # absorbs and an exit code cannot.
+    #
+    # A remote read (`git ls-remote`) was the obvious alternative and is WORSE
+    # here: `alpha-engine-config` takes merges continuously, so comparing HEAD
+    # against a freshly-read remote tip fails whenever main advances in the
+    # second between the reset and the read — reporting a correctly-synced box
+    # as stale. The retry asks the question that actually matters ("can we reach
+    # the remote and get main?") without racing anything.
+    #
+    # Exit code contract for the inner script:
+    #   0  fetch (possibly on retry) + checkout + reset all clean
+    #   10 fetch failed TWICE — remote genuinely unreachable
+    #   2  checkout/reset failed
+    #   3  cd failed
+    # flock's own `-w` timeout surfaces as 1, which is why 10 is used for the
+    # fetch rather than 1 — the two must stay distinguishable.
+    flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c '
+        cd "$1" || exit 3
+        fetch_rc=0
+        if ! git fetch origin main --prune; then
+            echo "boot-pull: fetch reported an error; retrying main once" >&2
+            git fetch origin main || fetch_rc=10
+        fi
+        git checkout -f main && git reset --hard origin/main || exit 2
+        exit $fetch_rc
+    ' _ "$repo" >> "$LOG" 2>&1 || rc=$?
+
+    # A flock timeout keeps its established fail-loud semantics (config#1944): a
+    # stuck git writer on this box is worth an alert on its own, independent of
+    # whether the code happens to be current.
+    if [ "$rc" -eq 1 ]; then
+        log "FAIL $repo — git-sync flock timed out after ${GIT_SYNC_LOCK_WAIT}s on $GIT_SYNC_LOCK (a git writer is stuck)"
+        return 1
+    fi
+
+    local head_branch head_sha origin_main_sha
+    head_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")
+    origin_main_sha=$(git -C "$repo" rev-parse origin/main 2>/dev/null || echo "")
+
+    # Judge on the POST-CONDITION, evaluated UNCONDITIONALLY. The invariant that
+    # matters is "this checkout is on main at the remote's current main"; the
+    # sync's exit code is only ever a proxy for it, and it is a proxy that is
+    # wrong in both directions.
+    if [ "$head_branch" != "main" ] || [ -z "$head_sha" ] \
+            || [ "$head_sha" != "$origin_main_sha" ]; then
+        log "FAIL $repo — post-condition failed: branch=$head_branch HEAD=$head_sha origin/main=$origin_main_sha (sync rc=$rc)"
+        return 1
+    fi
+
+    # HEAD == origin/main is necessary but NOT sufficient. If the fetch never
+    # reached the remote, origin/main is stale too and the comparison above is
+    # satisfied by two equally-old LOCAL refs — a false OK in exactly the
+    # stale-code case this alert exists for. rc != 0 here means the fetch failed
+    # twice, so nothing local can be trusted as current.
+    if [ "$rc" -ne 0 ]; then
+        log "FAIL $repo — sync rc=$rc (fetch failed twice / checkout unusable); HEAD=$head_sha cannot be shown to be current"
+        return 1
+    fi
+
+    log "OK   $repo — $(git -C "$repo" log --oneline -1)"
+    return 0
+}
+
+# Tests source this file for sync_repo_to_main() and must not execute the boot
+# sequence (SSM reads, sudo, systemctl). Everything above this line is pure
+# definition; everything below has side effects.
+if [ "${AE_BOOT_PULL_LIB_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 log "=== boot-pull started ==="
 
@@ -134,21 +266,35 @@ for repo in "${REPOS[@]}"; do
     if [ "$CURRENT_BRANCH" != "main" ]; then
         log "NOTE $repo — on branch '$CURRENT_BRANCH', will reset to origin/main (policy: boot always tracks main)"
     fi
-    # Serialize the index-mutating git ops behind the shared flock (config#1944)
-    # so this boot-pull can't race the weekday CodeFreshnessGate /
-    # ChronicGapSelfHeal on .git/index.lock. flock holds the lock for the whole
-    # fetch+checkout+reset group (window-free) and returns non-zero on a -w
-    # timeout (fail-loud -> else branch below). The ownership reclaim above runs
-    # OUTSIDE the lock deliberately (it is not a git-index op; a test pins that
-    # the reclaim still precedes the reset).
-    if flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" bash -c 'git fetch origin && git checkout -f main && git reset --hard origin/main' >> "$LOG" 2>&1; then
-        NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
-        log "OK   $repo — $(git log --oneline -1)"
 
-        # Deploy gate: import smoke test (catches syntax + transitive ImportErrors;
-        # no IB Gateway connection needed). Imports pull the full transitive module
-        # graph, so a broken dependency in any executor module surfaces here pre-
-        # planner, not at runtime.
+    # Fix stale remote URL (post-org-transfer: cipher813/alpha-engine-config →
+    # nousergon/alpha-engine-config). Only the config repo was cloned pre-transfer
+    # and carries the old path; sibling repos point at nousergon/ directly.
+    if [ "$repo" = "/home/ec2-user/alpha-engine-config" ]; then
+        _CURRENT_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+        _EXPECTED_URL="https://github.com/nousergon/alpha-engine-config.git"
+        if [ -n "$_CURRENT_URL" ] && [ "$_CURRENT_URL" != "$_EXPECTED_URL" ]; then
+            log "FIX $repo — remote.origin.url corrected: $_CURRENT_URL -> $_EXPECTED_URL"
+            git remote set-url origin "$_EXPECTED_URL" >> "$LOG" 2>&1 \
+                || log "WARN $repo — remote set-url failed"
+        fi
+        unset _CURRENT_URL _EXPECTED_URL
+    fi
+
+    # The sync + its post-condition live in sync_repo_to_main() (defined at the
+    # top of this file, where the full rationale is). It serializes the
+    # index-mutating git ops behind the shared flock (config#1944) so this cannot
+    # race the weekday CodeFreshnessGate / ChronicGapSelfHeal on .git/index.lock,
+    # and it judges success on the post-condition rather than on git's exit code.
+    # The ownership reclaim above runs OUTSIDE the lock deliberately (it is not a
+    # git-index op; a test pins that the reclaim still precedes the sync).
+    if sync_repo_to_main "$repo"; then
+        NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
+
+        # Deploy gate: import smoke test (catches syntax + transitive
+        # ImportErrors; no IB Gateway connection needed). Imports pull the full
+        # transitive module graph, so a broken dependency in any executor module
+        # surfaces here pre-planner, not at runtime.
         if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
             if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
                 log "GATE $repo — running import smoke test..."
@@ -162,7 +308,6 @@ for repo in "${REPOS[@]}"; do
             fi
         fi
     else
-        log "FAIL $repo — git-sync under flock failed (fetch/checkout/reset error OR ${GIT_SYNC_LOCK_WAIT}s lock timeout on $GIT_SYNC_LOCK); last git lines: $(tail -3 "$LOG" | tr '\n' ';')"
         PULL_FAILURES=$((PULL_FAILURES + 1))
         FAILED_REPOS+=("$repo (git)")
     fi
@@ -173,11 +318,34 @@ for repo in "${REPOS[@]}"; do
     # install (pip install -e /home/ec2-user/flow-doctor) has been
     # removed so boot doesn't silently overwrite the lib-provided copy
     # with a local dev branch.
-    if [ -f ".venv/bin/pip" ] && [ -f "requirements.txt" ]; then
-        if .venv/bin/pip install --quiet -r requirements.txt >> "$LOG" 2>&1; then
-            log "OK   $repo — deps updated"
+    #
+    # alpha-engine-data-config#1768 Phase 1: trading no longer runs the heavy
+    # weekday/EOD data phases at all (those moved to ephemeral EC2 spot boxes
+    # in config#1767 Phase 2, nousergon-data#643) — the ONLY thing this box's
+    # alpha-engine-data checkout still needs a working venv for is the
+    # metron-intraday collector (systemd timer, see the sync_systemd_units_from
+    # call below), plus a manual/emergency SSM fallback of morning_enrich /
+    # daily_append if ever needed. nousergon-data's own
+    # infrastructure/data-trading-requirements.txt is the traced minimal
+    # subset for exactly that scope (excludes arcticdb's RAG/backfill/
+    # weekly-feature-engineer-only siblings: voyageai, edgartools, embit,
+    # jsonschema, beautifulsoup4, feedparser — see that file's header for the
+    # full trace) — full requirements.txt (~1.5GB, RAG + backfill + weekly
+    # feature_engineer deps this box never runs) stays reserved for repos
+    # that actually need it. REQUIREMENTS_FILE keyed on $repo rather than a
+    # generic lookup table since alpha-engine-data is (for now) the only repo
+    # in $REPOS with a non-default requirements filename; extend this
+    # if/elif (not a full map) only if a second repo needs the same
+    # treatment.
+    REQUIREMENTS_FILE="requirements.txt"
+    if [ "$repo" = "/home/ec2-user/alpha-engine-data" ] && [ -f "infrastructure/data-trading-requirements.txt" ]; then
+        REQUIREMENTS_FILE="infrastructure/data-trading-requirements.txt"
+    fi
+    if [ -f ".venv/bin/pip" ] && [ -f "$REQUIREMENTS_FILE" ]; then
+        if .venv/bin/pip install --quiet -r "$REQUIREMENTS_FILE" >> "$LOG" 2>&1; then
+            log "OK   $repo — deps updated (from $REQUIREMENTS_FILE)"
         else
-            log "FAIL $repo — pip install failed"
+            log "FAIL $repo — pip install failed (from $REQUIREMENTS_FILE)"
             PULL_FAILURES=$((PULL_FAILURES + 1))
             FAILED_REPOS+=("$repo (pip)")
         fi
@@ -321,23 +489,48 @@ fi
 # (2026-07-13 operator ruling: "queue on merge, apply on next boot" — THIS
 # boot-pull pass is that queue's drain point for the trading box, which is
 # off most of the day and can't reliably receive a merge-time SSM push).
-# $1: source dir holding *.service/*.timer. $2+: one or more glob prefixes
-# for orphan reconciliation (keeps each repo's orphan sweep scoped to units
-# IT owns — alpha-engine's sweep must never disable/remove a nousergon-data
-# unit or vice versa; multiple prefixes let one source dir cover unit
-# families that don't share a common prefix, e.g. nousergon-data ships both
-# "metron-intraday.*" and "systemd-unit-drift-check.*").
+# $1: source dir holding *.service/*.timer. $2: space-separated EXCLUDE list
+# of exact basenames to skip entirely (install AND enable-reconcile) — for
+# a source dir that ships MULTIPLE repos' unit families where one family no
+# longer belongs on THIS box (config#1768 Phase 1: metron-intraday moved off
+# trading onto ae-dashboard, but nousergon-data's infrastructure/systemd/
+# still ships its unit files for ae-dashboard's OWN sync pass to pick up —
+# the install loop below globs *.service/*.timer unconditionally, so
+# without this exclude it would keep re-installing + re-enabling
+# metron-intraday on trading every boot regardless of the orphan-prefix
+# args, since the orphan pass only fires when a unit is ABSENT from
+# $SYSTEMD_SRC, not merely unwanted on this box). Pass "" for no excludes.
+# $3+: one or more glob prefixes for orphan reconciliation (keeps each
+# repo's orphan sweep scoped to units IT owns — alpha-engine's sweep must
+# never disable/remove a nousergon-data unit or vice versa; multiple
+# prefixes let one source dir cover unit families that don't share a common
+# prefix, e.g. nousergon-data ships both "metron-intraday.*" and
+# "systemd-unit-drift-check.*").
 sync_systemd_units_from() {
     local SYSTEMD_SRC="$1"
     shift
+    local EXCLUDE_BASENAMES="$1"
+    shift
     local ORPHAN_GLOB_PREFIXES=("$@")
     [ -d "$SYSTEMD_SRC" ] || return 0
+
+    _sync_is_excluded() {
+        local candidate="$1"
+        local excl
+        for excl in $EXCLUDE_BASENAMES; do
+            [ "$candidate" = "$excl" ] && return 0
+        done
+        return 1
+    }
 
     local CHANGED=false
     for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         [ -f "$unit" ] || continue
         local name target
         name=$(basename "$unit")
+        if _sync_is_excluded "$name"; then
+            continue
+        fi
         target="/etc/systemd/system/$name"
         if [ ! -f "$target" ]; then
             sudo cp "$unit" /etc/systemd/system/
@@ -407,15 +600,19 @@ sync_systemd_units_from() {
         [ -f "$unit" ] || continue
         local tname
         tname=$(basename "$unit")
+        if _sync_is_excluded "$tname"; then
+            continue
+        fi
         if sudo systemctl enable --now "$tname" >> "$LOG" 2>&1; then
             log "OK   systemd: enable reconciled $tname"
         else
             log "WARN systemd: enable reconcile failed: $tname"
         fi
     done
+    unset -f _sync_is_excluded
 }
 
-sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "alpha-engine-"
+sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "" "alpha-engine-"
 
 # nousergon-data's systemd units (metron-intraday.{service,timer} +
 # config#2352's own systemd-unit-drift-check.{service,timer}) — see
@@ -424,7 +621,37 @@ sync_systemd_units_from "/home/ec2-user/alpha-engine/infrastructure/systemd" "al
 # "alpha-engine-*"-style prefix: glob on the two exact basenames this repo
 # ships instead of a wildcard prefix, so a future unrelated unit hand-placed
 # on this box for debugging is never swept as an "orphan" of this repo.
-sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday" "systemd-unit-drift-check"
+#
+# config#1768 Phase 1 (2026-07-21): metron-intraday MOVED off trading onto
+# ae-dashboard (config#1768 workstream 2) — ae-dashboard now runs it
+# (intraday price alerts Lambda already covers the duplicate work this was
+# doing here; see that issue). nousergon-data's infrastructure/systemd/ dir
+# is shared by BOTH boxes' sync passes (ae-dashboard's own boot-pull now
+# also points at this same source dir for its metron-intraday pull), so
+# metron-intraday.{service,timer} must stay in the exclude list here
+# PERMANENTLY, not just as a one-time cleanup — without it, the very next
+# nousergon-data merge touching either unit file would re-install +
+# re-enable it right back onto trading via the reconcile loop above
+# (orphan-removal alone can't catch this: the unit is NOT absent from
+# $SYSTEMD_SRC, it's merely unwanted on THIS box).
+sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd" "metron-intraday.service metron-intraday.timer" "systemd-unit-drift-check"
+
+# One-time (idempotent) self-heal for boxes that already had metron-intraday
+# installed+enabled from before the exclude above existed: the exclude only
+# stops FUTURE install/enable/re-enable, it does not retroactively touch a
+# unit already present in /etc/systemd/system/, since sync_systemd_units_from
+# only acts on units it manages (installs, updates, or orphan-removes ones
+# absent from $SYSTEMD_SRC — metron-intraday is neither, now that it's
+# excluded rather than removed from the source dir). `|| true` on every step:
+# this must never fail boot-pull itself, and each systemctl call is already
+# a no-op if the unit doesn't exist / isn't loaded. Safe to leave in
+# permanently (config#1768's own closes-when checks `systemctl is-active
+# metron-intraday` is inactive/masked on ae-trading — this is that
+# self-healing path for this environment, which cannot verify it live).
+if systemctl list-unit-files metron-intraday.timer >> "$LOG" 2>&1 || systemctl list-unit-files metron-intraday.service >> "$LOG" 2>&1; then
+    log "NOTE metron-intraday unit(s) found installed on trading — disabling (config#1768: moved to ae-dashboard)"
+    sudo systemctl disable --now metron-intraday.timer metron-intraday.service 2>> "$LOG" || true
+fi
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
 # Each module's config loader searches ~/alpha-engine-config/ first.
@@ -439,30 +666,43 @@ sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd
 # in /var/log/boot-pull.log are the fallback signal, and we still exit 1.
 if [ "$PULL_FAILURES" -gt 0 ]; then
     log "=== boot-pull completed with $PULL_FAILURES failure(s): ${FAILED_REPOS[*]} ==="
-    FD_VENV="/home/ec2-user/alpha-engine/.venv/bin/python"
-    FD_CFG="/home/ec2-user/alpha-engine/flow-doctor.yaml"
-    if [ -x "$FD_VENV" ] && [ -f "$FD_CFG" ]; then
-        "$FD_VENV" - <<PYEOF 2>> "$LOG" || true
-import os
-import sys
-sys.path.insert(0, "/home/ec2-user/alpha-engine")
-try:
-    from nousergon_lib.secrets import get_secret
-    for _name in ("EMAIL_SENDER", "EMAIL_RECIPIENTS", "GMAIL_APP_PASSWORD", "FLOW_DOCTOR_GITHUB_TOKEN"):
-        _val = get_secret(_name, required=False)
-        if _val is not None and _name not in os.environ:
-            os.environ[_name] = _val
-    import flow_doctor
-    fd = flow_doctor.init(config_path="/home/ec2-user/alpha-engine/flow-doctor.yaml")
-    fd.report(
-        RuntimeError("boot-pull failed: ${FAILED_REPOS[*]}"),
-        severity="error",
-        context={"site": "boot-pull", "host": "trading", "failures": "${FAILED_REPOS[*]}"},
-    )
-except Exception as e:
-    print(f"[boot-pull] flow-doctor report failed: {e}", file=sys.stderr)
-PYEOF
+
+    # This used to construct flow-doctor by hand in a heredoc. It had been
+    # BROKEN for an unknown length of time and nobody knew, because the thing
+    # that was broken was the failure reporter itself
+    # (alpha-engine-config-I4509). Two independent faults, either one fatal:
+    #
+    #   1. `flow_doctor.init()` does not exist. flow-doctor 0.8.7 exports
+    #      FlowDoctor/FlowDoctorBuilder and no `init`; the call raised
+    #      AttributeError every time, leaving one stderr line in a log nobody
+    #      reads.
+    #   2. The env hydration was incomplete anyway — flow-doctor.yaml
+    #      references more ${VAR}s than the heredoc hydrated, so even with the
+    #      API call fixed, construction fails with ConfigError.
+    #
+    # This matters more here than on the dashboard box: THIS is the trading
+    # box, boot-pull is what guarantees it runs current code on a trading day,
+    # and it runs once at boot on an instance that only exists during the
+    # trading window — so a failure has a one-day blast radius and then the
+    # evidence disappears with the instance. It was observed failing for 3+
+    # days straight with zero signal.
+    #
+    # `krepis.alerts` is the canonical alert CLI (config#1649) and resolves its
+    # own secrets, so there is no hydration list here to drift.
+    ALERT_PY="/home/ec2-user/alpha-engine/.venv/bin/python"
+    if [ -x "$ALERT_PY" ]; then
+        _dkey="boot-pull-trading-$(printf '%s' "${FAILED_REPOS[*]}" | tr ' /' '__' | cut -c1-72)"
+        "$ALERT_PY" -m krepis.alerts publish \
+            --message "boot-pull FAILED on the TRADING box: ${PULL_FAILURES} repo(s) could not be updated — ${FAILED_REPOS[*]}. The executor may be running stale code for today's session. See /var/log/boot-pull.log." \
+            --severity error \
+            --source boot-pull \
+            --dedup-key "$_dkey" \
+            --dedup-window-min 1440 \
+            || log "ALERT PUBLISH FAILED — boot-pull failure is UNREPORTED"
+    else
+        log "ALERT PUBLISH SKIPPED — $ALERT_PY missing; boot-pull failure is UNREPORTED"
     fi
+
     log "=== boot-pull complete (with failures) ==="
     exit 1
 fi
