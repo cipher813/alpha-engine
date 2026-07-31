@@ -405,9 +405,23 @@ def _read_signals(
     # the coverage assert sees the injected rows for synthesized tickers.
     _champion_injected_predictions: dict = {}
     if not simulate:
-        from executor.champion import apply_champion_selection, load_champion_pointer
+        from executor.champion import (
+            apply_champion_selection,
+            assert_producer_champion_coherence,
+            load_champion_pointer,
+        )
 
         _champion_pointer = load_champion_pointer(signals_bucket)
+        # Coherence guard (config#5713): refuse to start a trading day when
+        # the signals producer's buy_candidates is empty BY CONTRACT and the
+        # resolved champion arm is a no-op passthrough (agentic) — that
+        # pairing guarantees no new entry is ever proposed, silently. The
+        # producer stamps ``producer`` at write time, the champion pointer
+        # resolves here at read time, and neither side can see the other;
+        # this read path is the only place both facts are in hand. Must run
+        # BEFORE apply_champion_selection so the guard sees the producer's
+        # own artifact, not a champion-stamped copy.
+        assert_producer_champion_coherence(signals_raw, _champion_pointer, config)
         if _champion_pointer["champion"] in ("scanner_predictor_direct", "thinktank_coverage"):
             from executor.eod_reconcile import _load_constituents_sector_map
             sector_map = _load_constituents_sector_map(signals_bucket)
@@ -948,6 +962,7 @@ def _write_stops_and_finalize(
     signals_bucket: str | None = None,
     use_optimizer: bool = False,
     signals_raw: dict | None = None,
+    config: dict | None = None,
 ) -> None:
     """Write stop records for held positions, detect shorts, save order book, notify.
 
@@ -1045,6 +1060,24 @@ def _write_stops_and_finalize(
             ob, blocked_entries, signals_bucket, run_date,
             champion=(signals_raw or {}).get("champion"),
             promotion_source=(signals_raw or {}).get("promotion_source"),
+        )
+
+    # Consecutive zero-entries floor alarm (config#5713) — general-case
+    # backstop for "no new entry ever proposed" failures that the
+    # producer/champion coherence assertion in _read_signals cannot
+    # enumerate. Runs after today's summary is written so the streak
+    # includes the session just planned. Best-effort: never blocks the
+    # planner (this call site is live-only — not simulate / not dry_run —
+    # so the backtest replay path never pages).
+    if signals_bucket:
+        from executor.zero_entries_alarm import check_zero_entries_floor
+
+        check_zero_entries_floor(
+            signals_bucket,
+            run_date,
+            threshold=int(
+                (config or {}).get("zero_entries_alarm_consecutive_sessions", 3)
+            ),
         )
 
     n_entries = len(ob.pending_entries())
@@ -2067,7 +2100,7 @@ def run(
         # ── 6. Write stop records and save order book for daemon ────────────────
         if not simulate and not dry_run:
             try:
-                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer, signals_raw=signals_raw)
+                _write_stops_and_finalize(ibkr, ob, price_histories, atr_map, strategy_config, conn, run_date, blocked_entries, signals_bucket, use_optimizer=use_optimizer, signals_raw=signals_raw, config=config)
             except Exception as e:
                 logger.warning("Failed to write order book: %s", e)
 
