@@ -7,9 +7,20 @@ never the real SSM Parameter Store.
 """
 import os
 import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
+
+# Mock arcticdb before any executor module is imported — executor/__init__.py
+# imports arcticdb at module level (the macOS allocator-priming fix), but
+# arcticdb has no prebuilt wheel for aarch64+py312 on this CI runner.
+# Expose Arctic so unittest.mock.patch.object can find the attribute — several
+# test modules patch arcticdb.Arctic and MagicMock.patch.object raises
+# AttributeError when the target attribute doesn't exist on the real module.
+_arcticdb_stub = types.ModuleType("arcticdb")
+_arcticdb_stub.Arctic = MagicMock
+sys.modules["arcticdb"] = _arcticdb_stub
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
