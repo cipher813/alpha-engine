@@ -90,6 +90,34 @@ class StaleChampionFeedError(RuntimeError):
     silently on data that no longer reflects current market state."""
 
 
+class ProducerChampionIncoherenceError(ChampionPointerError):
+    """Raised when a producer whose ``buy_candidates`` is EMPTY BY CONTRACT
+    is paired with a champion arm that cannot synthesize entries (a no-op
+    arm). Such a pairing guarantees zero new entries are ever proposed — a
+    configuration incoherence (a rollback or bad promotion of the champion
+    pointer), never a market condition (config#5713)."""
+
+
+# Producers whose signals.json ``buy_candidates`` is EMPTY BY CONTRACT —
+# they never propose entries themselves and rely on a champion arm that
+# synthesizes them (today: ``signals_envelope``, see crucible-research
+# scoring/signals_envelope.py's docstring caveat). These baselines mirror
+# the declared producer/champion compatibility matrix on the private side
+# (executor risk.yaml keys
+# ``producers_emitting_empty_buy_candidates_by_contract`` /
+# ``champion_noop_arms`` and crucible-research producers/registry.py,
+# config#5713): config values EXTEND the baselines (union), they can never
+# disable them — a stale/missing/partial config row must not silently turn
+# the coherence guard off.
+DEFAULT_EMPTY_BUY_CANDIDATES_PRODUCERS = frozenset({"signals_envelope"})
+
+# Champion arms that are no-op passthroughs in ``apply_champion_selection``
+# — they neither read nor fill ``buy_candidates``. Today exactly one: the
+# ``agentic`` arm. Config-extensible via ``champion_noop_arms`` for the
+# same fail-closed reason as the producer set.
+DEFAULT_NOOP_CHAMPION_ARMS = frozenset({"agentic"})
+
+
 def load_champion_pointer(bucket: str, s3_client=None) -> dict:
     """Read ``s3://{bucket}/config/producer_champion.json``.
 
@@ -144,6 +172,64 @@ def load_champion_pointer(bucket: str, s3_client=None) -> dict:
         )
 
     return pointer
+
+
+def assert_producer_champion_coherence(
+    signals_raw: dict,
+    pointer: dict,
+    config: dict,
+) -> None:
+    """Raise when a producer whose ``buy_candidates`` is EMPTY BY CONTRACT
+    is paired with a champion arm that cannot fill it (config#5713).
+
+    The read path is the only place both facts are visible: the producer
+    stamps ``signals_raw["producer"]`` at write time, the champion pointer
+    resolves at read time, and neither side can see the other. An empty
+    ``buy_candidates`` under the ``agentic`` no-op arm means NO new entry
+    will ever be proposed — a configuration incoherence, not a market
+    condition, and exactly the failure a rollback or bad promotion of the
+    champion pointer produces silently (see crucible-research
+    scoring/signals_envelope.py's docstring caveat).
+
+    The producer set and the no-op arm set are DECLARED, not hardcoded in
+    the branch: the module baselines mirror the compatibility matrix in the
+    private config repo (executor risk.yaml keys
+    ``producers_emitting_empty_buy_candidates_by_contract`` /
+    ``champion_noop_arms``) and crucible-research's ``producers/registry.py``
+    — config values EXTEND the baselines (union semantics); a
+    missing/empty/partial config row still enforces the baselines, so the
+    guard can never silently disable itself.
+
+    Producers that do not stamp ``producer`` are exempt — no declared
+    contract to enforce. Unrecognized producers are exempt — the matrix
+    only names producers whose emptiness is a contract, not a value.
+    """
+    producer = signals_raw.get("producer")
+    if not producer:
+        return
+    champion = pointer.get("champion")
+    empty_by_contract = DEFAULT_EMPTY_BUY_CANDIDATES_PRODUCERS | frozenset(
+        config.get("producers_emitting_empty_buy_candidates_by_contract") or ()
+    )
+    noop_arms = DEFAULT_NOOP_CHAMPION_ARMS | frozenset(
+        config.get("champion_noop_arms") or ()
+    )
+    if producer in empty_by_contract and champion in noop_arms:
+        raise ProducerChampionIncoherenceError(
+            f"Producer/champion configuration incoherence (config#5713): "
+            f"signals.json was written by producer={producer!r}, whose "
+            f"buy_candidates is EMPTY BY CONTRACT, but the resolved champion "
+            f"arm is {champion!r} — a no-op passthrough that never "
+            "synthesizes entries. No new entry will ever be proposed while "
+            "this pairing is live (the book trades down and never up). "
+            "Promote the champion pointer "
+            f"({CHAMPION_POINTER_KEY}) to a synthesizing arm "
+            "(scanner_predictor_direct / thinktank_coverage) or switch the "
+            "signals producer. Compatibility matrix declared in the "
+            "executor risk.yaml + crucible-research producers/registry.py. "
+            "Refusing to start a trading day on a configuration that "
+            "guarantees zero entries."
+        )
 
 
 def _rank_to_score(rank_fraction: float, floor: float, ceiling: float) -> float:
