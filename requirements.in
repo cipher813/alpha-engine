@@ -16,7 +16,7 @@ pyarrow~=25.0
 # executor and predictor agree on the ATR definition. See executor/price_cache.py
 # load_atr_14_pct. Version range kept loose to avoid pinning pain with the
 # predictor/backtester venvs which share the same S3-backed store.
-arcticdb~=6.20
+arcticdb~=6.18
 # anthropic SDK removed 2026-05-25 — executor has no LLM exposure per
 # [[preference_llm_calls_confined_to_research_module]] hard guardrail.
 # The 10-week EOD-narrative Haiku call site that motivated this dep was
@@ -66,7 +66,7 @@ websocket-client~=1.9
 # v0.83.0 floor (config#1741): fleet forum-topic Telegram config
 # (nousergon_lib.flow_doctor_fleet) + flow-doctor notify_event routing.
 # v0.75.0 added canonical √-impact TransactionCostModel (ARCHITECTURE §15/§43).
-nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.86.0
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.25
 # krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
 # console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
 # v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct
@@ -86,7 +86,7 @@ krepis>=0.25.0
 # import time — executor/portfolio_optimizer.py raises a clear ImportError if
 # missing, so the legacy 1/n sizing path runs unaffected on environments that
 # haven't pulled these in yet.
-# cvxpy: the rest of this stack (arcticdb~=6.20, pyarrow~=25.0, pandas~=3.0)
+# cvxpy: the rest of this stack (arcticdb~=6.18, pyarrow~=25.0, pandas~=3.0)
 # already resolves numpy to the 2.x series today — arcticdb 6.18.x and
 # pyarrow 25.0.x both support numpy 2 (verified via PyPI metadata + a real
 # `pip install -r requirements.txt`, numpy resolved to 2.4.6 even under the
