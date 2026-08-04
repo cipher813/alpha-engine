@@ -10,9 +10,14 @@ SPY stored 733.50 vs settled 734.30, corrupting daily alpha on 06-25 AND 06-26).
 This pass closes that gap institutionally. For a trailing window of trading
 days it re-reconciles (``eod_reconcile.run``, re-pricing from settled ArcticDB
 and re-emitting the artifact) any day whose stored ``spy_close`` diverged from
-the current settled close OR whose stored ``spy_return`` no longer matches the
-value recomputed from settled closes (the cascade case). Each correction writes
-an audit record and pages flow-doctor.
+the current settled close, whose stored ``spy_return`` no longer matches the
+value recomputed from settled closes (the cascade case), OR whose stored
+per-ticker ``closing_price`` for ANY held position diverged from that
+ticker's own current settled close (config#6349: the SPY-only checks caught
+nothing for a non-SPY name's provisional-then-corrected price, which then
+silently fed every later day's NAV three-way pricing&timing diff via
+``prior_positions``). Each correction writes an audit record and pages
+flow-doctor.
 
 It does NOT blanket-synthesize a NAV for a missing row. Ledger-replay backfill
 (``backfill_eod_pnl``) reconstructs positions from the full trades ledger, which
@@ -51,6 +56,7 @@ import logging
 from datetime import UTC, date, datetime
 
 import boto3
+import pandas as pd
 from nousergon_lib.dates import now_dual
 from nousergon_lib.logging import get_flow_doctor
 from nousergon_lib.trading_calendar import previous_trading_day
@@ -123,6 +129,38 @@ def _settled_close(run_date: str, config: dict) -> float | None:
         logger.info("[reconcile_audit] no settled ArcticDB SPY close for %s yet (%s) — skipping.",
                     run_date, e.__class__.__name__)
         return None
+
+
+def _settled_close_for_ticker(ticker: str, run_date: str, config: dict) -> float | None:
+    """Settled ArcticDB close for any held ``ticker`` on ``run_date``, or None
+    if not yet available.
+
+    Generalizes ``_settled_close`` (SPY-only) to every ticker a day's stored
+    ``positions_snapshot`` actually held (config#6349). The original SPY-only
+    detector meant a non-SPY name's provisional-then-corrected price (e.g. an
+    AMD or COIN close revised after this pass's window had moved on) stayed
+    frozen in ``prior_positions`` indefinitely and silently fed every later
+    day's pricing&timing diff. Mirrors ``eod_reconcile.run()``'s own
+    macro/universe routing so this checks the same source of truth the daily
+    reconcile does.
+    """
+    from executor.price_cache import _MACRO_SYMBOLS, _open_macro_library, _open_universe_library
+    bucket = config.get("trades_bucket", "alpha-engine-research")
+    try:
+        lib = _open_macro_library(bucket) if ticker in _MACRO_SYMBOLS else _open_universe_library(bucket)
+        df = lib.read(ticker).data
+    except Exception as e:  # noqa: BLE001 — absence is "can't check yet", not fatal
+        logger.info("[reconcile_audit] no settled ArcticDB close for %s on %s yet (%s) — skipping.",
+                    ticker, run_date, e.__class__.__name__)
+        return None
+    if df.empty or "Close" not in df.columns:
+        return None
+    target = pd.Timestamp(run_date).normalize()
+    idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
+    match = df[idx == target]
+    if match.empty:
+        return None
+    return float(match["Close"].iloc[-1])
 
 
 def _write_audit_record(
@@ -198,7 +236,8 @@ def audit_window(
         checked += 1
 
         row = conn.execute(
-            "SELECT spy_close, spy_return_pct, daily_alpha_pct FROM eod_pnl WHERE date = ?",
+            "SELECT spy_close, spy_return_pct, daily_alpha_pct, positions_snapshot "
+            "FROM eod_pnl WHERE date = ?",
             (d,),
         ).fetchone()
 
@@ -311,13 +350,47 @@ def audit_window(
         return_stale = (
             (stored_spy_return is None and expected_spy_return is not None)
             or (return_div_bps is not None and return_div_bps > tolerance_bps))
-        if not own_stale and not return_stale:
-            continue  # clean — own close and recomputed spy_return both match
 
-        reason = "stale_close" if own_stale else "stale_return"
+        # ── Held-position check (config#6349): the SPY-only checks above
+        # catch nothing for a non-SPY name whose ArcticDB price was
+        # provisional-then-corrected. That stale `closing_price` then feeds
+        # `mark_basis` on every later day's pricing&timing diff via
+        # `prior_positions`, indefinitely. Check every ticker this day
+        # actually held against its own current settled close.
+        stale_tickers: dict[str, float] = {}
+        snap_raw = row[3]
+        if snap_raw:
+            try:
+                snap_positions = json.loads(snap_raw)
+            except (json.JSONDecodeError, TypeError):
+                snap_positions = {}
+            for ticker, pos in snap_positions.items():
+                stored_cp = pos.get("closing_price")
+                if stored_cp is None:
+                    continue
+                settled_cp = _settled_close_for_ticker(ticker, d, config)
+                if settled_cp is None:
+                    continue
+                cp_div_bps = abs(settled_cp / float(stored_cp) - 1.0) * 1e4 if stored_cp else float("inf")
+                if cp_div_bps > tolerance_bps:
+                    stale_tickers[ticker] = cp_div_bps
+        ticker_stale = bool(stale_tickers)
+
+        if not own_stale and not return_stale and not ticker_stale:
+            continue  # clean — own close, recomputed spy_return, and every held ticker's close all match
+
+        reason = "stale_close" if own_stale else "stale_return" if return_stale else "stale_position_close"
         before = {"spy_close": stored_close, "spy_return_pct": stored_spy_return,
-                  "daily_alpha_pct": row[2]}
-        divergence_bps = own_close_div_bps if own_stale else return_div_bps
+                  "daily_alpha_pct": row[2], "stale_tickers": stale_tickers or None}
+        divergence_bps = (
+            own_close_div_bps if own_stale
+            else return_div_bps if return_stale
+            else max(stale_tickers.values()))
+        if stale_tickers:
+            logger.warning(
+                "[reconcile_audit] %s held-position closes diverged from settled: %s",
+                d, {t: f"{v:.2f}bp" for t, v in stale_tickers.items()},
+            )
 
         logger.warning(
             "[reconcile_audit] %s needs correction (%s): stored_close=%s settled=%.2f "

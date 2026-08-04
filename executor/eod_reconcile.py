@@ -603,8 +603,11 @@ def run(
     ``eod_report.json`` artifact (kept) but must NOT resend that day's email.
 
     ``run_audit``: when True (the live daily run), the trailing-window
-    ``reconcile_audit`` self-heal pass fires at the end. The audit pass itself
-    calls ``run(..., run_audit=False)`` so the re-reconcile can't recurse.
+    ``reconcile_audit`` self-heal pass fires FIRST, before this run's own NAV
+    three-way pricing&timing term reads yesterday's prior-day snapshot
+    (config#6349 — a self-heal that lands after that read is one run too
+    late). The audit pass itself calls ``run(..., run_audit=False)`` so the
+    re-reconcile can't recurse.
     """
     today_trading_day = now_dual().trading_day
     if run_date is None:
@@ -632,6 +635,49 @@ def run(
                 f"(run_audit=False)."
             )
         logger.info("EOD reconciliation | date=%s (explicit)", run_date)
+
+    # ── T+1 self-heal, run BEFORE today's own reconcile (config#6349) ───────
+    # This used to fire at the tail of `run()`, AFTER the NAV three-way
+    # pricing&timing term below had already read yesterday's `prior_positions`
+    # / `prior_snapshot_nav` from the DB. A correction to yesterday's row
+    # landing mid-way through TODAY's run (observed live: the 7/31 SPY
+    # correction wrote 2026-08-03T20:56:04Z, inside 8/3's own invocation)
+    # therefore arrived one run too late — 8/3 had already computed its
+    # mark_basis(t−1) off the stale 7/31 snapshot and paged the hard gate
+    # (alpha-engine-config#6349). Running the self-heal first closes the gap:
+    # any prior day corrected here is corrected before this run's
+    # `prior_positions` read (see the "NAV change reconciliation" block).
+    # Cheap in the common case (a few ArcticDB reads, no re-reconcile when
+    # clean). Fail-soft: a correction-pass error must never block today's EOD.
+    # ``run_audit=False`` on the live run is how the audit's own re-reconciles
+    # avoid recursing back into the audit.
+    if run_audit:
+        from nousergon_lib.logging import get_flow_doctor as _get_flow_doctor_early
+        try:
+            _fd_early = _get_flow_doctor_early()
+        except Exception:  # noqa: BLE001 — flow-doctor optional / not configured
+            _fd_early = None
+        try:
+            from executor.reconcile_audit import audit_window
+            _audit = audit_window(exclude_dates={run_date}, send_email=False)
+            if _audit.get("corrected"):
+                logger.warning(
+                    "[reconcile_audit] corrected %d prior day(s) against settled "
+                    "ArcticDB before today's reconcile: %s", len(_audit["corrected"]),
+                    [c["date"] for c in _audit["corrected"]],
+                )
+            else:
+                logger.info(
+                    "[reconcile_audit] clean — %d trailing day(s) checked, all "
+                    "stored closes match settled ArcticDB within tolerance.",
+                    _audit.get("checked", 0),
+                )
+        except Exception as _ae:  # noqa: BLE001 — self-heal is secondary; today's EOD must still run
+            logger.warning("[reconcile_audit] trailing self-heal FAILED (non-fatal): %s", _ae)
+            if _fd_early:
+                _fd_early.report(_ae, severity="warning", context={
+                    "site": "reconcile_audit_selfheal", "run_date": run_date})
+
     # Previous NYSE trading day — the baseline every "daily" figure must be
     # measured against. Used to detect skipped-SF gaps (config#1228).
     expected_prev_td = previous_trading_day(date.fromisoformat(run_date))
@@ -1566,33 +1612,9 @@ def run(
     except Exception as _ue:
         logger.warning("Uptime tracker failed: %s", _ue)
 
-    # ── T+1 self-heal: re-reconcile any prior day whose stored SPY close has
-    # since diverged from the now-settled ArcticDB close (config#1276). Cheap
-    # in the common case (a few ArcticDB reads, no re-reconcile when clean).
-    # Fail-soft: a correction-pass error must never break the primary EOD.
-    # ``run_audit=False`` on the live run is how the audit's own re-reconciles
-    # avoid recursing back into the audit.
-    if run_audit:
-        try:
-            from executor.reconcile_audit import audit_window
-            _audit = audit_window(exclude_dates={run_date}, send_email=False)
-            if _audit.get("corrected"):
-                logger.warning(
-                    "[reconcile_audit] corrected %d prior day(s) against settled "
-                    "ArcticDB: %s", len(_audit["corrected"]),
-                    [c["date"] for c in _audit["corrected"]],
-                )
-            else:
-                logger.info(
-                    "[reconcile_audit] clean — %d trailing day(s) checked, all "
-                    "stored SPY closes match settled ArcticDB within tolerance.",
-                    _audit.get("checked", 0),
-                )
-        except Exception as _ae:  # noqa: BLE001 — self-heal is secondary; primary EOD already wrote
-            logger.warning("[reconcile_audit] trailing self-heal FAILED (non-fatal): %s", _ae)
-            if fd:
-                fd.report(_ae, severity="warning", context={
-                    "site": "reconcile_audit_selfheal", "run_date": run_date})
+    # T+1 self-heal now runs at the START of this function, before the NAV
+    # three-way pricing&timing term reads yesterday's prior_positions —
+    # see the "T+1 self-heal, run BEFORE today's own reconcile" block above.
 
     if fd:
         fd.log_summary(logger)
