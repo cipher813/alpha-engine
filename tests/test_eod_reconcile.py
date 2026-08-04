@@ -581,6 +581,86 @@ class TestSnapshotContract:
             assert "snapshot_capturer.py" in msg
             assert "trades/snapshots/" in msg
 
+
+class TestSelfHealOrdering:
+    """config#6349: the T+1 self-heal (reconcile_audit.audit_window) must run
+    BEFORE this run reads yesterday's prior_positions/prior_snapshot_nav for
+    the NAV three-way pricing&timing term. Previously it ran at the tail of
+    run(), so a correction to a stale prior-day close landed one live run too
+    late — observed live: the 7/31 SPY correction was written at
+    2026-08-03T20:56:04Z, INSIDE 8/3's own invocation, after 8/3's
+    pricing&timing term had already been computed off the still-stale 7/31
+    snapshot and paged the hard gate (alpha-engine-config#6349)."""
+
+    def test_audit_window_runs_before_snapshot_load(self):
+        call_order: list[str] = []
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
+             patch("executor.eod_reconcile.load_config") as mock_cfg, \
+             patch("executor.preflight.ExecutorPreflight") as mock_preflight, \
+             patch("executor.eod_reconcile.init_db") as mock_db, \
+             patch("executor.reconcile_audit.audit_window") as mock_audit, \
+             patch("executor.snapshot_capturer.load_snapshot") as mock_load:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            mock_cfg.return_value = {
+                "db_path": "/tmp/x.db",
+                "trades_bucket": "alpha-engine-research",
+                "aws_region": "us-east-1",
+                "email_sender": "x@x.com",
+                "email_recipients": "y@y.com",
+            }
+            mock_preflight.return_value.run.return_value = None
+            mock_db.return_value = MagicMock()
+
+            def _audit_side_effect(**kwargs):
+                call_order.append("audit_window")
+                return {"checked": 0, "corrected": []}
+
+            def _load_side_effect(**kwargs):
+                call_order.append("load_snapshot")
+                return None  # missing snapshot -> run() raises right after
+
+            mock_audit.side_effect = _audit_side_effect
+            mock_load.side_effect = _load_side_effect
+
+            with pytest.raises(RuntimeError, match="No snapshot at s3://"):
+                run(run_date="2026-04-28", run_audit=True)
+
+        assert call_order == ["audit_window", "load_snapshot"], (
+            "self-heal must fire before the snapshot/prior-day read, not after"
+        )
+        # exclude_dates must exclude TODAY's own run_date — only prior days
+        # are eligible for self-heal (today hasn't written its own row yet).
+        _, audit_kwargs = mock_audit.call_args
+        assert audit_kwargs["exclude_dates"] == {"2026-04-28"}
+
+    def test_audit_window_skipped_when_run_audit_false(self):
+        """Historical correction passes (run_audit=False) must not recurse
+        into their own self-heal."""
+        with patch("executor.eod_reconcile.now_dual") as mock_now_dual, \
+             patch("executor.eod_reconcile.load_config") as mock_cfg, \
+             patch("executor.preflight.ExecutorPreflight") as mock_preflight, \
+             patch("executor.eod_reconcile.init_db") as mock_db, \
+             patch("executor.reconcile_audit.audit_window") as mock_audit, \
+             patch("executor.snapshot_capturer.load_snapshot") as mock_load:
+            mock_now_dual.return_value = SimpleNamespace(
+                trading_day="2026-04-28", calendar_date="2026-04-28"
+            )
+            mock_cfg.return_value = {
+                "db_path": "/tmp/x.db",
+                "trades_bucket": "alpha-engine-research",
+                "aws_region": "us-east-1",
+                "email_sender": "x@x.com",
+                "email_recipients": "y@y.com",
+            }
+            mock_preflight.return_value.run.return_value = None
+            mock_db.return_value = MagicMock()
+            mock_load.return_value = None
+            with pytest.raises(RuntimeError, match="No snapshot at s3://"):
+                run(run_date="2026-04-25", run_audit=False)
+        mock_audit.assert_not_called()
+
     def test_eod_no_longer_imports_ibkrclient(self):
         """eod_reconcile must NOT depend on IBKRClient — the live IB read
         is now in snapshot_capturer.py. A future regression that re-adds

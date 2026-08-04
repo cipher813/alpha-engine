@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from executor import reconcile_audit
 from executor.reconcile_audit import _window_dates, audit_window
 from executor.trade_logger import init_db
@@ -20,6 +22,24 @@ def _seed_eod(db_path, rows):
             "VALUES (?,?,?,?,?,?,?)",
             (d, 1_000_000.0, sc, sr, 0.0, da, f"{d}T20:00:00"),
         )
+    conn.commit()
+    conn.close()
+
+
+def _seed_eod_with_positions(db_path, date_, spy_close, spy_return_pct, daily_alpha_pct, positions):
+    """Like ``_seed_eod`` for a single row, plus a JSON ``positions_snapshot``
+    (``{ticker: {"closing_price": ..., "shares": ...}}``) for held-position
+    staleness tests (config#6349)."""
+    import json as _json
+
+    conn = init_db(db_path)
+    conn.execute(
+        "INSERT OR REPLACE INTO eod_pnl (date, portfolio_nav, spy_close, "
+        "spy_return_pct, daily_return_pct, daily_alpha_pct, positions_snapshot, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (date_, 1_000_000.0, spy_close, spy_return_pct, 0.0, daily_alpha_pct,
+         _json.dumps(positions), f"{date_}T20:00:00"),
+    )
     conn.commit()
     conn.close()
 
@@ -371,4 +391,86 @@ class TestAuditWindow:
             res = audit_window(start="2026-06-24", end="2026-06-24", config=_cfg(db))
         load_mock.assert_not_called()
         assert len(res["gaps"]) == 1
-        assert res["gaps"][0]["date"] == "2026-06-24"
+
+
+# ── Held-position staleness (config#6349) ───────────────────────────────────
+#
+# The SPY-only checks above catch nothing for a non-SPY held ticker whose
+# ArcticDB price was provisional-then-corrected — its stale closing_price
+# then silently feeds eod_reconcile's NAV three-way pricing&timing diff via
+# prior_positions on every later day, indefinitely. These tests cover the
+# generalized per-ticker check (_settled_close_for_ticker).
+
+
+class TestHeldPositionStaleness:
+    def test_stale_held_ticker_close_triggers_reconcile(self, tmp_path):
+        # SPY itself is clean, but AMD's stored closing_price (100.00) has
+        # since been corrected in ArcticDB to 101.50 (~148bp) — must still
+        # trigger a re-reconcile even though the SPY-only checks see nothing.
+        db = str(tmp_path / "t.db")
+        _seed_eod_with_positions(
+            db, "2026-06-25", 734.30, 0.10, 1.40,
+            {"AMD": {"closing_price": 100.00, "shares": 10}},
+        )
+        settled_spy = {"2026-06-25": 734.30}
+        settled_tickers = {("AMD", "2026-06-25"): 101.50}
+
+        def fake_run(d, *, send_email, run_audit):
+            assert send_email is False and run_audit is False
+            conn = init_db(db)
+            conn.execute(
+                "UPDATE eod_pnl SET positions_snapshot=? WHERE date=?",
+                ('{"AMD": {"closing_price": 101.50, "shares": 10}}', d),
+            )
+            conn.commit()
+            conn.close()
+
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled_spy[d]), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                           lambda t, d, c: settled_tickers.get((t, d))), \
+             patch.object(reconcile_audit, "eod_run", side_effect=fake_run) as run_mock, \
+             patch.object(reconcile_audit, "_write_audit_record", return_value="k"), \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+        run_mock.assert_called_once()
+        assert len(res["corrected"]) == 1
+        c = res["corrected"][0]
+        assert c["date"] == "2026-06-25" and c["reason"] == "stale_position_close"
+        assert c["before"]["stale_tickers"] == {"AMD": pytest.approx(150.0, abs=0.5)}
+        assert c["divergence_bps"] > 100
+
+    def test_held_ticker_within_tolerance_skipped(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        # 0.5bp divergence on AMD < 1bp tolerance → no correction.
+        _seed_eod_with_positions(
+            db, "2026-06-25", 734.30, 0.10, 1.40,
+            {"AMD": {"closing_price": 100.00, "shares": 10}},
+        )
+        settled_spy = {"2026-06-25": 734.30}
+        settled_tickers = {("AMD", "2026-06-25"): 100.005}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled_spy[d]), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker",
+                           lambda t, d, c: settled_tickers.get((t, d))), \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+        assert res["corrected"] == []
+        run_mock.assert_not_called()
+
+    def test_ticker_settled_close_unavailable_does_not_trigger(self, tmp_path):
+        # _settled_close_for_ticker returning None (no ArcticDB row yet) must
+        # be treated as "can't check yet", not as a divergence.
+        db = str(tmp_path / "t.db")
+        _seed_eod_with_positions(
+            db, "2026-06-25", 734.30, 0.10, 1.40,
+            {"NEWCO": {"closing_price": 50.00, "shares": 5}},
+        )
+        settled_spy = {"2026-06-25": 734.30}
+        with patch.object(reconcile_audit, "_spy_close", lambda d, c: settled_spy[d]), \
+             patch.object(reconcile_audit, "_settled_close_for_ticker", return_value=None), \
+             patch.object(reconcile_audit, "eod_run") as run_mock, \
+             patch.object(reconcile_audit, "get_flow_doctor", return_value=None):
+            res = audit_window(start="2026-06-25", end="2026-06-25", config=_cfg(db))
+        assert res["corrected"] == []
+        assert res["gaps"] == []
+        run_mock.assert_not_called()
