@@ -1290,6 +1290,11 @@ def run(
         peak_nav = ibkr.get_peak_nav(conn)
 
         # Enrich positions with sector data from signals
+        # signals.json::universe read: this is the executor sizing/exit path —
+        # the ONE fleet-level exception to "resolve ticker lists from
+        # decision_set, not universe" (alpha-engine-config#5809). Formal
+        # policy-clause registration tracked separately, not yet landed:
+        # alpha-engine-config#6448.
         universe_sectors = {
             s["ticker"]: s.get("sector", "")
             for s in signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])
@@ -1552,6 +1557,11 @@ def run(
         strategy_config = load_strategy_config(config)
 
         # Build signals lookup for exit manager
+        # signals.json::universe read: this is the executor sizing/exit path —
+        # the ONE fleet-level exception to "resolve ticker lists from
+        # decision_set, not universe" (alpha-engine-config#5809). Formal
+        # policy-clause registration tracked separately, not yet landed:
+        # alpha-engine-config#6448.
         signals_by_ticker = {}
         for s in (signals_raw.get("universe", []) + signals_raw.get("buy_candidates", [])):
             t = s.get("ticker")

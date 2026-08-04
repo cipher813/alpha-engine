@@ -482,6 +482,11 @@ def _build_universe(
     candidates: set[str] = set()
     candidates.update(predictions_by_ticker.keys())
     candidates.update(current_positions.keys())
+    # signals.json::universe read: this is the executor sizing/exit path —
+    # the ONE fleet-level exception to "resolve ticker lists from
+    # decision_set, not universe" (alpha-engine-config#5809). Formal
+    # policy-clause registration tracked separately, not yet landed:
+    # alpha-engine-config#6448.
     candidates.update(_extract_universe_tickers(signals_raw.get("universe", [])))
 
     candidates.discard(_SPY)
