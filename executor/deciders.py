@@ -106,6 +106,11 @@ def enrich_positions(
     ``predictor_param_sweep`` (Tier 3 Part A amortization, 2026-04-27).
     """
     if universe_sectors is None:
+        # signals.json::universe read: this is the executor sizing/exit path —
+        # the ONE fleet-level exception to "resolve ticker lists from
+        # decision_set, not universe" (alpha-engine-config#5809). Formal
+        # policy-clause registration tracked separately, not yet landed:
+        # alpha-engine-config#6448.
         universe_sectors = {
             s["ticker"]: s.get("sector", "")
             for s in (

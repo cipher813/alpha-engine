@@ -85,6 +85,11 @@ def build_conviction_map(signals_payload: dict | None) -> dict[str, dict]:
     out: dict[str, dict] = {}
     if not signals_payload:
         return out
+    # signals.json::universe read: this is the executor sizing/exit path —
+    # the ONE fleet-level exception to "resolve ticker lists from
+    # decision_set, not universe" (alpha-engine-config#5809). Formal
+    # policy-clause registration tracked separately, not yet landed:
+    # alpha-engine-config#6448.
     records = (signals_payload.get("universe") or []) + (signals_payload.get("buy_candidates") or [])
     for rec in records:
         if not isinstance(rec, dict):

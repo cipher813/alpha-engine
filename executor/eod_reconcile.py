@@ -315,6 +315,11 @@ def _build_position_contexts(
         data_warnings.append(pred_warn)
 
     # Build signals lookup
+    # signals.json::universe read: this is the executor sizing/exit path —
+    # the ONE fleet-level exception to "resolve ticker lists from
+    # decision_set, not universe" (alpha-engine-config#5809). Formal
+    # policy-clause registration tracked separately, not yet landed:
+    # alpha-engine-config#6448.
     signals_by_ticker = {}
     for s in (signals_data.get("universe", []) + signals_data.get("buy_candidates", [])):
         t = s.get("ticker")
@@ -778,6 +783,11 @@ def run(
     try:
         sig_data, _ = _load_signals_from_s3(signals_bucket, run_date)
         sector_lookup = {}
+        # signals.json::universe read: this is the executor sizing/exit path —
+        # the ONE fleet-level exception to "resolve ticker lists from
+        # decision_set, not universe" (alpha-engine-config#5809). Formal
+        # policy-clause registration tracked separately, not yet landed:
+        # alpha-engine-config#6448.
         for s in (sig_data.get("universe", []) + sig_data.get("buy_candidates", [])):
             t = s.get("ticker")
             if t and s.get("sector"):
