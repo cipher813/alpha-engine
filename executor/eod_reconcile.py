@@ -726,6 +726,20 @@ def run(
     # hard-block is no longer needed: the snapshot-existence check is
     # the new contract, and snapshot existence is what makes the run
     # safe (today, last Tuesday, or any other date with a snapshot).
+    #
+    # IRREVERSIBILITY (alpha-engine-config-I5569 / I6705): this is the
+    # ONE non-re-runnable read in the whole EOD pipeline — the snapshot
+    # it loads was itself a live IB capture (see
+    # `executor/snapshot_capturer.py::run` docstring). If it is missing
+    # for `run_date`, there is no historical source to reconstruct it
+    # from; the cost of a missed day was measured in
+    # alpha-engine-config-I5325. Mitigations already in place: same-day
+    # bounded retry + irreversible-deadline paging inside the EOD SF's
+    # `CaptureSnapshot` state (nousergon-data-PR1260), and an independent
+    # pre-midnight positive existence check,
+    # `alpha-engine-eod-snapshot-existence-check`, scheduled separately
+    # so it still fires even if the EOD SF never reaches `CaptureSnapshot`
+    # at all (nousergon-data-PR1265).
     from executor.snapshot_capturer import load_snapshot
     snapshot = load_snapshot(
         bucket=trades_bucket,
