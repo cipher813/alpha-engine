@@ -80,6 +80,23 @@ def run(run_date: str | None = None) -> None:
     arguments are accepted but are expected to match today — capture
     only makes sense for the current trading day since IB's account
     state is now-as-of, not historical.
+
+    IRREVERSIBILITY (alpha-engine-config-I5569 / I6705): the `--date`
+    live-capture-only constraint enforced below is not a convenience
+    guard — it is the reason this is the EOD pipeline's ONE
+    non-re-runnable stage. Every other EOD step reads from an artifact
+    or a historical API and can be replayed for a past date; this step
+    reads live IB account/position state, which only exists NOW. Miss
+    the window (crash before `CaptureSnapshot` runs, or before NYSE-local
+    midnight for the day) and that day's snapshot is gone permanently —
+    there is no historical source to backfill it from. The cost of a
+    missed day was measured in alpha-engine-config-I5325. Mitigations
+    in place: same-day bounded retry + irreversible-deadline paging
+    inside the EOD SF's `CaptureSnapshot` state (nousergon-data-PR1260),
+    and an independent pre-midnight positive existence check —
+    `alpha-engine-eod-snapshot-existence-check`, scheduled separately so
+    it still fires even if the EOD SF never reaches this step at all
+    (nousergon-data-PR1265).
     """
     today_trading_day = now_dual().trading_day
     if run_date is None:
