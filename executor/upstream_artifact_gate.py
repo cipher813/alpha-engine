@@ -28,7 +28,13 @@ EXECUTOR_UPSTREAM_SPECS: tuple[ArtifactSpec, ...] = (
         artifact_id="research_signals",
         s3_bucket=_DEFAULT_BUCKET,
         s3_key_template="signals/{trading_day}/signals.json",
-        cadence="saturday_sf",
+        # eod_sf, not saturday_sf (config-I6658): the weekly pipeline is
+        # chain-launched by every trading day's postclose while
+        # exercise_cadence=daily, so this artifact is written on every NYSE
+        # trading day, not just Saturday. Mirrors ARTIFACT_REGISTRY.yaml's
+        # research_signals row — see that row's comment for the full
+        # rationale and the reversion condition if exercise_cadence changes.
+        cadence="eod_sf",
         sla_minutes_after_cron=180,
         severity="critical",
         owner_repo="alpha-engine-research",

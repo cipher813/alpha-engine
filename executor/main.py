@@ -883,22 +883,33 @@ def _should_hold_book(
 
 
 def _write_hold_book_flag(
-    bucket: str, run_date: str, predictions_date: str | None, gate: dict
+    bucket: str, run_date: str, predictions_date: str | None, gate: dict | None,
+    *, held: bool,
 ) -> None:
-    """Persist a dashboard-readable record that the hold-book safeguard fired
-    this run (predictor distribution gate flagged "strongly biased" → optimizer
-    rebalance suppressed → current book held). Writes both a dated artifact and
-    a ``latest.json`` pointer under ``executor/hold_book_flags/`` so the console
-    can banner the discrepancy for operator review. Best-effort — the caller
-    swallows failures so an audit-artifact write never blocks the planner.
+    """Persist a dashboard-readable record of the hold-book safeguard's verdict
+    THIS run (predictor distribution gate flagged "strongly biased" AND the
+    tradable signal collapsed → optimizer rebalance suppressed → current book
+    held). Writes both a dated artifact and a ``latest.json`` pointer under
+    ``executor/hold_book_flags/`` so the console can banner the discrepancy for
+    operator review. Best-effort — the caller swallows failures so an
+    audit-artifact write never blocks the planner.
+
+    Written UNCONDITIONALLY every run (``held`` True or False) — mirrors
+    ``_write_derisk_gate_artifact``'s convention. A fire-only write left
+    ``latest.json`` pinned to the LAST hold event forever once one occurred,
+    with no way for the dashboard to tell "held right now" from "held once, on
+    2026-06-26" — the console kept bannering a 6-week-stale HOLD-BOOK SAFEGUARD
+    FIRED alert through 2026-08-10 because no healthy run ever overwrote it
+    with ``held: false`` (alpha-engine-config-I<ISSUE>).
     """
     import boto3 as _boto3
 
+    gate = gate or {}
     payload = json.dumps(
         {
             "run_date": run_date,
             "predictions_date": predictions_date,
-            "held": True,
+            "held": held,
             "reason": gate.get("reason"),
             "failed_check": gate.get("failed_check"),
             "gate_metrics": gate.get("metrics"),
@@ -2037,6 +2048,19 @@ def run(
             # see ``_should_hold_book``. Fail-open: a missing/None gate proceeds.
             _gate = read_distribution_gate(signals_bucket)
             _hold_book, _hold_diag = _should_hold_book(_gate, predictions_by_ticker)
+            # Written unconditionally (held True or False) every run so the
+            # console banner reflects THIS cycle, not the last time the
+            # safeguard ever fired — see _write_hold_book_flag docstring.
+            try:
+                _write_hold_book_flag(
+                    signals_bucket, run_date, predictions_date, _gate,
+                    held=_hold_book,
+                )
+            except Exception as _hb_err:
+                logger.warning(
+                    "hold-book flag artifact write failed (non-blocking): %s",
+                    _hb_err,
+                )
             if _hold_book:
                 logger.warning(
                     "HOLD-BOOK SAFEGUARD ACTIVE: predictor gate FLAGGED (check=%s) "
@@ -2047,13 +2071,6 @@ def run(
                     (_gate or {}).get("failed_check"), predictions_date,
                     (_gate or {}).get("reason"), _hold_diag,
                 )
-                try:
-                    _write_hold_book_flag(signals_bucket, run_date, predictions_date, _gate)
-                except Exception as _hb_err:
-                    logger.warning(
-                        "hold-book flag artifact write failed (non-blocking): %s",
-                        _hb_err,
-                    )
             elif is_log_usable(shadow_log):
                 if _hold_diag.get("gate_flagged"):
                     # Gate flagged on the isotonic p_up artifact, but the
