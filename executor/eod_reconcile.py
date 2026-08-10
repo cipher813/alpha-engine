@@ -123,6 +123,89 @@ def _check_nav_three_way_hard_gate(
     }
 
 
+# ── IB mark-outside-range detection (config#6349/#6818) ────────────────────
+# IB Gateway's delayed-feed portfolio mark for a held ticker occasionally
+# lands outside the day's own traded [Low, High] range (six historical
+# instances catalogued in config#6349, e.g. AMD 2026-08-04: IB mark $479.00
+# vs day low $502.20). NetLiquidation — and therefore pricing_timing_usd —
+# inherits that bad mark wholesale. This never repriced positions (the
+# settled close stays canonical for valuation, see the override two lines
+# above `pos["closing_price"] = current_price`); it only names the culprit
+# so a hard-gate page is diagnosable in one glance instead of a four-day
+# by-hand trace.
+NAV_BREACH_RESIDUAL_FLOOR_USD = 500.0  # matches the pre-existing soft data_warnings floor (config#1276)
+
+
+def _detect_ib_mark_outside_range(
+    *,
+    positions: dict,
+    day_low: dict[str, float],
+    day_high: dict[str, float],
+) -> list[dict]:
+    """Flag held tickers whose ``ib_market_value / shares`` fell outside
+    that day's ArcticDB ``[Low, High]``.
+
+    Mutates each flagged position with ``ib_mark_outside_range=True`` (so
+    the flag reaches ``eod_report.json`` via the ``positions`` dict) and
+    returns the flag list the hard-gate call site uses to name tickers in
+    the alert text and classify the breach.
+    """
+    flags: list[dict] = []
+    for ticker, pos in positions.items():
+        shares = pos.get("shares", 0) or 0
+        ib_mv = pos.get("ib_market_value")
+        lo = day_low.get(ticker)
+        hi = day_high.get(ticker)
+        if not shares or ib_mv is None or lo is None or hi is None:
+            continue
+        ib_mark = ib_mv / shares
+        if lo <= ib_mark <= hi:
+            continue
+        mark_error_usd = shares * (ib_mark - lo if ib_mark < lo else ib_mark - hi)
+        pos["ib_mark_outside_range"] = True
+        pos["ib_mark_range_error_usd"] = mark_error_usd
+        flags.append({
+            "ticker": ticker,
+            "ib_mark": ib_mark,
+            "day_low": lo,
+            "day_high": hi,
+            "shares": shares,
+            "mark_error_usd": mark_error_usd,
+        })
+    return flags
+
+
+def _classify_nav_breach(pricing_timing_usd: float, mark_range_flags: list[dict]) -> dict:
+    """Reclassify a hard-gate breach fully explained by out-of-range IB
+    marks as a broker data-quality event rather than a NAV reconcile
+    defect (config#6349 deliverable 4) — a different remediation (chase
+    the broker feed) than a code defect (chase the reconcile math).
+
+    "Fully explained" means what's left after subtracting every flagged
+    ticker's mark error wouldn't itself have warranted even the pre-
+    existing soft data_warnings entry.
+    """
+    total_mark_error_usd = sum(f["mark_error_usd"] for f in mark_range_flags)
+    residual_usd = pricing_timing_usd - total_mark_error_usd
+    fully_explained = bool(mark_range_flags) and abs(residual_usd) <= NAV_BREACH_RESIDUAL_FLOOR_USD
+    return {
+        "classification": "broker_data_quality" if fully_explained else "reconcile_defect",
+        "total_mark_error_usd": total_mark_error_usd,
+        "residual_usd": residual_usd,
+    }
+
+
+def _format_mark_range_detail(mark_range_flags: list[dict]) -> str:
+    """Ticker-by-ticker detail string for the hard-gate alert text — the
+    single most important thing config#6349's investigation had to
+    reconstruct by hand across three sessions before this existed."""
+    return "; ".join(
+        f"{f['ticker']} mark ${f['ib_mark']:.2f} vs day range "
+        f"[${f['day_low']:.2f}, ${f['day_high']:.2f}] (${f['mark_error_usd']:+,.0f})"
+        for f in mark_range_flags
+    )
+
+
 def _compute_unattributed_residual_pct(
     unattributed_usd: float | None,
     nav: float | None,
@@ -935,6 +1018,10 @@ def run(
     macro_lib = None  # lazy-open only if a macro-routed held ticker appears
     target_ts = pd.Timestamp(run_date).normalize()
     closing_prices: dict[str, float] = {}
+    # Same-day traded [Low, High] per held ticker — used only to validate the
+    # IB portfolio mark (config#6349/#6818), never to price positions.
+    day_low: dict[str, float] = {}
+    day_high: dict[str, float] = {}
     # Authoritative prior-day baseline: the last ArcticDB row strictly before
     # run_date, with its date, so daily returns are measured against the real
     # previous trading day rather than a possibly-stale snapshot (config#1228).
@@ -962,6 +1049,9 @@ def run(
             missing.append(f"{ticker} (no row for {run_date})")
             continue
         closing_prices[ticker] = float(match["Close"].iloc[-1])
+        if "Low" in match.columns and "High" in match.columns:
+            day_low[ticker] = float(match["Low"].iloc[-1])
+            day_high[ticker] = float(match["High"].iloc[-1])
         # Capture the previous available close (last row strictly before
         # run_date) + its date — the gap-aware daily-return baseline.
         prior_mask = idx < target_ts
@@ -1088,6 +1178,23 @@ def run(
         pos_spy = spy_return if spy_return is not None else 0
         pos["alpha_contribution_pct"] = weight * (pos["daily_return_pct"] - pos_spy)
         pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
+
+    # IB mark-outside-range detection (config#6349/#6818) — flags positions,
+    # used below to name culprits in the hard-gate alert and classify a
+    # fully-explained breach as broker data quality rather than a defect.
+    ib_mark_range_flags = _detect_ib_mark_outside_range(
+        positions=positions, day_low=day_low, day_high=day_high,
+    )
+    if ib_mark_range_flags:
+        logger.warning(
+            "IB mark outside day's traded range for %d ticker(s): %s",
+            len(ib_mark_range_flags),
+            ", ".join(
+                f"{f['ticker']} mark=${f['ib_mark']:.2f} range=[${f['day_low']:.2f},"
+                f" ${f['day_high']:.2f}] error=${f['mark_error_usd']:+,.0f}"
+                for f in ib_mark_range_flags
+            ),
+        )
 
     # data_warnings was initialized at the top of run() and accumulates gap
     # flags (per-position N/A, headline multi-session) plus the NAV residual
@@ -1229,11 +1336,27 @@ def run(
             run_date=run_date,
         )
         if nav_hard_gate_breach:
+            # Reclassify (config#6349 deliverable 4): if flagged out-of-range
+            # IB marks fully explain the divergence, this is a broker
+            # data-quality event, not a NAV reconcile code defect — a
+            # different remediation, and named in the alert either way so
+            # an operator isn't left tracing four positions by hand.
+            _breach_classification = _classify_nav_breach(
+                nav_hard_gate_breach["pricing_timing_usd"], ib_mark_range_flags,
+            )
+            nav_hard_gate_breach.update(_breach_classification)
+            if ib_mark_range_flags:
+                nav_hard_gate_breach["message"] += (
+                    f" Classification: {_breach_classification['classification']}. "
+                    f"IB mark outside traded range — "
+                    f"{_format_mark_range_detail(ib_mark_range_flags)}."
+                )
             logger.error(
-                "NAV three-way reconcile BREACH: pricing&timing=$%+.0f "
+                "NAV three-way reconcile BREACH [%s]: pricing&timing=$%+.0f "
                 "(%.3f%% of NAV) exceeds hard-gate tolerance $%.0f "
                 "(%.1fbps of NAV) — broker-reported NAV vs settled/system "
                 "NAV diverged beyond tolerance for run_date=%s.",
+                nav_hard_gate_breach["classification"],
                 nav_hard_gate_breach["pricing_timing_usd"],
                 nav_hard_gate_breach["pricing_timing_pct_of_nav"],
                 nav_hard_gate_breach["tolerance_usd"],
@@ -1243,13 +1366,26 @@ def run(
             if fd:
                 fd.report(
                     RuntimeError(nav_hard_gate_breach["message"]),
-                    severity="error",
+                    # A breach fully explained by an out-of-range broker mark
+                    # still needs eyes (the feed is serving bad data) but is
+                    # not itself evidence of a reconcile code defect — page
+                    # at warning, not error, so the two classes triage
+                    # differently at a glance.
+                    severity=(
+                        "warning"
+                        if nav_hard_gate_breach["classification"] == "broker_data_quality"
+                        else "error"
+                    ),
                     context={
                         "site": "nav_three_way_reconcile_hard_gate",
                         "run_date": run_date,
                         "pricing_timing_usd": nav_hard_gate_breach["pricing_timing_usd"],
                         "hard_gate_tolerance_usd": nav_hard_gate_breach["tolerance_usd"],
                         "nav": nav_hard_gate_breach["nav"],
+                        "classification": nav_hard_gate_breach["classification"],
+                        "ib_mark_outside_range_tickers": [
+                            f["ticker"] for f in ib_mark_range_flags
+                        ],
                     },
                 )
         # The TRUE residual (after rotation + pricing&timing are lifted out) is

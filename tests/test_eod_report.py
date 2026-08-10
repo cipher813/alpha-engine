@@ -439,8 +439,8 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_2(self):
-        assert SCHEMA_VERSION == "2.2"
+    def test_schema_version_is_2_3(self):
+        assert SCHEMA_VERSION == "2.3"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -492,7 +492,13 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.2"
+        assert report["schema_version"] == "2.3"
+        # config#6349/#6818 deliverable 3: ib_market_value + the out-of-range
+        # flag reach the artifact even when absent from the input position
+        # (legacy/no-flag path defaults cleanly).
+        adbe = next(p for p in report["positions"] if p["ticker"] == "ADBE")
+        assert adbe["ib_market_value"] is None
+        assert adbe["ib_mark_outside_range"] is False
         assert report["run_date"] == "2026-06-22"
         assert report["summary"]["nav"] == 991322.0
         adbe = report["positions"][0]
@@ -524,6 +530,35 @@ class TestBuildEodReport:
         assert report["trades_today"][0]["ticker"] == "ADBE"
         assert len(report["trailing_history"]) == 2
         assert report["data_warnings"]
+
+    def test_ib_mark_outside_range_flag_and_value_reach_the_artifact(self):
+        """config#6349/#6818 closes-when (iii): ib_market_value reaches
+        eod_report.json — the artifact is self-diagnosing instead of
+        requiring a by-hand S3/SQLite trace to explain a hard-gate page."""
+        conn = _conn()
+        report = build_eod_report(
+            run_date="2026-08-04", nav=1036143.44, prior_nav=1045000.0,
+            daily_return=1.13, spy_return=2.09, alpha=-0.96,
+            positions={
+                "AMD": {
+                    "shares": 225, "market_value": 225 * 518.58,
+                    "ib_market_value": 225 * 479.00,
+                    "ib_mark_outside_range": True,
+                    "ib_mark_range_error_usd": 225 * (479.00 - 502.20),
+                    "daily_return_pct": -1.2, "daily_return_usd": -1400.0,
+                    "sector": "Information Technology",
+                    "prior_shares": 239.0, "retained_shares": 225.0,
+                    "added_shares": 0.0, "prior_price": 484.64,
+                    "entry_price": None,
+                },
+            },
+            prior_positions={},
+            conn=conn,
+        )
+        amd = report["positions"][0]
+        assert amd["ib_market_value"] == pytest.approx(225 * 479.00)
+        assert amd["ib_mark_outside_range"] is True
+        assert amd["ib_mark_range_error_usd"] == pytest.approx(225 * (479.00 - 502.20))
 
     def test_first_day_no_attribution(self):
         conn = _conn()

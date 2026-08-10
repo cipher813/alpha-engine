@@ -93,7 +93,7 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.2"
+SCHEMA_VERSION = "2.3"
 
 # Sell-side trade actions whose fills realize P&L on shares rotated out today.
 _SELL_ACTIONS = {
@@ -480,6 +480,12 @@ def build_eod_report(
             "ticker": ticker,
             "shares": pos.get("shares"),
             "market_value": mv,
+            # Schema 2.3 (config#6349/#6818): IB's raw mark before the
+            # settled-close override, so a NAV hard-gate breach is
+            # self-diagnosing from the artifact instead of a by-hand trace.
+            "ib_market_value": pos.get("ib_market_value"),
+            "ib_mark_outside_range": pos.get("ib_mark_outside_range", False),
+            "ib_mark_range_error_usd": pos.get("ib_mark_range_error_usd"),
             "pct_nav": (mv / nav * 100.0) if nav else None,
             "daily_return_pct": pos.get("daily_return_pct"),
             "daily_return_usd": pos.get("daily_return_usd"),
