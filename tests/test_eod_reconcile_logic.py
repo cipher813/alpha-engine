@@ -8,12 +8,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from executor.eod_reconcile import (
+    NAV_BREACH_RESIDUAL_FLOOR_USD,
     NAV_HARD_GATE_TOLERANCE_NAV_BPS,
     NAV_HARD_GATE_TOLERANCE_USD_FLOOR,
     _apply_dividend_delta,
     _check_nav_three_way_hard_gate,
+    _classify_nav_breach,
     _compute_daily_return,
     _compute_unattributed_residual_pct,
+    _detect_ib_mark_outside_range,
+    _format_mark_range_detail,
     _load_constituents_sector_map,
     _nav_hard_gate_tolerance_usd,
     _resolve_prior_price,
@@ -265,6 +269,114 @@ class TestNavThreeWayHardGate:
                 f"hard gate tolerance ${hard_threshold} must exceed soft "
                 f"warning threshold ${soft_threshold} at nav=${nav}"
             )
+
+
+class TestDetectIbMarkOutsideRange:
+    """config#6349/#6818 — flag a held ticker whose IB portfolio mark lands
+    outside the day's own ArcticDB [Low, High], the root cause behind six-
+    plus historical NAV hard-gate breaches (AMD 2026-08-04 is the reference
+    instance: IB mark $479.00 vs day range [$502.20, $530.13])."""
+
+    def test_mark_below_day_low_flags_and_prices_the_error(self):
+        positions = {"AMD": {"shares": 225, "ib_market_value": 225 * 479.00}}
+        flags = _detect_ib_mark_outside_range(
+            positions=positions,
+            day_low={"AMD": 502.20},
+            day_high={"AMD": 530.13},
+        )
+        assert len(flags) == 1
+        assert flags[0]["ticker"] == "AMD"
+        assert flags[0]["ib_mark"] == pytest.approx(479.00)
+        assert flags[0]["mark_error_usd"] == pytest.approx(225 * (479.00 - 502.20))
+        # The position itself is mutated so the flag reaches eod_report.json.
+        assert positions["AMD"]["ib_mark_outside_range"] is True
+        assert positions["AMD"]["ib_mark_range_error_usd"] == pytest.approx(
+            225 * (479.00 - 502.20)
+        )
+
+    def test_mark_above_day_high_flags_too(self):
+        positions = {"XYZ": {"shares": 100, "ib_market_value": 100 * 55.0}}
+        flags = _detect_ib_mark_outside_range(
+            positions=positions, day_low={"XYZ": 40.0}, day_high={"XYZ": 50.0},
+        )
+        assert len(flags) == 1
+        assert flags[0]["mark_error_usd"] == pytest.approx(100 * (55.0 - 50.0))
+
+    def test_mark_inside_range_does_not_flag(self):
+        positions = {"SPY": {"shares": 10, "ib_market_value": 10 * 450.0}}
+        flags = _detect_ib_mark_outside_range(
+            positions=positions, day_low={"SPY": 440.0}, day_high={"SPY": 460.0},
+        )
+        assert flags == []
+        assert "ib_mark_outside_range" not in positions["SPY"]
+
+    def test_missing_day_range_or_shares_is_silently_skipped(self):
+        """No day range (e.g. macro symbol not in ArcticDB universe) or a
+        zero-share/legacy position without ib_market_value must not raise
+        or false-flag — absence of data is not evidence of a bad mark."""
+        positions = {
+            "NO_RANGE": {"shares": 5, "ib_market_value": 500.0},
+            "NO_SHARES": {"shares": 0, "ib_market_value": 0.0},
+            "NO_IB_MV": {"shares": 5},
+        }
+        flags = _detect_ib_mark_outside_range(
+            positions=positions,
+            day_low={"NO_SHARES": 1.0, "NO_IB_MV": 1.0},
+            day_high={"NO_SHARES": 2.0, "NO_IB_MV": 2.0},
+        )
+        assert flags == []
+
+
+class TestClassifyNavBreach:
+    """config#6349 deliverable 4 — a breach fully explained by out-of-range
+    IB marks is a broker data-quality event, not a reconcile code defect."""
+
+    def test_fully_explained_by_single_flagged_ticker_classifies_as_data_quality(self):
+        flags = [{"ticker": "AMD", "mark_error_usd": -9560.36}]
+        result = _classify_nav_breach(pricing_timing_usd=-9560.36, mark_range_flags=flags)
+        assert result["classification"] == "broker_data_quality"
+        assert result["residual_usd"] == pytest.approx(0.0)
+
+    def test_residual_within_floor_still_classifies_as_data_quality(self):
+        flags = [{"ticker": "AMD", "mark_error_usd": -9560.36}]
+        result = _classify_nav_breach(
+            pricing_timing_usd=-9560.36 - (NAV_BREACH_RESIDUAL_FLOOR_USD - 1),
+            mark_range_flags=flags,
+        )
+        assert result["classification"] == "broker_data_quality"
+
+    def test_large_residual_beyond_flagged_marks_stays_reconcile_defect(self):
+        """Flagged marks explain only part of the divergence — the leftover
+        is a real code-path question, not resolved by naming the ticker."""
+        flags = [{"ticker": "AMD", "mark_error_usd": -1000.0}]
+        result = _classify_nav_breach(pricing_timing_usd=-9560.36, mark_range_flags=flags)
+        assert result["classification"] == "reconcile_defect"
+        assert result["residual_usd"] == pytest.approx(-8560.36)
+
+    def test_no_flags_is_always_reconcile_defect(self):
+        result = _classify_nav_breach(pricing_timing_usd=-9560.36, mark_range_flags=[])
+        assert result["classification"] == "reconcile_defect"
+
+
+class TestFormatMarkRangeDetail:
+    def test_names_ticker_and_dollar_error_in_alert_text(self):
+        flags = [{
+            "ticker": "AMD", "ib_mark": 479.00, "day_low": 502.20,
+            "day_high": 530.13, "shares": 225, "mark_error_usd": -5224.50,
+        }]
+        detail = _format_mark_range_detail(flags)
+        assert "AMD" in detail
+        assert "479.00" in detail
+        assert "-5,224" in detail or "-5224" in detail
+
+    def test_multiple_tickers_are_all_named(self):
+        flags = [
+            {"ticker": "AMD", "ib_mark": 1, "day_low": 2, "day_high": 3, "shares": 1, "mark_error_usd": -1},
+            {"ticker": "COIN", "ib_mark": 1, "day_low": 2, "day_high": 3, "shares": 1, "mark_error_usd": -1},
+        ]
+        detail = _format_mark_range_detail(flags)
+        assert "AMD" in detail
+        assert "COIN" in detail
 
 
 class TestResolvePriorPrice:
