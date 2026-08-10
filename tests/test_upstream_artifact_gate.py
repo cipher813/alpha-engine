@@ -72,7 +72,8 @@ class TestCheckUpstreamDeliverables:
         assert failures
         assert any("predictor_predictions" in f for f in failures)
         assert any("daily_closes_parquet" in f for f in failures)
-        # research_signals uses saturday_sf 10-day window — May 1 is >10d before Jun 23
+        # research_signals uses eod_sf (config-I6658) — May 1 is far outside
+        # the ~2-trading-day floor before Jun 23
         assert any("research_signals" in f for f in failures)
 
     def test_passes_prior_trading_day_fallback_artifacts(self):
