@@ -201,16 +201,37 @@ def test_metron_intraday_excluded_from_trading_sync():
     )
 
 
-def test_metron_intraday_one_time_disable_cleanup_exists():
-    """boot-pull.sh must self-heal a box that already had metron-intraday
-    installed+enabled before the exclude existed — the exclude only stops
-    FUTURE install/enable, it doesn't retroactively touch an already-present
-    unit. `systemctl disable --now` on both unit names, guarded to run only
-    if actually installed, `|| true` so it can never fail boot-pull itself."""
+def test_metron_intraday_cleanup_removes_the_unit_files_not_just_disables():
+    """boot-pull.sh must RETIRE metron-intraday on trading, not merely disable it.
+
+    This test used to pin the literal `systemctl disable --now
+    metron-intraday.timer metron-intraday.service`, and that is exactly as far
+    as the cleanup went. A disabled unit whose FILE stays on disk is still an
+    installed unit: `check-systemd-unit-drift` compared trading's July copy
+    against nousergon-data's current one — which had since been reshaped for
+    the dashboard box — and reported
+    `metron-intraday.service: installed (3c6a241e) != repo (082a1ab8)` every
+    day from 2026-07-29 to 2026-08-13 (alpha-engine-config-I6960).
+
+    It could never converge: the unit is on the EXCLUDE list, so the sync pass
+    deliberately never updates it, and orphan removal never fires because the
+    file is present in the source dir. Disable leaves a permanent drift
+    finding; remove ends it truthfully. Both halves are asserted so a revert to
+    disable-only fails here.
+    """
     src = _source()
-    assert "systemctl disable --now metron-intraday.timer metron-intraday.service" in src, (
-        "boot-pull.sh must explicitly disable+stop any already-installed "
-        "metron-intraday unit on trading as a one-time/idempotent cleanup "
-        "step (config#1768: moved to ae-dashboard, closes-when requires "
-        "`systemctl is-active metron-intraday` inactive/masked on ae-trading)."
+    assert "systemctl disable --now" in src and "metron-intraday" in src, (
+        "boot-pull.sh must still disable+stop an already-installed "
+        "metron-intraday on trading (config#1768: moved to ae-dashboard)."
+    )
+    assert 'rm -f "/etc/systemd/system/$_u"' in src, (
+        "the cleanup must DELETE the leftover unit files. Disabling alone "
+        "leaves a decommissioned unit permanently drifted against a source it "
+        "is excluded from syncing with — a daily ERROR page that no amount of "
+        "reconciling could ever clear (alpha-engine-config-I6960)."
+    )
+    assert "list-unit-files metron-intraday" not in src, (
+        "`systemctl list-unit-files <name>` exits 0 with '0 unit files listed' "
+        "when nothing matches, so the old guard was always true and the NOTE "
+        "printed on every boot. Test for the FILES."
     )

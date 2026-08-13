@@ -1,0 +1,14 @@
+[Unit]
+Description=Pull latest Alpha Engine code on boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+ExecStart=/home/ec2-user/alpha-engine/infrastructure/boot-pull.sh
+TimeoutStartSec=120
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
