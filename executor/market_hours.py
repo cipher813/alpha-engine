@@ -2,18 +2,46 @@
 Market hours validation — prevents order placement outside regular trading hours.
 
 NYSE regular session: 9:30 AM – 4:00 PM Eastern, weekdays only.
-Includes NYSE holiday calendar through 2030 to prevent orders on closed days.
+
+The NYSE holiday calendar is NOT maintained here. ``NYSE_HOLIDAYS`` and
+``is_trading_day`` are re-exported from ``krepis.trading_calendar``, which is
+the fleet's single owner of the NYSE calendar (alpha-engine-config-I7111).
+
+Until 2026-08-13 this module carried its own hand-maintained copy of the
+holiday table — byte-for-byte identical to krepis's at the time of the
+merge, and drifting only by luck. The retired ``sf-watch-market-hours-toggler``
+Lambda recorded that duplication as an owed follow-up in its own source and
+was then deleted without paying it; two Step Functions pipelines now gate on
+this predicate (``ne-preopen-trading-pipeline`` and
+``ne-postclose-trading-pipeline``, nousergon-data), so a divergent table
+would mean the daemon and the pipelines disagree about whether the market
+is open.
+
+``is_market_hours`` below is the ONE remaining local copy of logic that also
+exists as ``krepis.trading_calendar.is_market_hours`` (krepis >= 0.55.0). It
+stays local only because this repo's uv lockfile pins ``krepis==0.16.2`` and
+re-resolving it is a lockfile-wide change on the trading daemon, unrelated to
+the boundary this ships. Collapse this into a re-export at the next krepis
+pin bump — tracked as alpha-engine-config-I7149. The two implementations are
+kept from outliving the pin by
+``tests/test_market_hours.py::TestCollapseTrigger``, which fails the moment the
+pinned krepis exposes ``is_market_hours``.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, time
+from datetime import datetime, time
 
 import pytz
 
+# Single source of the NYSE calendar. Do NOT re-declare either name here.
+from krepis.trading_calendar import NYSE_HOLIDAYS, is_trading_day
+
 logger = logging.getLogger(__name__)
+
+__all__ = ["NYSE_HOLIDAYS", "is_market_hours", "is_trading_day"]
 
 _ET = pytz.timezone("US/Eastern")
 _MARKET_OPEN = time(9, 30)
@@ -26,50 +54,18 @@ _MARKET_CLOSE = time(
     int(os.environ.get("MARKET_CLOSE_MINUTE", "0")),
 )
 
-# NYSE observed holidays through 2030.
-# Source: https://www.nyse.com/markets/hours-calendars
-NYSE_HOLIDAYS: set[date] = {
-    # 2025
-    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 4, 18),
-    date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1),
-    date(2025, 11, 27), date(2025, 12, 25),
-    # 2026
-    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
-    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
-    date(2026, 11, 26), date(2026, 12, 25),
-    # 2027
-    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
-    date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
-    date(2027, 11, 25), date(2027, 12, 24),
-    # 2028
-    date(2028, 1, 17), date(2028, 2, 21), date(2028, 4, 14), date(2028, 5, 29),
-    date(2028, 6, 19), date(2028, 7, 4), date(2028, 9, 4), date(2028, 11, 23),
-    date(2028, 12, 25),
-    # 2029
-    date(2029, 1, 1), date(2029, 1, 15), date(2029, 2, 19), date(2029, 3, 30),
-    date(2029, 5, 28), date(2029, 6, 19), date(2029, 7, 4), date(2029, 9, 3),
-    date(2029, 11, 22), date(2029, 12, 25),
-    # 2030
-    date(2030, 1, 1), date(2030, 1, 21), date(2030, 2, 18), date(2030, 4, 19),
-    date(2030, 5, 27), date(2030, 6, 19), date(2030, 7, 4), date(2030, 9, 2),
-    date(2030, 11, 28), date(2030, 12, 25),
-}
-
-
-def is_trading_day(d: date | None = None) -> bool:
-    """Return True if the given date is an NYSE trading day (not weekend or holiday)."""
-    if d is None:
-        d = date.today()
-    if d.weekday() > 4:
-        return False
-    return d not in NYSE_HOLIDAYS
-
 
 def is_market_hours(now: datetime | None = None) -> bool:
     """
     Return True if the current time is during NYSE regular trading hours.
 
     Checks: weekday AND not a holiday AND between 9:30 AM – 4:00 PM Eastern.
+
+    The close is EXCLUSIVE. ``daemon.py`` reads that boundary directly: it
+    triggers ``ne-postclose-trading-pipeline`` only once this returns False
+    (``daemon.py`` — ``market_opened and not is_market_hours()``), which is
+    why every observed ``eod-*`` execution starts at 16:00:0x ET rather than
+    inside the session.
     """
     if now is None:
         now = datetime.now(_ET)
@@ -78,19 +74,17 @@ def is_market_hours(now: datetime | None = None) -> bool:
     else:
         now = now.astimezone(_ET)
 
-    if now.weekday() > 4:
-        logger.info("Market closed: weekend (day=%d)", now.weekday())
-        return False
-
-    if now.date() in NYSE_HOLIDAYS:
-        logger.info("Market closed: NYSE holiday (%s)", now.date())
+    if not is_trading_day(now.date()):
+        logger.info("Market closed: %s is not an NYSE trading day", now.date())
         return False
 
     current_time = now.time()
     if current_time < _MARKET_OPEN or current_time >= _MARKET_CLOSE:
         logger.info(
-            "Market closed: current time %s ET is outside 9:30-16:00",
+            "Market closed: current time %s ET is outside %s-%s",
             current_time.strftime("%H:%M"),
+            _MARKET_OPEN.strftime("%H:%M"),
+            _MARKET_CLOSE.strftime("%H:%M"),
         )
         return False
 
