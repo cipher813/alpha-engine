@@ -54,9 +54,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 CHAMPION_POINTER_KEY = "config/producer_champion.json"
-RESEARCH_FREE_PARQUET_KEY = (
-    "predictor/research_free_backfill/predictor_outcomes_research_free.parquet"
-)
+RESEARCH_FREE_PARQUET_KEY = "predictor/research_free_backfill/predictor_outcomes_research_free.parquet"
 # Think Tank's challenger-arm submission (crucible-research thinktank/__init__.py
 # CHALLENGER_SELECTION_LATEST_KEY — kept as a literal here rather than an
 # import to avoid a cross-repo package dependency from crucible-executor on
@@ -141,21 +139,18 @@ def load_champion_pointer(bucket: str, s3_client=None) -> dict:
         code = e.response.get("Error", {}).get("Code", "")
         if code in ("NoSuchKey", "404"):
             logger.info(
-                "No champion pointer at s3://%s/%s — defaulting to agentic "
-                "(pre-bootstrap state)", bucket, CHAMPION_POINTER_KEY,
+                "No champion pointer at s3://%s/%s — defaulting to agentic (pre-bootstrap state)",
+                bucket,
+                CHAMPION_POINTER_KEY,
             )
             return dict(_DEFAULT_POINTER)
-        raise ChampionPointerError(
-            f"Failed to read champion pointer s3://{bucket}/{CHAMPION_POINTER_KEY}: {e}"
-        ) from e
+        raise ChampionPointerError(f"Failed to read champion pointer s3://{bucket}/{CHAMPION_POINTER_KEY}: {e}") from e
 
     try:
         raw = obj["Body"].read()
         pointer = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError, KeyError) as e:
-        raise ChampionPointerError(
-            f"Champion pointer s3://{bucket}/{CHAMPION_POINTER_KEY} is malformed: {e}"
-        ) from e
+        raise ChampionPointerError(f"Champion pointer s3://{bucket}/{CHAMPION_POINTER_KEY} is malformed: {e}") from e
 
     if not isinstance(pointer, dict):
         raise ChampionPointerError(
@@ -211,9 +206,7 @@ def assert_producer_champion_coherence(
     empty_by_contract = DEFAULT_EMPTY_BUY_CANDIDATES_PRODUCERS | frozenset(
         config.get("producers_emitting_empty_buy_candidates_by_contract") or ()
     )
-    noop_arms = DEFAULT_NOOP_CHAMPION_ARMS | frozenset(
-        config.get("champion_noop_arms") or ()
-    )
+    noop_arms = DEFAULT_NOOP_CHAMPION_ARMS | frozenset(config.get("champion_noop_arms") or ())
     if producer in empty_by_contract and champion in noop_arms:
         raise ProducerChampionIncoherenceError(
             f"Producer/champion configuration incoherence (config#5713): "
@@ -268,8 +261,7 @@ def _load_research_free_cohort(bucket: str, s3_client=None) -> pd.DataFrame:
         df = pd.read_parquet(io.BytesIO(body))
     except Exception as e:  # noqa: BLE001 — any parse failure must raise, not silently no-op
         raise ChampionPointerError(
-            f"Failed to parse research-free parquet s3://{bucket}/"
-            f"{RESEARCH_FREE_PARQUET_KEY}: {e}"
+            f"Failed to parse research-free parquet s3://{bucket}/{RESEARCH_FREE_PARQUET_KEY}: {e}"
         ) from e
 
     required_cols = {"ticker", "prediction_date", "predicted_alpha"}
@@ -282,8 +274,7 @@ def _load_research_free_cohort(bucket: str, s3_client=None) -> pd.DataFrame:
 
     if df.empty:
         raise ChampionPointerError(
-            "research-free parquet is empty — scanner_predictor_direct champion "
-            "has no candidates to select from."
+            "research-free parquet is empty — scanner_predictor_direct champion has no candidates to select from."
         )
 
     latest_date = df["prediction_date"].max()
@@ -324,8 +315,7 @@ def _load_challenger_selection(bucket: str, s3_client=None) -> dict:
         selection = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
         raise ChampionPointerError(
-            f"Challenger-selection artifact s3://{bucket}/"
-            f"{CHALLENGER_SELECTION_LATEST_KEY} is malformed: {e}"
+            f"Challenger-selection artifact s3://{bucket}/{CHALLENGER_SELECTION_LATEST_KEY} is malformed: {e}"
         ) from e
 
     if not isinstance(selection, dict):
@@ -371,6 +361,64 @@ def _load_challenger_selection(bucket: str, s3_client=None) -> dict:
             )
 
     return selection
+
+
+#: Calendar-day age at or below which a champion cohort is considered current.
+#: 3 allows the legitimate Friday-cohort-used-Monday case and nothing looser —
+#: the producer refreshes every trading day, so anything beyond a weekend gap
+#: means the producer has stopped. Deliberately NOT the hard-fail bound: see
+#: the I7216 comment in ``_apply_scanner_predictor_direct``.
+COHORT_FRESH_MAX_DAYS = 3
+
+
+def evaluate_cohort_staleness(prediction_date, run_date: str, config: dict) -> dict:
+    """Classify the champion cohort's age. Never raises; never blocks.
+
+    Returns a dict carrying the cohort date, its age in calendar days, and
+    whether that age is within the fresh window. It is emitted on every run —
+    including the healthy one — because a field that only appears when
+    something is wrong cannot be trended, and its absence reads as "fine"
+    rather than "not measured" (``principles.md`` §2.7).
+
+    alpha-engine-config-I7216. The hard ``_check_freshness`` bound stays where
+    it is; this is the signal that was missing between "current" and "so old
+    we refuse to trade".
+    """
+    fresh_max = int(config.get("champion_cohort_fresh_max_days", COHORT_FRESH_MAX_DAYS))
+    pred_d = pd.Timestamp(prediction_date).date()
+    run_d = date.fromisoformat(run_date)
+    age_days = (run_d - pred_d).days
+    is_stale = age_days > fresh_max
+    record = {
+        "cohort_prediction_date": pred_d.isoformat(),
+        "run_date": run_date,
+        "age_days": age_days,
+        "fresh_max_days": fresh_max,
+        "is_stale": is_stale,
+    }
+    if is_stale:
+        # WARNING, not INFO: this run will trade, and the orders it places are
+        # derived from a candidate ranking this many days old. That belongs in
+        # the degraded-run path, not buried in a success.
+        logger.warning(
+            "[champion] STALE COHORT: prediction_date=%s is %d calendar day(s) "
+            "before run_date=%s (fresh window %d). Entries this run are drawn "
+            "from a frozen candidate pool — check the producer "
+            "(predictor/research_free_backfill/). alpha-engine-config-I7216.",
+            pred_d,
+            age_days,
+            run_date,
+            fresh_max,
+        )
+    else:
+        logger.info(
+            "[champion] cohort age OK: prediction_date=%s is %d day(s) before run_date=%s (fresh window %d)",
+            pred_d,
+            age_days,
+            run_date,
+            fresh_max,
+        )
+    return record
 
 
 def _check_freshness(
@@ -466,25 +514,33 @@ def apply_champion_selection(
 
     if champion == "scanner_predictor_direct":
         return _apply_scanner_predictor_direct(
-            signals_raw, predictions_by_ticker,
-            bucket=bucket, run_date=run_date, config=config,
-            sector_map=sector_map, s3_client=s3_client, pointer=pointer,
+            signals_raw,
+            predictions_by_ticker,
+            bucket=bucket,
+            run_date=run_date,
+            config=config,
+            sector_map=sector_map,
+            s3_client=s3_client,
+            pointer=pointer,
         )
 
     if champion == "thinktank_coverage":
         return _apply_thinktank_coverage(
-            signals_raw, predictions_by_ticker,
-            bucket=bucket, run_date=run_date, config=config,
-            sector_map=sector_map, s3_client=s3_client, pointer=pointer,
+            signals_raw,
+            predictions_by_ticker,
+            bucket=bucket,
+            run_date=run_date,
+            config=config,
+            sector_map=sector_map,
+            s3_client=s3_client,
+            pointer=pointer,
         )
 
     # Unreachable in practice — load_champion_pointer already validates
     # against VALID_CHAMPIONS — but fail loud rather than silently
     # falling through if a new champion value is ever added to the
     # pointer schema without a matching branch here.
-    raise ChampionPointerError(
-        f"apply_champion_selection has no handling for champion={champion!r}"
-    )
+    raise ChampionPointerError(f"apply_champion_selection has no handling for champion={champion!r}")
 
 
 def _apply_scanner_predictor_direct(
@@ -506,11 +562,29 @@ def _apply_scanner_predictor_direct(
     cohort = _load_research_free_cohort(bucket, s3_client=s3_client)
     latest_date = cohort["prediction_date"].iloc[0]
     _check_freshness(latest_date, run_date, max_days)
+    # alpha-engine-config-I7216: the hard bound above is deliberately loose
+    # (8 calendar days) because halting a trading day is itself expensive —
+    # sf-pipeline-policy.md §1.2 makes the cost of NOT trading a first-class
+    # input. But 8 days spans a full trading week plus a weekend, so between
+    # "yesterday's cohort" and "last Thursday's" the hard bound says nothing,
+    # and the run completes as a clean success either way.
+    #
+    # Measured 2026-08-13: the cohort had been frozen at prediction_date
+    # 2026-08-07 since its producer (the weekly pipeline's PredictorBacktest)
+    # started failing. Six days stale, under the bound, so every trading day
+    # drew its 10 entry candidates from the same frozen pool. Distinct names
+    # newly entered fell from ~20/month to 3, and the only surface carrying
+    # the cohort date at all was an INFO line in /var/log/executor.log on the
+    # trading box. The operator noticed before any detector did.
+    #
+    # So: keep trading, and make the staleness LOUD. This is the honest-
+    # degradation split (sf-pipeline-policy §2.3) — visibility to a human and
+    # propagation to a machine are separate properties, and a stale entry feed
+    # needs both.
+    staleness = evaluate_cohort_staleness(latest_date, run_date, config)
 
     n_buy_candidates = len(signals_raw.get("buy_candidates") or [])
-    n = n_buy_candidates if n_buy_candidates > 0 else int(
-        config.get("champion_top_n_default", 10)
-    )
+    n = n_buy_candidates if n_buy_candidates > 0 else int(config.get("champion_top_n_default", 10))
 
     cohort_sorted = cohort.sort_values("predicted_alpha", ascending=False).reset_index(drop=True)
     top_n = cohort_sorted.head(n)
@@ -560,14 +634,27 @@ def _apply_scanner_predictor_direct(
 
     logger.info(
         "[champion] scanner_predictor_direct selected %d/%d candidate(s) from "
-        "cohort=%s (n_buy_candidates=%d, cohort_size=%d)",
-        len(synthesized), n, latest_date, n_buy_candidates, cohort_size,
+        "cohort=%s age=%dd (n_buy_candidates=%d, cohort_size=%d)",
+        len(synthesized),
+        n,
+        latest_date,
+        staleness["age_days"],
+        n_buy_candidates,
+        cohort_size,
     )
 
     new_signals_raw = dict(signals_raw)
     new_signals_raw["buy_candidates"] = synthesized
     new_signals_raw["champion"] = "scanner_predictor_direct"
     new_signals_raw["promotion_source"] = pointer.get("promotion_source")
+    # alpha-engine-config-I7216: carried on the artifact, not just logged, so a
+    # consumer can render it and a stale feed is machine-visible. Emitted on
+    # every run, healthy included — an absent field is unmeasured, not fine.
+    new_signals_raw["champion_cohort"] = {
+        **staleness,
+        "cohort_size": cohort_size,
+        "n_selected": len(synthesized),
+    }
 
     new_predictions_by_ticker = dict(predictions_by_ticker)
     new_predictions_by_ticker.update(injected_predictions)
@@ -651,7 +738,9 @@ def _apply_thinktank_coverage(
     max_days = int(config.get("champion_freshness_max_days", 8))
     trading_day = selection["trading_day"]
     _check_freshness(
-        trading_day, run_date, max_days,
+        trading_day,
+        run_date,
+        max_days,
         feed_label="thinktank_coverage challenger-selection artifact",
     )
 
@@ -666,9 +755,7 @@ def _apply_thinktank_coverage(
     selection_size = len(rows_sorted)
 
     n_buy_candidates = len(signals_raw.get("buy_candidates") or [])
-    n = n_buy_candidates if n_buy_candidates > 0 else int(
-        config.get("champion_top_n_default", 10)
-    )
+    n = n_buy_candidates if n_buy_candidates > 0 else int(config.get("champion_top_n_default", 10))
     top_n = rows_sorted[:n]
 
     score_floor = float(config.get("champion_score_floor", 60))
@@ -717,7 +804,11 @@ def _apply_thinktank_coverage(
         "[champion] thinktank_coverage selected %d/%d candidate(s) from "
         "challenger-selection trading_day=%s (n_buy_candidates=%d, "
         "selection_size=%d, uncovered_count=%d)",
-        len(synthesized), n, trading_day, n_buy_candidates, selection_size,
+        len(synthesized),
+        n,
+        trading_day,
+        n_buy_candidates,
+        selection_size,
         selection.get("uncovered_count", 0),
     )
 
