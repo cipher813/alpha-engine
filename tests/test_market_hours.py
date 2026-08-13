@@ -23,10 +23,10 @@ import inspect
 import re
 from datetime import date, datetime, time
 
+import krepis.trading_calendar as krepis_calendar
 import pytest
 import pytz
 
-import krepis.trading_calendar as krepis_calendar
 from executor import market_hours
 from executor.market_hours import NYSE_HOLIDAYS, is_market_hours, is_trading_day
 
@@ -90,7 +90,7 @@ class TestSessionBoundary:
     def test_non_eastern_input_is_converted(self):
         import datetime as _dt
 
-        utc_noon_et = datetime(2026, 8, 12, 16, 0, tzinfo=_dt.timezone.utc)
+        utc_noon_et = datetime(2026, 8, 12, 16, 0, tzinfo=_dt.UTC)
         assert is_market_hours(utc_noon_et) is True
 
 
