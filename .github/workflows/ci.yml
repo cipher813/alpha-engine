@@ -72,5 +72,5 @@ jobs:
   notify-main-failure:
     needs: [test, lockfile-python-parity]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@fbedec1ac6b659a88a3d42572017c04e7b825360
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@9a23dbb5a719feb4757534f5f158d28f0357e81f
     secrets: inherit
