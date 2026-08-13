@@ -648,10 +648,33 @@ sync_systemd_units_from "/home/ec2-user/alpha-engine-data/infrastructure/systemd
 # permanently (config#1768's own closes-when checks `systemctl is-active
 # metron-intraday` is inactive/masked on ae-trading — this is that
 # self-healing path for this environment, which cannot verify it live).
-if systemctl list-unit-files metron-intraday.timer >> "$LOG" 2>&1 || systemctl list-unit-files metron-intraday.service >> "$LOG" 2>&1; then
-    log "NOTE metron-intraday unit(s) found installed on trading — disabling (config#1768: moved to ae-dashboard)"
-    sudo systemctl disable --now metron-intraday.timer metron-intraday.service 2>> "$LOG" || true
+#
+# 2026-08-13 (alpha-engine-config-I6960): this used to DISABLE and stop there,
+# so the unit FILES stayed on disk — at the version trading had in July 2026,
+# while nousergon-data's copy moved on to the dashboard box's shape
+# (`.venv-intraday`, MemoryHigh/Max). check-systemd-unit-drift then reported
+# `metron-intraday.service: installed (3c6a241e) != repo (082a1ab8)` every
+# single day, correctly and forever: a decommissioned unit cannot converge on a
+# source it is excluded from syncing with. Disabling is half a retirement.
+# Removing the file is the other half, and it is what makes the drift finding
+# go away by being TRUE rather than by being silenced.
+#
+# The old condition was also always-true — `systemctl list-unit-files <name>`
+# exits 0 with "0 unit files listed" when nothing matches — so the NOTE printed
+# on every boot of every box regardless. Test the files.
+_metron_leftovers=()
+for _u in metron-intraday.timer metron-intraday.service; do
+    [ -f "/etc/systemd/system/$_u" ] && _metron_leftovers+=("$_u")
+done
+if [ ${#_metron_leftovers[@]} -gt 0 ]; then
+    log "NOTE metron-intraday leftover unit(s) on trading: ${_metron_leftovers[*]} — retiring (config#1768: moved to ae-dashboard)"
+    sudo systemctl disable --now "${_metron_leftovers[@]}" 2>> "$LOG" || true
+    for _u in "${_metron_leftovers[@]}"; do
+        sudo rm -f "/etc/systemd/system/$_u" && log "OK   systemd: retired $_u (decommissioned, moved to ae-dashboard)"
+    done
+    sudo systemctl daemon-reload
 fi
+unset _metron_leftovers _u
 
 # Config files are now in the alpha-engine-config private repo (pulled above).
 # Each module's config loader searches ~/alpha-engine-config/ first.
