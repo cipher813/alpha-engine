@@ -26,10 +26,12 @@ from botocore.exceptions import ClientError
 from executor.champion import (
     CHALLENGER_SELECTION_LATEST_KEY,
     CHAMPION_POINTER_KEY,
+    COHORT_FRESH_MAX_DAYS,
     RESEARCH_FREE_PARQUET_KEY,
     ChampionPointerError,
     StaleChampionFeedError,
     apply_champion_selection,
+    evaluate_cohort_staleness,
     load_champion_pointer,
 )
 from executor.signal_reader import (
@@ -201,9 +203,13 @@ class TestAgenticPassthrough:
         s3 = _FakeS3({CHAMPION_POINTER_KEY: _pointer_bytes(champion="agentic")})
 
         out_signals, out_preds = apply_champion_selection(
-            signals_raw, predictions_by_ticker,
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            predictions_by_ticker,
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
 
         assert out_signals is signals_raw
@@ -221,9 +227,13 @@ class TestAgenticPassthrough:
         s3 = _FakeS3({})  # no pointer key at all
 
         out_signals, out_preds = apply_champion_selection(
-            signals_raw, predictions_by_ticker,
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            predictions_by_ticker,
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
 
         assert out_signals is signals_raw
@@ -235,10 +245,12 @@ class TestAgenticPassthrough:
 
 class TestScannerPredictorDirect:
     def _s3(self, cohort_date="2026-07-10", n=5, champion="scanner_predictor_direct"):
-        return _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion=champion),
-            RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows(cohort_date, n)),
-        })
+        return _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(champion=champion),
+                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows(cohort_date, n)),
+            }
+        )
 
     def test_synthesized_entries_route_to_enter(self):
         signals_raw = {
@@ -249,9 +261,13 @@ class TestScannerPredictorDirect:
         s3 = self._s3(cohort_date="2026-07-10", n=3)
 
         out_signals, out_preds = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={"TKR000": "Technology"}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={"TKR000": "Technology"},
+            s3_client=s3,
         )
 
         actionable = get_actionable_signals(out_signals)
@@ -270,9 +286,13 @@ class TestScannerPredictorDirect:
         s3 = self._s3(n=4)
 
         out_signals, out_preds = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
 
         # Must not raise — every synthesized buy_candidate has a prediction row.
@@ -293,9 +313,13 @@ class TestScannerPredictorDirect:
         s3 = self._s3(n=1)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
 
         assert out_signals["universe"] == held
@@ -313,9 +337,13 @@ class TestScannerPredictorDirect:
         s3 = self._s3(n=5)  # cohort has 5, but only 2 buy_candidates → N=2
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 2
 
@@ -325,9 +353,13 @@ class TestScannerPredictorDirect:
         cfg = dict(_CONFIG, champion_top_n_default=3)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=cfg, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=cfg,
+            sector_map={},
+            s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 3
 
@@ -338,9 +370,13 @@ class TestScannerPredictorDirect:
 
         with pytest.raises(StaleChampionFeedError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_cohort_within_freshness_window_does_not_raise(self):
@@ -349,9 +385,13 @@ class TestScannerPredictorDirect:
         s3 = self._s3(cohort_date="2026-07-05", n=2)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 2
 
@@ -361,9 +401,13 @@ class TestScannerPredictorDirect:
         cfg = dict(_CONFIG, champion_top_n_default=6)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=cfg, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=cfg,
+            sector_map={},
+            s3_client=s3,
         )
 
         entries = out_signals["buy_candidates"]
@@ -380,16 +424,22 @@ class TestScannerPredictorDirect:
     def test_missing_required_columns_raises(self):
         signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
         bad_rows = [{"ticker": "TKR000", "prediction_date": "2026-07-10"}]  # no predicted_alpha
-        s3 = _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(),
-            RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(bad_rows),
-        })
+        s3 = _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(),
+                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(bad_rows),
+            }
+        )
 
         with pytest.raises(ChampionPointerError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_missing_parquet_raises(self):
@@ -398,9 +448,13 @@ class TestScannerPredictorDirect:
 
         with pytest.raises(ChampionPointerError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_sector_map_applied_to_synthesized_entries(self):
@@ -409,9 +463,13 @@ class TestScannerPredictorDirect:
         sector_map = {"TKR000": "Health Care", "TKR001": "Financials"}
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map=sector_map, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map=sector_map,
+            s3_client=s3,
         )
         by_ticker = {e["ticker"]: e for e in out_signals["buy_candidates"]}
         assert by_ticker["TKR000"]["sector"] == "Health Care"
@@ -422,9 +480,13 @@ class TestScannerPredictorDirect:
         s3 = self._s3(n=1)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
         assert out_signals["champion"] == "scanner_predictor_direct"
         assert out_signals["promotion_source"] == "manual_test"
@@ -435,10 +497,12 @@ class TestScannerPredictorDirect:
 
 class TestThinktankCoverage:
     def _s3(self, **kwargs):
-        return _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
-            CHALLENGER_SELECTION_LATEST_KEY: _challenger_selection_bytes(**kwargs),
-        })
+        return _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+                CHALLENGER_SELECTION_LATEST_KEY: _challenger_selection_bytes(**kwargs),
+            }
+        )
 
     def test_synthesized_entries_route_to_enter(self):
         signals_raw = {
@@ -449,9 +513,13 @@ class TestThinktankCoverage:
         s3 = self._s3(trading_day="2026-07-10", n=3)
 
         out_signals, out_preds = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={"TKR000": "Technology"}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={"TKR000": "Technology"},
+            s3_client=s3,
         )
 
         actionable = get_actionable_signals(out_signals)
@@ -466,9 +534,13 @@ class TestThinktankCoverage:
         s3 = self._s3(n=4)
 
         out_signals, out_preds = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
 
         # Must not raise — every synthesized buy_candidate has a prediction row.
@@ -492,9 +564,13 @@ class TestThinktankCoverage:
         s3 = self._s3(n=1)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
 
         assert out_signals["universe"] == held
@@ -512,9 +588,13 @@ class TestThinktankCoverage:
         s3 = self._s3(n=5)  # selection has 5, but only 2 buy_candidates → N=2
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 2
 
@@ -524,9 +604,13 @@ class TestThinktankCoverage:
         cfg = dict(_CONFIG, champion_top_n_default=3)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=cfg, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=cfg,
+            sector_map={},
+            s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 3
 
@@ -539,9 +623,13 @@ class TestThinktankCoverage:
         cfg = dict(_CONFIG, champion_top_n_default=50)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=cfg, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=cfg,
+            sector_map={},
+            s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 3
 
@@ -552,9 +640,13 @@ class TestThinktankCoverage:
 
         with pytest.raises(StaleChampionFeedError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_trading_day_within_freshness_window_does_not_raise(self):
@@ -563,9 +655,13 @@ class TestThinktankCoverage:
         s3 = self._s3(trading_day="2026-07-05", n=2)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 2
 
@@ -578,9 +674,13 @@ class TestThinktankCoverage:
 
         with pytest.raises(ChampionPointerError, match="coverage_complete"):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_missing_artifact_raises(self):
@@ -592,38 +692,54 @@ class TestThinktankCoverage:
 
         with pytest.raises(ChampionPointerError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_malformed_artifact_json_raises(self):
         signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
-        s3 = _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
-            CHALLENGER_SELECTION_LATEST_KEY: b"{not valid json",
-        })
+        s3 = _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+                CHALLENGER_SELECTION_LATEST_KEY: b"{not valid json",
+            }
+        )
 
         with pytest.raises(ChampionPointerError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_missing_required_top_level_key_raises(self):
         signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
         bad_payload = json.dumps({"schema_version": 1, "selections": []}).encode()  # no trading_day/coverage_complete
-        s3 = _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
-            CHALLENGER_SELECTION_LATEST_KEY: bad_payload,
-        })
+        s3 = _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+                CHALLENGER_SELECTION_LATEST_KEY: bad_payload,
+            }
+        )
 
         with pytest.raises(ChampionPointerError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_missing_required_row_key_raises(self):
@@ -632,9 +748,13 @@ class TestThinktankCoverage:
 
         with pytest.raises(ChampionPointerError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_empty_selections_raises(self):
@@ -643,9 +763,13 @@ class TestThinktankCoverage:
 
         with pytest.raises(ChampionPointerError):
             apply_champion_selection(
-                signals_raw, {},
-                bucket="test-bucket", run_date="2026-07-13",
-                config=_CONFIG, sector_map={}, s3_client=s3,
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
             )
 
     def test_sector_map_applied_to_synthesized_entries(self):
@@ -654,9 +778,13 @@ class TestThinktankCoverage:
         sector_map = {"TKR000": "Health Care", "TKR001": "Financials"}
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map=sector_map, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map=sector_map,
+            s3_client=s3,
         )
         by_ticker = {e["ticker"]: e for e in out_signals["buy_candidates"]}
         assert by_ticker["TKR000"]["sector"] == "Health Care"
@@ -667,9 +795,13 @@ class TestThinktankCoverage:
         s3 = self._s3(n=1)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=_CONFIG, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
         )
         assert out_signals["champion"] == "thinktank_coverage"
         assert out_signals["promotion_source"] == "manual_test"
@@ -684,9 +816,13 @@ class TestThinktankCoverage:
         cfg = dict(_CONFIG, champion_top_n_default=6)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=cfg, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=cfg,
+            sector_map={},
+            s3_client=s3,
         )
 
         entries = out_signals["buy_candidates"]
@@ -708,9 +844,13 @@ class TestThinktankCoverage:
         cfg = dict(_CONFIG, champion_top_n_default=6)
 
         out_signals, _ = apply_champion_selection(
-            signals_raw, {},
-            bucket="test-bucket", run_date="2026-07-13",
-            config=cfg, sector_map={}, s3_client=s3,
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=cfg,
+            sector_map={},
+            s3_client=s3,
         )
 
         by_ticker = {e["ticker"]: e["score"] for e in out_signals["buy_candidates"]}
@@ -894,10 +1034,12 @@ class TestReadSignalsChampionRegression:
             "executor.signal_reader.read_predictions",
             lambda bucket: ({}, "2026-04-24"),
         )
-        s3 = _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
-            RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-04-24", n=1)),
-        })
+        s3 = _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
+                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-04-24", n=1)),
+            }
+        )
         monkeypatch.setattr("boto3.client", lambda *a, **kw: s3)
 
         signals_raw, *_rest = main_mod._read_signals(
@@ -913,8 +1055,7 @@ class TestReadSignalsChampionRegression:
         # patch_unknown_sectors_with_constituents call below it is mocked
         # separately above and doesn't route through this same spy).
         assert sector_map_calls == ["test-bucket"], (
-            f"expected exactly one sector-map fetch from the champion adapter "
-            f"path, got {sector_map_calls}"
+            f"expected exactly one sector-map fetch from the champion adapter path, got {sector_map_calls}"
         )
         assert signals_raw["buy_candidates"][0]["sector"] == "Technology"
 
@@ -942,10 +1083,12 @@ class TestReadSignalsChampionRegression:
             "executor.signal_reader.read_predictions",
             lambda bucket: ({}, "2026-04-24"),
         )
-        s3 = _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
-            CHALLENGER_SELECTION_LATEST_KEY: _challenger_selection_bytes(trading_day="2026-04-24", n=1),
-        })
+        s3 = _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(champion="thinktank_coverage"),
+                CHALLENGER_SELECTION_LATEST_KEY: _challenger_selection_bytes(trading_day="2026-04-24", n=1),
+            }
+        )
         monkeypatch.setattr("boto3.client", lambda *a, **kw: s3)
 
         signals_raw, *_rest = main_mod._read_signals(
@@ -958,8 +1101,7 @@ class TestReadSignalsChampionRegression:
         )
 
         assert sector_map_calls == ["test-bucket"], (
-            f"expected exactly one sector-map fetch from the champion adapter "
-            f"path, got {sector_map_calls}"
+            f"expected exactly one sector-map fetch from the champion adapter path, got {sector_map_calls}"
         )
         assert signals_raw["buy_candidates"][0]["sector"] == "Technology"
 
@@ -979,6 +1121,7 @@ class TestOrderBookChampionStamp:
 
     def _order_book(self, run_date="2026-04-25"):
         from executor.order_book import OrderBook, _default_book
+
         return OrderBook(_default_book(run_date))
 
     def test_write_order_book_summary_stamps_champion_fields(self, monkeypatch, tmp_path):
@@ -994,7 +1137,10 @@ class TestOrderBookChampionStamp:
 
         ob = self._order_book()
         main_mod._write_order_book_summary(
-            ob, [], "test-bucket", "2026-04-25",
+            ob,
+            [],
+            "test-bucket",
+            "2026-04-25",
             champion="scanner_predictor_direct",
             promotion_source="manual_test",
         )
@@ -1050,9 +1196,17 @@ class TestOrderBookChampionStamp:
         }
 
         main_mod._write_stops_and_finalize(
-            ibkr, ob, {}, {}, {}, None, "2026-04-25",
-            blocked_entries=[], signals_bucket="test-bucket",
-            use_optimizer=False, signals_raw=signals_raw,
+            ibkr,
+            ob,
+            {},
+            {},
+            {},
+            None,
+            "2026-04-25",
+            blocked_entries=[],
+            signals_bucket="test-bucket",
+            use_optimizer=False,
+            signals_raw=signals_raw,
         )
 
         summary_calls = [c for c in put_calls if c["Key"].endswith("summary.json")]
@@ -1060,3 +1214,58 @@ class TestOrderBookChampionStamp:
         body = json.loads(summary_calls[0]["Body"])
         assert body["champion"] == "scanner_predictor_direct"
         assert body["promotion_source"] == "manual_test"
+
+
+# ── I7216: cohort age is measured and emitted on every run ───────────────────
+#
+# 2026-08-13: the champion cohort sat frozen at prediction_date 2026-08-07
+# because its producer (the weekly pipeline's PredictorBacktest) was failing.
+# Six calendar days stale — under the 8-day hard bound — so every trading day
+# drew its entry candidates from the same frozen pool and every run reported a
+# clean success. Distinct names newly entered fell from ~20/month to 3. The
+# only place the cohort date appeared was an INFO line on the trading box.
+
+
+class TestCohortStaleness:
+    def test_fresh_cohort_is_not_stale(self):
+        rec = evaluate_cohort_staleness("2026-08-12", "2026-08-13", {})
+        assert rec["age_days"] == 1
+        assert rec["is_stale"] is False
+
+    def test_friday_cohort_used_monday_is_still_fresh(self):
+        # The one legitimate multi-day gap: a Friday cohort consumed on the
+        # following Monday is 3 calendar days old and must NOT flag.
+        rec = evaluate_cohort_staleness("2026-08-07", "2026-08-10", {})
+        assert rec["age_days"] == 3
+        assert rec["is_stale"] is False
+
+    def test_the_20260813_frozen_cohort_flags_stale(self):
+        # The exact live state that went unreported.
+        rec = evaluate_cohort_staleness("2026-08-07", "2026-08-13", {})
+        assert rec["age_days"] == 6
+        assert rec["is_stale"] is True
+        assert rec["cohort_prediction_date"] == "2026-08-07"
+
+    def test_it_never_raises_and_never_blocks(self):
+        # Deliberately not a gate: halting a trading day is itself expensive
+        # (sf-pipeline-policy §1.2). This classifies; _check_freshness gates.
+        rec = evaluate_cohort_staleness("2020-01-02", "2026-08-13", {})
+        assert rec["is_stale"] is True
+        assert rec["age_days"] > 2000
+
+    def test_the_fresh_window_is_configurable(self):
+        rec = evaluate_cohort_staleness("2026-08-07", "2026-08-13", {"champion_cohort_fresh_max_days": 10})
+        assert rec["is_stale"] is False
+        assert rec["fresh_max_days"] == 10
+
+    def test_the_record_is_emitted_on_a_healthy_run_too(self):
+        # An absent field is unmeasured, not fine (principles.md §2.7) — so the
+        # healthy path must carry the same keys as the stale one.
+        healthy = evaluate_cohort_staleness("2026-08-12", "2026-08-13", {})
+        stale = evaluate_cohort_staleness("2026-08-01", "2026-08-13", {})
+        assert set(healthy) == set(stale)
+
+    def test_the_fresh_window_is_tighter_than_the_hard_fail_bound(self):
+        # The whole point: between "current" and "so old we refuse to trade"
+        # there was no signal. If these ever converge, that gap returns.
+        assert COHORT_FRESH_MAX_DAYS < 8
