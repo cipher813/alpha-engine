@@ -43,7 +43,7 @@ class TestFormatters:
 class TestEodReportUrl:
     def test_default_base(self):
         url = eod_report_url("2026-06-22")
-        assert url == f"https://console.nousergon.ai/{EOD_REPORT_SLUG}?date=2026-06-22"
+        assert url == f"https://dashboard.nousergon.ai/{EOD_REPORT_SLUG}?date=2026-06-22"
 
     def test_custom_base_strips_trailing_slash(self):
         url = eod_report_url("2026-06-22", "https://console.example.com/")
