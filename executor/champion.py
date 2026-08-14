@@ -377,6 +377,24 @@ def _load_challenger_selection(bucket: str, s3_client=None) -> dict:
 #: the I7216 comment in ``_apply_scanner_predictor_direct``.
 COHORT_FRESH_MAX_DAYS = 3
 
+#: Hard freshness bound for the ``thinktank_coverage`` arm's
+#: challenger-selection artifact, INDEPENDENT of ``champion_freshness_max_days``
+#: (alpha-engine-config-I7232, Brian ruling 2026-08-14). A freshness bound is
+#: a property of the PRODUCER's cadence, not a fleet-wide constant: the Think
+#: Tank is a DAILY producer, while ``champion_freshness_max_days`` (default 8)
+#: is shared with the ``scanner_predictor_direct`` arm, whose producer runs
+#: WEEKLY. Sharing the 8-day bound is exactly what let a 3-day-frozen
+#: challenger-selection pointer pass silently into a live champion feed.
+#: Set to 3 to match ``POINTER_LAG_ERROR_DAYS`` in crucible-research
+#: (thinktank/challenger_selection.py, crucible-research-PR630) — the
+#: producer-side ERROR and this consumer-side refusal now agree on what
+#: "stale" means for this arm. Accepted delta: the arm refuses to trade
+#: sooner during a Think Tank outage than it did before; that is the intent.
+#: This constant is deliberately NOT read from ``config`` — the whole point
+#: of the ruling is that this bound must not silently move if
+#: ``champion_freshness_max_days`` is retuned for the scanner arm.
+THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS = 3
+
 
 def evaluate_cohort_staleness(prediction_date, run_date: str, config: dict) -> dict:
     """Classify the champion cohort's age. Never raises; never blocks.
@@ -736,17 +754,24 @@ def _apply_thinktank_coverage(
         ENTIRE current-scan top-N coverage window is covered — an
         incomplete-coverage selection raises ``ChampionPointerError``
         rather than trading a partial/unrepresentative pool.
-      * ``trading_day`` must be within ``champion_freshness_max_days`` of
-        ``run_date`` (same knob + same calendar-day-diff technique as the
-        scanner arm's ``_check_freshness``, reused rather than a new
-        TT-specific staleness parameter — both represent "how stale can a
-        champion feed be before we refuse to trade", not an arm-specific
-        concept). Note this is a HARD gate, distinct from the artifact's
-        own ``board_date`` (which the producer deliberately never
-        hard-fails on — the daily Think Tank cadence legitimately reads a
-        stale universe board all week, config#1580) — ``trading_day`` is
-        the run identity of the challenger-selection artifact itself, the
-        analogue of the scanner arm's ``prediction_date``.
+      * ``trading_day`` must be within ``THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS``
+        (3 calendar days) of ``run_date`` — the same calendar-day-diff
+        technique as the scanner arm's ``_check_freshness``, but its OWN
+        bound (alpha-engine-config-I7232, Brian ruling 2026-08-14), not the
+        shared ``champion_freshness_max_days`` (default 8) used by the
+        ``scanner_predictor_direct`` arm below. The Think Tank is a daily
+        producer; the scanner's cohort is a weekly one — sharing one
+        fleet-wide constant between a daily and a weekly producer is exactly
+        what let a 3-day-frozen challenger-selection pointer pass silently
+        into a live champion feed. 3 matches ``POINTER_LAG_ERROR_DAYS`` in
+        crucible-research (crucible-research-PR630), so the producer-side
+        ERROR and this consumer-side refusal agree on what "stale" means.
+        Note this is a HARD gate, distinct from the artifact's own
+        ``board_date`` (which the producer deliberately never hard-fails on
+        — the daily Think Tank cadence legitimately reads a stale universe
+        board all week, config#1580) — ``trading_day`` is the run identity
+        of the challenger-selection artifact itself, the analogue of the
+        scanner arm's ``prediction_date``.
 
     Rank → score: ``selections`` arrives PRE-SORTED best-rating-first from
     the producer (``thinktank.challenger_selection.write_challenger_selection``
@@ -783,12 +808,15 @@ def _apply_thinktank_coverage(
             "trade on an incomplete-coverage selection (config#1580)."
         )
 
-    max_days = int(config.get("champion_freshness_max_days", 8))
+    # alpha-engine-config-I7232 (Brian ruling 2026-08-14): this arm's own
+    # freshness bound, NOT the shared `champion_freshness_max_days` used by
+    # the scanner arm below — see THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS and
+    # the docstring above.
     trading_day = selection["trading_day"]
     _check_freshness(
         trading_day,
         run_date,
-        max_days,
+        THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS,
         feed_label="thinktank_coverage challenger-selection artifact",
     )
 
