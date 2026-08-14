@@ -134,6 +134,7 @@ def run_shadow_optimizer(
     run_date: str,
     legacy_orders: list[dict] | None = None,
     s3_client=None,
+    price_histories_requested: set[str] | None = None,
 ) -> dict | None:
     """
     Run the optimizer in shadow mode and write the result to S3.
@@ -153,6 +154,7 @@ def run_shadow_optimizer(
             run_date=run_date,
             legacy_orders=legacy_orders or [],
             signals_bucket=signals_bucket,
+            price_histories_requested=price_histories_requested,
         )
         # L4515 turnover tripwire: band-check the executed turnover (daily +
         # rolling) BEFORE the artifact write so the verdict rides the daily
@@ -198,6 +200,7 @@ def _build_and_solve(
     run_date: str,
     legacy_orders: list[dict],
     signals_bucket: str | None = None,
+    price_histories_requested: set[str] | None = None,
 ) -> dict:
     optimizer_cfg = {
         **OPTIMIZER_CONFIG_DEFAULTS,
@@ -231,8 +234,11 @@ def _build_and_solve(
             "[derisk_gate] optimizer risk_aversion floored at %.2f (%s)",
             optimizer_cfg["risk_aversion"], _derisk_gate.reason,
         )
+    dropped_candidates: list[dict] = []
     tickers = _build_universe(
         signals_raw, predictions_by_ticker, current_positions, price_histories,
+        price_histories_requested=price_histories_requested,
+        dropped_out=dropped_candidates,
     )
     N = len(tickers)
     spy_idx = tickers.index(_SPY)
@@ -365,6 +371,13 @@ def _build_and_solve(
         "alpha_uncertainty": _alpha_uncertainty_to_json(alpha_uncertainty),
         "eligibility": [bool(x) for x in eligibility],
         "eligibility_reasons": list(eligibility_reasons),
+        # Names deleted BEFORE the solve, with a typed reason each. Distinct
+        # from `eligibility_reasons`, which only explains an included name's
+        # zero weight — the two answer different questions and neither
+        # substitutes for the other (config-I7337). Emitted every run,
+        # including empty: a field that appears only on the bad path is
+        # indistinguishable from a dead emitter.
+        "dropped_candidates": dropped_candidates,
         "stance_caps": [float(x) for x in stance_caps],
         "sectors": sectors,
         "covariance_daily": [[float(x) for x in row] for row in sigma_daily],
@@ -473,11 +486,46 @@ def _maybe_run_ablation(
     }
 
 
+def _classify_drop(
+    ticker: str,
+    price_histories: dict[str, pd.DataFrame],
+    requested: set[str] | None,
+) -> str:
+    """Why a declared candidate did not make the solved universe.
+
+    Three outcomes that ``_has_usable_history`` collapses into one ``False``,
+    and the collapse is the whole defect (config-I7337):
+
+    * ``no_history_loaded``    — the loader was never asked for it. A plumbing
+      contradiction: this module DECLARED it a candidate and something upstream
+      decided it would never have the data. Raised on, never recorded and
+      swallowed.
+    * ``history_absent_in_cache`` — asked for, the cache had nothing. A data
+      condition (new listing, gap in the predictor cache). Legitimate; recorded.
+    * ``history_too_short``    — present but under the covariance floor.
+      Legitimate; recorded.
+
+    ``requested is None`` means the caller could not say what was asked for, so
+    the first case is unprovable — degrade to ``history_absent_in_cache`` rather
+    than raise on a distinction we cannot make.
+    """
+    if requested is not None and ticker not in requested:
+        return "no_history_loaded"
+    df = price_histories.get(ticker)
+    if df is None:
+        return "history_absent_in_cache"
+    if "close" not in df.columns:
+        return "history_missing_close_column"
+    return "history_too_short"
+
+
 def _build_universe(
     signals_raw: dict,
     predictions_by_ticker: dict,
     current_positions: dict,
     price_histories: dict[str, pd.DataFrame],
+    price_histories_requested: set[str] | None = None,
+    dropped_out: list[dict] | None = None,
 ) -> list[str]:
     candidates: set[str] = set()
     candidates.update(predictions_by_ticker.keys())
@@ -492,6 +540,61 @@ def _build_universe(
     candidates.discard(_SPY)
     candidates.discard(_CASH)
     eligible = sorted(t for t in candidates if _has_usable_history(t, price_histories))
+
+    # ── A dropped candidate is NAMED, and a plumbing bug RAISES (config-I7337) ─
+    #
+    # `eligibility_reasons` further down explains why an INCLUDED name got
+    # weight 0. It is structurally blind to names deleted here, one step
+    # earlier — so until this block, the optimizer's own artifact could not
+    # distinguish "the predictor proposed nothing" from "the predictor's whole
+    # cut was silently removed before the solve". Those two rendered
+    # identically, which is the fleet's could-not-measure-as-found-nothing
+    # class and the reason a 20-name cut produced a 2-name book unnoticed.
+    #
+    # Predicted names are the ones that raise. A held position or a
+    # signals-universe name lacking history is ordinary; a name THIS MODULE
+    # declared a candidate on line ~483 and that the loader was never asked for
+    # is a contract violated inside one process, and it must not be tradeable
+    # through. Fail loud and fast: the fleet default is RAISE.
+    dropped = [
+        {
+            "ticker": t,
+            "reason": _classify_drop(t, price_histories, price_histories_requested),
+            "source": (
+                "prediction" if t in predictions_by_ticker
+                else "position" if t in current_positions
+                else "signals_universe"
+            ),
+        }
+        for t in sorted(candidates - set(eligible))
+    ]
+    if dropped_out is not None:
+        dropped_out.extend(dropped)
+
+    plumbing_bugs = [
+        d for d in dropped
+        if d["reason"] == "no_history_loaded" and d["source"] == "prediction"
+    ]
+    if plumbing_bugs:
+        names = ", ".join(d["ticker"] for d in plumbing_bugs)
+        raise RuntimeError(
+            f"Shadow optimizer: {len(plumbing_bugs)} predicted ticker(s) were "
+            f"declared candidates but their price histories were never "
+            f"requested, so they were dropped from the solved universe with no "
+            f"record: {names}. This is a data-plumbing contradiction inside one "
+            f"run — `_build_universe` asked for the predictor's cut and "
+            f"`executor.main` did not load it (config-I7337). Refusing to solve "
+            f"over a universe that silently excludes the signal it exists to "
+            f"trade. A ticker legitimately missing from the price cache is "
+            f"reported as `history_absent_in_cache` and does NOT raise."
+        )
+
+    if dropped:
+        logger.warning(
+            "[optimizer_shadow] %d candidate(s) dropped before the solve: %s",
+            len(dropped),
+            "; ".join(f"{d['ticker']}({d['source']}/{d['reason']})" for d in dropped),
+        )
 
     if _SPY not in price_histories or not _has_usable_history(_SPY, price_histories):
         raise RuntimeError(
