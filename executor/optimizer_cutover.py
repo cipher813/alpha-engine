@@ -333,6 +333,33 @@ def _build_entry_record(
     pullback_atr_mult = strategy_config.get("intraday_pullback_atr_multiple", 1.0)
     scaled_pullback_pct = ticker_atr_pct * pullback_atr_mult
 
+    # ── A missing ATR must not silently become "enter immediately, unstopped" ─
+    #
+    # `main.py` now loads ATR for the predictions cohort too (config-I7337), so
+    # this should not fire. It stays because the failure it guards is silent in
+    # BOTH directions and the cost is a real unprotected position:
+    #
+    #   * `daemon.py`: `use_bracket = atr_value and atr_value > 0` — a 0.0 ATR
+    #     places NO bracket stop.
+    #   * `entry_triggers.py` reads `triggers.get("pullback_pct", <default>)`.
+    #     A key that is PRESENT AND ZERO beats the default, so `pullback >= 0.0`
+    #     is always true and the entry fires on the first tick. Omitting the key
+    #     is therefore SAFER than writing 0.0 — the configured default applies.
+    #
+    # So on a missing ATR: omit `pullback_pct` rather than pin it to zero, and
+    # say so. The entry still proceeds — this is a discipline degradation, not a
+    # reason to refuse a target the optimizer chose — but it is now recorded and
+    # falls back to the conservative default instead of to "always".
+    atr_missing = ticker_atr_pct <= 0.0
+    if atr_missing:
+        logger.warning(
+            "optimizer_cutover: %s has no ATR (atr_map miss) — no bracket stop "
+            "will be placed and the pullback trigger falls back to the "
+            "configured default instead of firing on the first tick. "
+            "config-I7337: atr_tickers should cover every predicted name.",
+            ticker,
+        )
+
     sig = signals_by_ticker.get(ticker, {}) or {}
     pred = predictions_by_ticker.get(ticker, {}) or {}
 
@@ -348,9 +375,14 @@ def _build_entry_record(
         "atr_value": atr_dollar,
         "atr_pct": ticker_atr_pct,
         "triggers": {
-            "pullback_pct": scaled_pullback_pct,
+            # `pullback_pct` is OMITTED when the ATR is missing, so
+            # `entry_triggers` falls back to its configured default. Writing
+            # 0.0 here would beat that default and make the trigger always
+            # true — see the atr_missing note above.
+            **({} if atr_missing else {"pullback_pct": scaled_pullback_pct}),
             "pullback_atr_multiple": pullback_atr_mult,
             "atr_pct": ticker_atr_pct,
+            "atr_missing": atr_missing,
             "vwap_discount": strategy_config.get("intraday_vwap_discount_pct", 0.005),
             "vwap": vwap_map.get(ticker) if vwap_map else None,
             "support_level": None,

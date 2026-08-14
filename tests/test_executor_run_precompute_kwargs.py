@@ -315,3 +315,34 @@ def test_main_imports_macro_symbols_from_price_cache():
         "executor.main must reuse price_cache._MACRO_SYMBOLS, not "
         "redefine its own macro set (drift risk)."
     )
+
+
+# ── config-I7337: every precompute set covers the predictor's cut ────────────
+
+
+def test_atr_and_vwap_tickers_cover_the_predictions_cohort():
+    """The optimizer enters names from the PREDICTOR's cut; `signals["enter"]`
+    is the CHAMPION's synthesized cohort. Measured 2026-08-14 the two were
+    disjoint — champion AVAV/AXON/DELL/DOCS/ELF/ENTG/IT/KTOS/ONTO/TER vs the 8
+    the optimizer chose (ANF CPRT FCN FFIV KEX LULU OLLI TREX).
+
+    With ATR keyed only on `signals["enter"]`, every optimizer entry carried
+    `atr_value: 0.0`, which (a) makes `daemon.py`'s
+    `use_bracket = atr_value and atr_value > 0` falsy so NO bracket stop is
+    placed, and (b) writes `pullback_pct: 0.0`, which beats
+    `entry_triggers`' configured default and fires the entry on the first tick.
+
+    This is the sibling of the price-history loader config-I7337 fixed. Pin all
+    three sets to the same cohort so the class cannot recur one loader over.
+    """
+    src = _source()
+    assert "atr_tickers += list(predictions_by_ticker)" in src, (
+        "atr_tickers must include the predictions cohort — the optimizer "
+        "enters those names and a missing ATR silently disables the bracket "
+        "stop and the pullback trigger (config-I7337)."
+    )
+    assert "| set(predictions_by_ticker)" in src, (
+        "vwap_tickers must include the predictions cohort — otherwise the "
+        "VWAP entry trigger is inert for exactly the names the optimizer "
+        "chose (config-I7337)."
+    )

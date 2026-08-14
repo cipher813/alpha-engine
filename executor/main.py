@@ -1645,7 +1645,16 @@ def run(
         # existing path unchanged. Contract is identical either way:
         # {ticker: vwap_value_for_run_date}. Same design as the existing
         # ``price_histories`` kwarg — injection point, not replacement.
-        vwap_tickers = sorted({s["ticker"] for s in signals.get("enter", [])})
+        # config-I7337 (second instance): `signals["enter"]` is the CHAMPION's
+        # synthesized cohort, a different set from the predictor's cut that
+        # `optimizer_shadow` now solves over. An optimizer-sourced entry whose
+        # VWAP is missing gets `triggers.vwap = None`, which makes the VWAP
+        # entry trigger inert for exactly the names the optimizer chose. Same
+        # set as `price_histories` — see the loader above.
+        vwap_tickers = sorted(
+            {s["ticker"] for s in signals.get("enter", [])}
+            | set(predictions_by_ticker)
+        )
         if vwap_map is None:
             vwap_map = load_daily_vwap(vwap_tickers, signals_bucket, run_date) if vwap_tickers else {}
         # When vwap_map was injected, trust the caller's resolution —
@@ -1703,8 +1712,33 @@ def run(
         # precomputes once per simulate pipeline, skipping millions of
         # per-call universe.read(ticker) round-trips. Live trading passes
         # atr_map=None and takes the load_atr_14_pct path unchanged.
+        # config-I7337 (second instance) — the load-bearing one of the two.
+        #
+        # `signals["enter"]` is the CHAMPION's synthesized cohort. The optimizer
+        # now enters names from the PREDICTOR's cut, which is a different set:
+        # measured 2026-08-14, the champion's 10 (AVAV AXON DELL DOCS ELF ENTG
+        # IT KTOS ONTO TER) and the 8 the optimizer chose (ANF CPRT FCN FFIV
+        # KEX LULU OLLI TREX) were DISJOINT.
+        #
+        # Consequence of a missing ATR, both measured in code, both silent:
+        #   * `optimizer_cutover._build_entry_record` reads `atr_map.get(t, 0.0)`
+        #     -> `atr_value: 0.0` -> `daemon.py`'s
+        #     `use_bracket = atr_value and atr_value > 0` is falsy, so NO
+        #     BRACKET STOP is placed and the position trades unprotected until
+        #     the next morning's planner writes one.
+        #   * `pullback_pct` is written as 0.0 rather than omitted, and
+        #     `entry_triggers.py` reads it with
+        #     `triggers.get("pullback_pct", <configured default>)` — a key that
+        #     is PRESENT AND ZERO beats the default, so `pullback >= 0.0` is
+        #     always true and the entry fires on the first tick as a market
+        #     buy with no pullback discipline.
+        #
+        # Same set as `price_histories` and `vwap_tickers`: held ∪ enter ∪
+        # predictions. This is the sibling of the loader config-I7337 fixed —
+        # a fix has to survive the class, not the instance.
         atr_tickers = [s["ticker"] for s in signals.get("enter", [])]
         atr_tickers += list(current_positions.keys())
+        atr_tickers += list(predictions_by_ticker)
         atr_tickers = sorted(set(atr_tickers) - _MACRO_SYMBOLS)
         if atr_map is None:
             if atr_tickers:
