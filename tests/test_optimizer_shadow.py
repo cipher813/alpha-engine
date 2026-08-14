@@ -650,9 +650,10 @@ def test_dropped_candidates_are_named_with_a_typed_reason():
     )
 
     assert "AAPL" not in tickers
-    rec = next(d for d in dropped if d["ticker"] == "AAPL")
-    assert rec["reason"] == "history_too_short"
-    assert rec["source"] in {"prediction", "position", "signals_universe"}
+    grp = next(g for g in dropped if "AAPL" in g["tickers"])
+    assert grp["reason"] == "history_too_short"
+    assert grp["source"] in {"prediction", "position", "signals_universe"}
+    assert grp["count"] == len(grp["tickers"])
 
 
 def test_a_predicted_ticker_never_requested_raises_rather_than_vanishing():
@@ -694,9 +695,9 @@ def test_a_predicted_ticker_the_cache_lacked_is_recorded_not_raised():
     )
 
     assert "NVDA" not in tickers
-    rec = next(d for d in dropped if d["ticker"] == "NVDA")
-    assert rec["reason"] == "history_absent_in_cache"
-    assert rec["source"] == "prediction"
+    grp = next(g for g in dropped if "NVDA" in g["tickers"])
+    assert grp["reason"] == "history_absent_in_cache"
+    assert grp["source"] == "prediction"
 
 
 def test_unknown_requested_set_degrades_rather_than_raising():
@@ -717,7 +718,7 @@ def test_unknown_requested_set_degrades_rather_than_raising():
     )
 
     assert "NVDA" not in tickers
-    assert next(d for d in dropped if d["ticker"] == "NVDA")["reason"] == (
+    assert next(g for g in dropped if "NVDA" in g["tickers"])["reason"] == (
         "history_absent_in_cache"
     )
 
@@ -736,3 +737,28 @@ def test_dropped_candidates_is_emitted_on_the_clean_path_too():
     )
 
     assert dropped == []
+
+
+def test_dropped_candidates_groups_repetition_but_keeps_every_member():
+    """A count without its members is the defect config-I7324 exists for, so the
+    grouping must carry the full ticker list — it removes repetition of the two
+    constant fields, never a name."""
+    inputs = _baseline_inputs()
+    inputs["signals_raw"]["universe"] = [
+        {"ticker": t, "signal": "HOLD"} for t in ("ZZA", "ZZB", "ZZC")
+    ]
+    dropped: list[dict] = []
+
+    _build_universe(
+        inputs["signals_raw"], inputs["predictions_by_ticker"],
+        inputs["current_positions"], inputs["price_histories"],
+        price_histories_requested=set(inputs["price_histories"]),
+        dropped_out=dropped,
+    )
+
+    grp = next(g for g in dropped if g["source"] == "signals_universe")
+    assert grp["reason"] == "no_history_loaded"
+    assert sorted(grp["tickers"]) == ["ZZA", "ZZB", "ZZC"]
+    assert grp["count"] == 3
+    # One record for three names, not three records.
+    assert len([g for g in dropped if g["source"] == "signals_universe"]) == 1
