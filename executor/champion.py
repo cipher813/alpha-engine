@@ -51,6 +51,13 @@ import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
 
+from executor.alpha_contract import (
+    ANCHOR_FIELD,
+    ANCHOR_SOURCE_FIELD,
+    OPTIMIZER_ALPHA_ANCHOR,
+    center_to_market_relative,
+)
+
 logger = logging.getLogger(__name__)
 
 CHAMPION_POINTER_KEY = "config/producer_champion.json"
@@ -587,6 +594,30 @@ def _apply_scanner_predictor_direct(
     n = n_buy_candidates if n_buy_candidates > 0 else int(config.get("champion_top_n_default", 10))
 
     cohort_sorted = cohort.sort_values("predicted_alpha", ascending=False).reset_index(drop=True)
+
+    # ── One alpha scale per solve (alpha-engine-config-I7337, layer 3) ──────
+    # The parquet carries the RAW MetaModel.predict_single output
+    # (crucible-backtester/analysis/scanner_predictor_research_free_backfill.py
+    # `alpha = float(mm.predict_single(feats))`), which is never
+    # level-neutralized and so still carries the meta-L2's common-mode macro
+    # level. Measured 2026-08-14 on the 2026-08-13 cohort: n=72, mean -0.2882,
+    # range -0.3184..-0.2094, ZERO positive. The predictor's own
+    # `predicted_alpha` IS level-neutralized (mean 4.3e-07, range
+    # -0.0400..+0.0948), and `optimizer_shadow._build_alpha_hat` sums both into
+    # one vector solved against a SPY=0.0 anchor — so every injected name sat
+    # ~29 points of 21d log alpha below SPY as a pure artifact of anchoring and
+    # could never win a solve. Center over the FULL cohort (the same
+    # cross-section a producer-side transform would use) before injecting.
+    #
+    # Centering is a constant shift, so `cohort_sorted`'s ORDER and therefore
+    # the selected candidate set are byte-identical. This is a units fix, not
+    # an arm swap: `policy-champion-challenger` promotion/retirement is
+    # untouched. Deliberately NOT rescaled to the predictor's dispersion —
+    # this arm's spread is genuinely narrower (std 0.0177) because it zeroes
+    # four research meta-features, and widening it would fabricate conviction.
+    centered, xsec_mean_removed = center_to_market_relative(cohort_sorted["predicted_alpha"].tolist())
+    cohort_sorted["predicted_alpha_market_relative"] = centered
+
     top_n = cohort_sorted.head(n)
 
     score_floor = float(config.get("champion_score_floor", 60))
@@ -598,7 +629,8 @@ def _apply_scanner_predictor_direct(
     injected_predictions: dict[str, dict] = {}
     for rank, row in top_n.iterrows():
         ticker = row["ticker"]
-        predicted_alpha = float(row["predicted_alpha"])
+        predicted_alpha_raw = float(row["predicted_alpha"])
+        predicted_alpha = float(row["predicted_alpha_market_relative"])
         # rank_fraction: 0.0 for the best name (rank 0), approaching 1.0 for
         # the worst — computed against the FULL cohort size so the score
         # band reflects the name's standing in the whole scored universe,
@@ -624,6 +656,15 @@ def _apply_scanner_predictor_direct(
 
         injected_predictions[ticker] = {
             "predicted_alpha": predicted_alpha,
+            # The optimizer's alpha input contract (I7337). Declared, not
+            # inferred: this adapter KNOWS it just centered the batch.
+            ANCHOR_FIELD: OPTIMIZER_ALPHA_ANCHOR,
+            ANCHOR_SOURCE_FIELD: "champion_xsec_centered",
+            # Forensics: what the parquet actually said, and by how much the
+            # cohort's common mode moved it. Without these the corrected
+            # value is unattributable to its source row.
+            "predicted_alpha_raw": predicted_alpha_raw,
+            "alpha_xsec_mean_removed": xsec_mean_removed,
             "predicted_direction": predicted_direction,
             # Deliberately neutral: the high-confidence-DOWN veto and the
             # hold-book alpha-dispersion gate must not fire off an
@@ -654,6 +695,13 @@ def _apply_scanner_predictor_direct(
         **staleness,
         "cohort_size": cohort_size,
         "n_selected": len(synthesized),
+        # alpha-engine-config-I7337: the common-mode level this adapter removed
+        # to put its alphas on the optimizer's anchor. Carried on the artifact
+        # and emitted on every run — a large or drifting value is the health
+        # signal for the producer-side defect this compensates for, and an
+        # ABSENT field would mean the correction never ran.
+        "alpha_anchor": OPTIMIZER_ALPHA_ANCHOR,
+        "alpha_xsec_mean_removed": xsec_mean_removed,
     }
 
     new_predictions_by_ticker = dict(predictions_by_ticker)
@@ -791,6 +839,20 @@ def _apply_thinktank_coverage(
             # Deliberately None, not a fabricated numeric alpha — see
             # docstring. Keeps this entry OUT of main._should_hold_book's
             # cross-sectional dispersion calc entirely.
+            #
+            # No `alpha_anchor` is stamped, and that is correct rather than an
+            # omission (alpha-engine-config-I7337): an anchor declares where a
+            # LEVEL was measured from, and this record asserts no level at all.
+            # `alpha_contract.assert_optimizer_anchor` skips records with no
+            # numeric alpha for exactly this reason. Stamping one would be a
+            # claim about a number that does not exist.
+            #
+            # Consequence worth naming: such a name lands at alpha_hat 0.0,
+            # identical to SPY, so it can tie but never beat the benchmark on
+            # the alpha term. That is an honest representation of a subjective
+            # 0-100 rating, not a defect of this contract — but it does mean
+            # the thinktank arm cannot win a solve on alpha alone. Tracked
+            # separately from this fix.
             "predicted_alpha": None,
             "predicted_direction": None,
             # Same neutral value as the scanner arm — keeps the

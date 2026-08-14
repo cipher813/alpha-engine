@@ -310,7 +310,10 @@ class TestScannerPredictorDirect:
             "buy_candidates": [{"ticker": "OLD1", "signal": "ENTER", "sector": "Technology"}],
             "universe": held,
         }
-        s3 = self._s3(n=1)
+        # n=2, not 1: a single-name cohort has no definable market level, so
+        # the arm now refuses it outright (alpha-engine-config-I7337). See
+        # test_a_single_name_cohort_is_refused for that behaviour on purpose.
+        s3 = self._s3(n=2)
 
         out_signals, _ = apply_champion_selection(
             signals_raw,
@@ -477,7 +480,7 @@ class TestScannerPredictorDirect:
 
     def test_stamps_champion_and_promotion_source_on_signals_raw(self):
         signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
-        s3 = self._s3(n=1)
+        s3 = self._s3(n=2)  # see I7337 note above — n=1 has no market level
 
         out_signals, _ = apply_champion_selection(
             signals_raw,
@@ -561,7 +564,10 @@ class TestThinktankCoverage:
             "buy_candidates": [{"ticker": "OLD1", "signal": "ENTER", "sector": "Technology"}],
             "universe": held,
         }
-        s3 = self._s3(n=1)
+        # n=2, not 1: a single-name cohort has no definable market level, so
+        # the arm now refuses it outright (alpha-engine-config-I7337). See
+        # test_a_single_name_cohort_is_refused for that behaviour on purpose.
+        s3 = self._s3(n=2)
 
         out_signals, _ = apply_champion_selection(
             signals_raw,
@@ -792,7 +798,7 @@ class TestThinktankCoverage:
 
     def test_stamps_champion_and_promotion_source_on_signals_raw(self):
         signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
-        s3 = self._s3(n=1)
+        s3 = self._s3(n=2)  # see I7337 note above — n=1 has no market level
 
         out_signals, _ = apply_champion_selection(
             signals_raw,
@@ -1037,7 +1043,8 @@ class TestReadSignalsChampionRegression:
         s3 = _FakeS3(
             {
                 CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
-                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-04-24", n=1)),
+                # n=2 — a single-name cohort is refused (I7337).
+                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-04-24", n=2)),
             }
         )
         monkeypatch.setattr("boto3.client", lambda *a, **kw: s3)

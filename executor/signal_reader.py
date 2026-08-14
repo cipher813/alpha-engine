@@ -13,6 +13,13 @@ from botocore.exceptions import BotoCoreError, ClientError
 from nousergon_lib.eval_artifacts import load_latest_eval_artifact
 from nousergon_lib.universe import filter_to_universe
 
+from executor.alpha_contract import (
+    ANCHOR_FIELD,
+    ANCHOR_SOURCE_FIELD,
+    OPTIMIZER_ALPHA_ANCHOR,
+    RAW_ALPHA_ANCHOR,
+)
+
 logger = logging.getLogger(__name__)
 
 REGIME_SUBSTRATE_PREFIX = "regime"
@@ -35,7 +42,9 @@ def read_regime_substrate(s3_bucket: str) -> dict | None:
     """
     s3 = boto3.client("s3")
     return load_latest_eval_artifact(
-        s3, bucket=s3_bucket, prefix=REGIME_SUBSTRATE_PREFIX,
+        s3,
+        bucket=s3_bucket,
+        prefix=REGIME_SUBSTRATE_PREFIX,
     )
 
 
@@ -75,7 +84,9 @@ def read_fast_signal(s3_bucket: str) -> dict | None:
     """
     s3 = boto3.client("s3")
     return load_latest_eval_artifact(
-        s3, bucket=s3_bucket, prefix=REGIME_FAST_SIGNAL_PREFIX,
+        s3,
+        bucket=s3_bucket,
+        prefix=REGIME_FAST_SIGNAL_PREFIX,
     )
 
 
@@ -111,7 +122,9 @@ def read_drawdown_substrate(s3_bucket: str) -> dict | None:
     """
     s3 = boto3.client("s3")
     return load_latest_eval_artifact(
-        s3, bucket=s3_bucket, prefix=REGIME_DRAWDOWN_PREFIX,
+        s3,
+        bucket=s3_bucket,
+        prefix=REGIME_DRAWDOWN_PREFIX,
     )
 
 
@@ -168,6 +181,49 @@ def extract_drawdown_protective_severity(payload: dict | None) -> int:
     return 0
 
 
+def _stamp_alpha_anchor(result: dict[str, dict], data: dict) -> str:
+    """Stamp each prediction record with the anchor its own artifact declares
+    (alpha-engine-config-I7337).
+
+    The predictor emits a ``level_neutralization`` block
+    (``crucible-predictor/inference/stages/write_output.py``) recording whether
+    the cross-sectional common mode was actually subtracted this batch. That
+    block — not the field name, not the sign of the numbers — is the fact this
+    reads. ``applied: true`` means ``predicted_alpha`` is market-relative and
+    comparable to the optimizer's SPY=0.0 anchor.
+
+    A batch whose neutralization did NOT apply is stamped
+    ``RAW_ALPHA_ANCHOR`` and will be REJECTED by
+    ``alpha_contract.assert_optimizer_anchor``. That is deliberate and it is
+    not re-centered here: ``crucible-predictor``'s own
+    ``level_neutralization`` module declares centering to be a producer-side
+    single source of truth with "no per-consumer re-derivation", and a
+    consumer quietly re-deriving it is exactly the second implementation that
+    rule exists to prevent. A halt is loud; a silently re-centered book is not.
+
+    The block is absent on predictions written before it shipped (2026-06-01).
+    Absent is NOT assumed to mean neutralized — it means unknown, which is
+    stamped raw for the same reason.
+    """
+    block = data.get("level_neutralization") or {}
+    applied = bool(block.get("applied"))
+    anchor = OPTIMIZER_ALPHA_ANCHOR if applied else RAW_ALPHA_ANCHOR
+    for p in result.values():
+        p[ANCHOR_FIELD] = anchor
+        p[ANCHOR_SOURCE_FIELD] = "predictor_level_neutralization"
+    if not applied:
+        logger.warning(
+            "Predictor level-neutralization NOT applied (block=%r) — predicted_"
+            "alpha still carries the cross-sectional common mode and is stamped "
+            "%s. The portfolio optimizer will REFUSE this batch rather than "
+            "flush the book to zero weights against a SPY=0.0 anchor "
+            "(alpha-engine-config-I7337).",
+            block or None,
+            RAW_ALPHA_ANCHOR,
+        )
+    return anchor
+
+
 def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:
     """
     Read predictor/predictions/latest.json from S3.
@@ -196,8 +252,12 @@ def read_predictions(s3_bucket: str) -> tuple[dict[str, dict], str | None]:
         preds = data.get("predictions", [])
         result = {p["ticker"]: p for p in preds if "ticker" in p}
         predictions_date = data.get("date")
+        anchor = _stamp_alpha_anchor(result, data)
         logger.info(
-            "Predictions loaded | n=%d | date=%s", len(result), predictions_date,
+            "Predictions loaded | n=%d | date=%s | alpha_anchor=%s",
+            len(result),
+            predictions_date,
+            anchor,
         )
         return result, predictions_date
     except ClientError as e:
@@ -230,7 +290,8 @@ def read_distribution_gate(s3_bucket: str) -> dict | None:
 
 
 def read_universe_tradeability(
-    s3_bucket: str, run_date: str | None = None,
+    s3_bucket: str,
+    run_date: str | None = None,
 ) -> dict[str, dict]:
     """Read the per-name tradeability block from the scanner universe artifact.
 
@@ -276,7 +337,8 @@ def read_universe_tradeability(
             logger.info(
                 "No scanner universe artifact at s3://%s/%s — optimizer will "
                 "run without per-name ADV (flat-L1 tcost fallback).",
-                s3_bucket, key,
+                s3_bucket,
+                key,
             )
             return {}
         logger.warning("Failed reading universe tradeability (%s) — ADV absent", e)
@@ -289,13 +351,14 @@ def read_universe_tradeability(
         # fallback instead of crashing the shadow optimizer. [[feedback_no_silent_fails]]
         # recording surface = this WARN log.
         logger.warning(
-            "boto core error reading universe tradeability s3://%s/%s (%s) — "
-            "ADV absent, flat-L1 tcost fallback.", s3_bucket, key, e,
+            "boto core error reading universe tradeability s3://%s/%s (%s) — ADV absent, flat-L1 tcost fallback.",
+            s3_bucket,
+            key,
+            e,
         )
         return {}
     except (ValueError, json.JSONDecodeError) as e:
-        logger.warning("Malformed universe artifact s3://%s/%s (%s) — ADV absent",
-                       s3_bucket, key, e)
+        logger.warning("Malformed universe artifact s3://%s/%s (%s) — ADV absent", s3_bucket, key, e)
         return {}
 
     stocks = data.get("stocks") or []
@@ -309,7 +372,8 @@ def read_universe_tradeability(
             out[ticker] = block
     logger.info(
         "Universe tradeability loaded | n_names=%d | schema_version=%s",
-        len(out), data.get("schema_version"),
+        len(out),
+        data.get("schema_version"),
     )
     return out
 
@@ -480,6 +544,7 @@ def filter_buy_candidates_to_universe(
         # Local import — avoids top-level circular (price_cache imports
         # executor.market_hours which touches signal_reader indirectly).
         from executor.price_cache import _open_universe_library
+
         universe_lib = _open_universe_library(signals_bucket)
         universe_symbols = frozenset(universe_lib.list_symbols())
     except Exception as exc:  # noqa: BLE001 — see docstring
@@ -497,8 +562,7 @@ def filter_buy_candidates_to_universe(
     # see lib v0.13.0 docstring).
     allowed, dropped_entries = filter_to_universe(buy, universe_symbols)
     dropped_tickers = [
-        entry["ticker"] for entry in dropped_entries
-        if isinstance(entry, dict) and isinstance(entry.get("ticker"), str)
+        entry["ticker"] for entry in dropped_entries if isinstance(entry, dict) and isinstance(entry.get("ticker"), str)
     ]
 
     if dropped_tickers:
@@ -567,7 +631,8 @@ def filter_buy_candidates_by_coverage(
             "remaining candidate(s) will be sized normally (position sizer "
             "will derate any partial-coverage tickers via "
             "``coverage_sizing_enabled``).",
-            len(refused), min_coverage,
+            len(refused),
+            min_coverage,
             [(t, round(c, 3)) for t, c in refused],
             len(allowed),
         )
@@ -588,14 +653,17 @@ def _emit_admission_refused_metric(count: int) -> None:
     """
     try:
         import boto3
+
         cw = boto3.client("cloudwatch")
         cw.put_metric_data(
             Namespace="AlphaEngine/Executor",
-            MetricData=[{
-                "MetricName": "admission_refused_count",
-                "Value": float(count),
-                "Unit": "Count",
-            }],
+            MetricData=[
+                {
+                    "MetricName": "admission_refused_count",
+                    "Value": float(count),
+                    "Unit": "Count",
+                }
+            ],
         )
     except Exception as exc:
         logger.warning(
@@ -615,6 +683,7 @@ class UnscoredBuyCandidatesError(RuntimeError):
     read-time defense-in-depth backstop: if the gap reaches the executor, we
     refuse to trade rather than bypass the veto.
     """
+
     def __init__(self, missing: list[str], n_buy: int, n_preds: int):
         self.missing = missing
         self.n_buy = n_buy
@@ -639,11 +708,13 @@ def _emit_unscored_count_metric(count: int) -> None:
         cw = boto3.client("cloudwatch")
         cw.put_metric_data(
             Namespace="AlphaEngine/Predictor",
-            MetricData=[{
-                "MetricName": "unscored_buy_candidates_count",
-                "Value": float(count),
-                "Unit": "Count",
-            }],
+            MetricData=[
+                {
+                    "MetricName": "unscored_buy_candidates_count",
+                    "Value": float(count),
+                    "Unit": "Count",
+                }
+            ],
         )
     except Exception as exc:  # noqa: BLE001 — observability, must never block trading path
         logger.warning("CloudWatch metric emission failed: %s", exc)
@@ -659,13 +730,8 @@ def assert_predictions_cover_buy_candidates(
     with value 0) so alarm baselines are continuous.
     """
     buy = signals.get("buy_candidates") or []
-    buy_tickers = {
-        (e.get("ticker") or "").upper()
-        for e in buy if isinstance(e, dict) and e.get("ticker")
-    }
-    pred_tickers = {
-        (t or "").upper() for t in (predictions_by_ticker or {}).keys()
-    }
+    buy_tickers = {(e.get("ticker") or "").upper() for e in buy if isinstance(e, dict) and e.get("ticker")}
+    pred_tickers = {(t or "").upper() for t in (predictions_by_ticker or {}).keys()}
     missing = sorted(buy_tickers - pred_tickers)
     _emit_unscored_count_metric(len(missing))
     if missing:
@@ -707,6 +773,7 @@ def patch_unknown_sectors_with_constituents(signals_raw: dict, s3_bucket: str) -
         return 0
 
     from executor.eod_reconcile import _load_constituents_sector_map
+
     constituents_map = _load_constituents_sector_map(s3_bucket)
     if not constituents_map:
         return 0
@@ -755,10 +822,10 @@ def get_actionable_signals(signals: dict) -> dict:
             all_stocks.append(s)
 
     return {
-        "enter":  [s for s in all_stocks if s.get("signal") == "ENTER"],
-        "exit":   [s for s in all_stocks if s.get("signal") == "EXIT"],
+        "enter": [s for s in all_stocks if s.get("signal") == "ENTER"],
+        "exit": [s for s in all_stocks if s.get("signal") == "EXIT"],
         "reduce": [s for s in all_stocks if s.get("signal") == "REDUCE"],
-        "hold":   [s for s in all_stocks if s.get("signal") == "HOLD"],
+        "hold": [s for s in all_stocks if s.get("signal") == "HOLD"],
         "market_regime": signals.get("market_regime", "neutral"),
         "sector_ratings": signals.get("sector_ratings", {}),
     }
