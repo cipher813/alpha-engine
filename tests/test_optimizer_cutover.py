@@ -552,3 +552,53 @@ def test_exit_record_surfaces_predicted_alpha_std():
     assert len(exits) == 1
     x = exits[0]
     assert x["predicted_alpha_std"] == 0.030
+
+
+# ── config-I7337 second instance: a missing ATR must not mean "enter now,
+# unstopped". `atr_map` was keyed on `signals["enter"]` — the CHAMPION's
+# cohort — while the optimizer enters names from the PREDICTOR's cut. Measured
+# 2026-08-14 those two sets were disjoint, so every optimizer entry would have
+# carried atr_value 0.0. Two silent consequences, both guarded here.
+
+
+def test_missing_atr_omits_pullback_pct_so_the_default_applies():
+    """`entry_triggers` reads `triggers.get("pullback_pct", <default>)`. A key
+    that is PRESENT AND ZERO beats the default and makes `pullback >= 0.0`
+    always true — the entry fires on the first tick with no discipline.
+    Omitting the key is strictly safer than writing 0.0."""
+    ob = OrderBook(data={"date": "2026-05-13"})
+    ibkr = _make_ibkr({"AAPL": 200.0})
+    log = {
+        "would_be_trades": [{
+            "ticker": "AAPL", "action": "BUY", "delta_dollars": 20_000.0,
+            "delta_weight": 0.02, "target_weight": 0.02, "current_weight": 0.0,
+        }],
+    }
+    entries, _ = apply_optimizer_targets_to_orderbook(
+        log=log, **_baseline_kwargs(ob, ibkr, atr_map={}),
+    )
+    assert len(entries) == 1
+    triggers = entries[0]["triggers"]
+    assert "pullback_pct" not in triggers
+    assert triggers["atr_missing"] is True
+    assert entries[0]["atr_value"] == 0.0
+
+
+def test_present_atr_still_writes_pullback_pct_and_flags_not_missing():
+    ob = OrderBook(data={"date": "2026-05-13"})
+    ibkr = _make_ibkr({"AAPL": 200.0})
+    log = {
+        "would_be_trades": [{
+            "ticker": "AAPL", "action": "BUY", "delta_dollars": 20_000.0,
+            "delta_weight": 0.02, "target_weight": 0.02, "current_weight": 0.0,
+        }],
+    }
+    entries, _ = apply_optimizer_targets_to_orderbook(
+        log=log, **_baseline_kwargs(ob, ibkr, atr_map={"AAPL": 0.02}),
+    )
+    triggers = entries[0]["triggers"]
+    assert triggers["atr_missing"] is False
+    # 0.02 ATR x 1.5 multiple from the baseline strategy_config
+    assert triggers["pullback_pct"] == pytest.approx(0.03)
+    # Non-zero atr_value is what lets daemon.py place a bracket stop.
+    assert entries[0]["atr_value"] > 0
