@@ -48,6 +48,11 @@ _CASH = "CASH"
 _BENCH_SECTOR = "__benchmark__"
 _CASH_SECTOR = "__cash__"
 _CASH_ALPHA_HINT = -1e-6
+# Below this |Δweight| the optimizer asked for no trade at all (a sub-dollar
+# move on any realistic book — solver noise, not an intention). Used only to
+# keep `band_dropped_trades` to trades the band actually REMOVED, rather than
+# to the whole universe sitting at zero on both sides.
+_DUST_DELTA = 1e-6
 _RETURNS_LOOKBACK_DAYS = 252
 _MIN_RETURNS_FOR_COV = 60
 
@@ -336,25 +341,42 @@ def _build_and_solve(
         name_sigma=name_sigma,
     )
 
-    # Turnover-governor large-move flag: the optimizer requested a one-way
-    # rebalance above large_move_turnover_flag. It is ALREADY executed
-    # gradually under the max_daily_turnover cap (the primary guardrail);
-    # this alert surfaces the aggressive request for operator approval to
-    # accelerate. Alert-publish is best-effort secondary observability — the
-    # cap already protected the book, so a publish failure must never block
-    # the planner. See [[feedback_no_silent_fails]] (recording surface = the
-    # WARN log + the shadow-log governor fields below).
+    # Large-move flag: the book is moving hard today. Two reasons now raise
+    # it, and the message says WHICH (alpha-engine-config-I7346):
+    #   * executed_turnover_above_flag — executed one-way turnover exceeds
+    #     large_move_turnover_flag outright (only reachable when the daily
+    #     budget is off or set above the flag).
+    #   * turnover_budget_binding — the daily turnover budget bound the solve,
+    #     i.e. the optimizer wanted to move MORE than it was allowed to. This
+    #     is the successor to the old "requested >> executed" gap: with the
+    #     budget enforced inside the convex program there is no longer a
+    #     pre-cap request to compare against, and without this branch the
+    #     detector would have gone permanently silent.
+    # Alert-publish is best-effort secondary observability — the budget already
+    # protected the book, so a publish failure must never block the planner.
+    # See [[feedback_no_silent_fails]] (recording surface = the WARN log + the
+    # shadow-log turnover fields below).
     if result.diagnostics.get("large_move_flagged"):
         _req = result.diagnostics.get("requested_turnover_one_way", 0.0)
         _cap = optimizer_cfg.get("max_daily_turnover")
         _flag = optimizer_cfg.get("large_move_turnover_flag")
+        _reason = result.diagnostics.get("large_move_reason")
+        _shadow = result.diagnostics.get("turnover_constraint_shadow_price")
+        if _reason == "turnover_budget_binding":
+            _detail = (
+                f"the {(_cap or 0):.0%}/day turnover budget BOUND the solve "
+                f"(executed {_req:.1%}, shadow price "
+                f"{'n/a' if _shadow is None else format(_shadow, '.4f')}) — the "
+                f"optimizer wanted to move further and the budget stopped it. "
+                f"Every name it did trade is sized where it wants it; the "
+                f"remainder is deferred to subsequent daily re-solves."
+            )
+        else:
+            _detail = f"executed one-way turnover {_req:.1%} exceeds the {(_flag or 0):.0%} large-move flag."
         logger.warning(
-            "Optimizer large-move flag: requested one-way turnover %.1f%% "
-            "> flag %.0f%% — executing gradually under the %.0f%%/day cap "
-            "(run_date=%s)",
-            _req * 100,
-            (_flag or 0) * 100,
-            (_cap or 0) * 100,
+            "Optimizer large-move flag (%s): %s (run_date=%s)",
+            _reason,
+            _detail,
             run_date,
         )
         try:
@@ -362,11 +384,9 @@ def _build_and_solve(
 
             publish_ops_alert(
                 message=(
-                    f"[executor] Optimizer requested a large rebalance: "
-                    f"one-way turnover {_req:.1%} exceeds the {_flag:.0%} flag "
-                    f"(run_date={run_date}). The book is being moved GRADUALLY "
-                    f"under the {_cap:.0%}/day cap — no single-day jump. Review "
-                    f"and approve acceleration if the reallocation is intended."
+                    f"[executor] Optimizer large rebalance ({_reason}): "
+                    f"{_detail} (run_date={run_date}) Review and approve "
+                    f"acceleration if the reallocation is intended."
                 ),
                 severity="WARN",
                 source="alpha-engine/executor/optimizer_shadow.py",
@@ -378,13 +398,24 @@ def _build_and_solve(
                 _alert_err,
             )
 
-    would_be_trades = _compute_trade_deltas(
+    would_be_trades, band_dropped_trades = _compute_trade_deltas(
         tickers,
         result.weights,
         w_prev,
         portfolio_nav,
         optimizer_cfg,
     )
+    _dropped_entries = [t for t in band_dropped_trades if t["is_new_position"]]
+    if _dropped_entries:
+        logger.warning(
+            "rebalance band removed %d intended NEW position(s) (band=%.4f): "
+            "%s — an entry sized under the band is not drift; check the "
+            "turnover budget and min_position_pct (run_date=%s)",
+            len(_dropped_entries),
+            float(optimizer_cfg.get("rebalance_band_pct", 0.005)),
+            "; ".join(f"{t['ticker']}({t['delta']:+.5f})" for t in _dropped_entries),
+            run_date,
+        )
 
     # B.4 ablation: when the α̂-uncertainty penalty is configured ON, solve
     # a second time with γ=0 so the shadow log carries both perspectives
@@ -438,6 +469,10 @@ def _build_and_solve(
         "adv_usd": [None if not np.isfinite(x) else float(x) for x in adv_usd],
         "adv_coverage": adv_coverage,
         "would_be_trades": would_be_trades,
+        # Trades the anti-churn rebalance band removed, with enough to tell an
+        # intended entry apart from genuine drift (`is_new_position`). Emitted
+        # every run including empty (alpha-engine-config-I7346).
+        "band_dropped_trades": band_dropped_trades,
         "diagnostics": result.diagnostics,
         "legacy_orders": [_redact_order(o) for o in legacy_orders],
         "optimizer_cfg": optimizer_cfg,
@@ -1039,14 +1074,55 @@ def _compute_trade_deltas(
     current_weights: np.ndarray,
     portfolio_nav: float,
     optimizer_cfg: dict,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
+    """Return ``(would_be_trades, band_dropped_trades)``.
+
+    The anti-churn rebalance band suppresses per-name DRIFT — a position that
+    has wandered a few basis points from its target is not worth a commission.
+    It cannot, on its own, tell drift apart from an intended NEW position that
+    something upstream shrank into the band, and until this returned its
+    second list, nothing named what it removed: the solve reported ``optimal``,
+    ``entries_blocked`` stayed empty, and a deleted entry cohort rendered
+    identically to a quiet hold day (alpha-engine-config-I7346).
+
+    ``band_dropped_trades`` is written to the shadow artifact on EVERY run,
+    including empty — the same could-not-measure-vs-found-nothing rule the
+    ``dropped_candidates`` field was given in config-I7337. A field that only
+    appears on the bad path is indistinguishable from a dead emitter.
+
+    ``is_new_position`` is the field that makes the record actionable: a
+    dropped trade whose ``current_weight`` is zero is an ENTRY the band
+    deleted, which is categorically different from trimming drift on a name
+    already held.
+    """
     band = float(optimizer_cfg.get("rebalance_band_pct", 0.005))
     trades: list[dict] = []
+    band_dropped: list[dict] = []
     for i, t in enumerate(tickers):
         if t == _CASH:
             continue
         delta_pct = float(target_weights[i] - current_weights[i])
+        target_w = float(target_weights[i])
+        current_w = float(current_weights[i])
         if abs(delta_pct) < band:
+            # Only an intended trade can be "removed by the band". A name the
+            # optimizer left exactly where it was — most of the universe, at
+            # weight 0 on both sides, plus any name already at its target —
+            # asked for no trade at all, and recording those would bury the
+            # real drops. _DUST_DELTA is a sub-dollar move on any realistic
+            # book, i.e. solver noise rather than an intention.
+            if abs(delta_pct) < _DUST_DELTA:
+                continue
+            band_dropped.append(
+                {
+                    "ticker": t,
+                    "target_weight": round(target_w, 6),
+                    "current_weight": round(current_w, 6),
+                    "delta": round(delta_pct, 6),
+                    "band": band,
+                    "is_new_position": bool(current_w == 0.0 and target_w > 0.0),
+                }
+            )
             continue
         delta_dollars = delta_pct * float(portfolio_nav)
         trades.append(
@@ -1055,11 +1131,11 @@ def _compute_trade_deltas(
                 "action": "BUY" if delta_pct > 0 else "SELL",
                 "delta_weight": round(delta_pct, 6),
                 "delta_dollars": round(delta_dollars, 2),
-                "target_weight": round(float(target_weights[i]), 6),
-                "current_weight": round(float(current_weights[i]), 6),
+                "target_weight": round(target_w, 6),
+                "current_weight": round(current_w, 6),
             }
         )
-    return trades
+    return trades, band_dropped
 
 
 def _redact_order(order: dict) -> dict:

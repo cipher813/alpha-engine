@@ -264,6 +264,24 @@ def solve_target_weights(
         spy_idx, cash_idx, cfg,
     )
 
+    # ── daily turnover budget, as a CONSTRAINT (alpha-engine-config-I7346) ──
+    # ‖w − w_prev‖₁ / 2 ≤ max_daily_turnover. cvxpy expresses the L1 norm
+    # directly and the problem stays DCP (a norm is convex, so a ≤ bound is a
+    # convex set). The optimizer therefore CHOOSES which trades fit the budget
+    # and each surviving name lands at a size it actually wants.
+    #
+    # This replaces a post-solve uniform shrink
+    # (w_exec = w_prev + (w_target − w_prev)·cap/requested), which answered
+    # "how much may I trade" by trading a bit less of EVERYTHING — including
+    # names whose entire delta IS an intended new position. Downstream,
+    # optimizer_shadow's rebalance band drops any |Δw| < rebalance_band_pct,
+    # so a hard enough shrink could push an entire entry cohort under the band
+    # and delete it while the solve still reported `optimal`. A budget spent
+    # by the objective cannot do that: nothing is scaled after the fact.
+    turnover_meta = _apply_turnover_constraint(
+        cp, w, w_prev, constraints, effective_caps, cash_idx, cfg,
+    )
+
     problem = cp.Problem(objective, constraints)
     weights, status = _solve_with_fallback(problem, w, cfg)
 
@@ -275,10 +293,17 @@ def solve_target_weights(
         )
         diagnostics.update(tcost.diagnostics)
         diagnostics.update(adv_cap_meta)
+        diagnostics.update(_turnover_diagnostics(weights, w_prev, turnover_meta))
         return OptimizerResult(weights=weights, diagnostics=diagnostics)
 
-    weights = _clip_and_renormalize(weights, effective_caps, cash_idx, cfg)
-    weights, governor = _apply_turnover_governor(weights, w_prev, cfg)
+    weights, clip_mass_zeroed = _clip_and_renormalize(
+        weights, effective_caps, cash_idx, cfg
+    )
+    weights, governor = _apply_turnover_governor(
+        weights, w_prev, cfg,
+        turnover_meta=turnover_meta,
+        clip_mass_zeroed=clip_mass_zeroed,
+    )
     diagnostics = _build_diagnostics(
         weights, w_prev, sigma, alpha_hat, spy_idx, status, cfg,
         omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
@@ -832,66 +857,269 @@ def _clip_and_renormalize(
     effective_caps: np.ndarray,
     cash_idx: int,
     cfg: dict,
-) -> np.ndarray:
+) -> tuple[np.ndarray, float]:
+    """Clip to the box, drop sub-``min_position_pct`` dust, renormalize.
+
+    Returns ``(weights, mass_zeroed)``. ``mass_zeroed`` is the total weight
+    removed by the dust rule and is NOT bookkeeping trivia: it is the exact
+    budget by which this post-solve step may legitimately push the vector past
+    the solver's turnover constraint (zeroing mass m adds ≤ m of one-way
+    turnover from the drop itself, and ≤ m more from renormalizing the
+    survivors up by 1/(1−m)). ``_apply_turnover_governor`` uses it as the
+    assertion tolerance, so the tolerance is DERIVED from what actually
+    happened rather than being a hand-picked epsilon that silently absorbs a
+    real breach.
+    """
     weights = np.maximum(weights, 0.0)
     weights = np.minimum(weights, effective_caps + 1e-8)
     small = (weights < cfg["min_position_pct"]) & (np.arange(len(weights)) != cash_idx)
+    mass_zeroed = float(np.sum(weights[small]))
     weights = np.where(small, 0.0, weights)
     total = weights.sum()
     if total > 0:
         weights = weights / total
-    return weights
+    return weights, mass_zeroed
+
+
+def _mandatory_turnover_floor(
+    w_prev: np.ndarray,
+    effective_caps: np.ndarray,
+    cash_idx: int,
+    cfg: dict,
+) -> float:
+    """One-way turnover that the OTHER constraints force, regardless of alpha.
+
+    Adding ``‖w − w_prev‖₁/2 ≤ cap`` can only be safe if the feasible set is
+    still non-empty. ``w_prev`` has turnover 0 and so always satisfies the
+    turnover constraint itself — but it does not necessarily satisfy the rest
+    of the program: a held name that went ineligible is pinned to 0, and the
+    cash sleeve is pinned to ``cash_sleeve_pct``. Those pins MANDATE movement.
+    If that mandated movement exceeds the budget, the program is infeasible
+    and the whole book falls to the hold path — a new failure mode, introduced
+    by the fix, on a day when a forced exit is exactly what must happen.
+
+    So the budget governs DISCRETIONARY trading only. This returns a bound on
+    the forced movement; the caller raises the constraint's right-hand side to
+    it when it is larger than the configured cap, which makes the feasible set
+    non-empty BY CONSTRUCTION rather than by assumption:
+
+      * ``d_i`` = distance from ``w_prev_i`` to its box ``[l_i, u_i]``. The
+        projection ``p`` of ``w_prev`` into the box costs ``Σ d_i`` of L1.
+      * ``p`` need not sum to 1; the residual ``r = 1 − Σp`` must be absorbed
+        by names with slack (SPY, the unconstrained benchmark fill, always
+        has some), costing a further ``|r|`` of L1.
+
+    ``(Σd + |r|) / 2`` is therefore an attainable one-way turnover for a point
+    satisfying the box, the sleeve pin and the budget identity. Sector and
+    participation caps can only be satisfied at that point or need more
+    movement; they are inequality caps on sums that the projection does not
+    tighten, so this is the operative bound in practice, and any residual
+    infeasibility still lands on the pre-existing ``_fallback_weights`` path
+    rather than anywhere new.
+    """
+    lower = np.zeros_like(w_prev)
+    upper = np.array(effective_caps, dtype=float)
+    sleeve = float(cfg["cash_sleeve_pct"])
+    lower[cash_idx] = sleeve
+    upper[cash_idx] = sleeve
+    projected = np.clip(w_prev, lower, upper)
+    forced_l1 = float(np.sum(np.abs(projected - w_prev)))
+    residual = abs(1.0 - float(projected.sum()))
+    return (forced_l1 + residual) / 2.0
+
+
+def _apply_turnover_constraint(
+    cp,
+    w,
+    w_prev: np.ndarray,
+    constraints: list,
+    effective_caps: np.ndarray,
+    cash_idx: int,
+    cfg: dict,
+) -> dict:
+    """Append the L1 daily-turnover budget to ``constraints``.
+
+    Returns metadata the diagnostics and the post-solve assertion both read:
+    the configured cap, the mandatory floor, and the EFFECTIVE right-hand side
+    actually imposed. ``max_daily_turnover=None`` disables the budget entirely
+    (legacy behaviour, bit-identical).
+    """
+    cap = cfg.get("max_daily_turnover")
+    meta: dict = {
+        "turnover_constraint_applied": False,
+        "turnover_constraint_cap": None,
+        "turnover_mandatory_floor": None,
+        "turnover_constraint": None,
+    }
+    if cap is None or cap <= 0:
+        return meta
+    floor = _mandatory_turnover_floor(w_prev, effective_caps, cash_idx, cfg)
+    # A small slack above the floor: the floor is a bound on an attainable
+    # point, and pinning the RHS exactly to it would leave a feasible set of
+    # measure ~zero that an interior-point solver reports as infeasible.
+    effective_cap = max(float(cap), floor * (1.0 + 1e-6) + 1e-9)
+    constraint = cp.norm(w - w_prev, 1) / 2 <= effective_cap
+    constraints.append(constraint)
+    meta.update({
+        "turnover_constraint_applied": True,
+        "turnover_constraint_cap": float(effective_cap),
+        "turnover_mandatory_floor": float(floor),
+        "turnover_constraint": constraint,
+    })
+    if effective_cap > float(cap) + 1e-9:
+        logger.warning(
+            "turnover budget RAISED from the configured %.4f to %.4f: the "
+            "eligibility mask and cash-sleeve pin mandate %.4f one-way "
+            "turnover on their own. The budget governs discretionary trading; "
+            "a forced exit is not discretionary and must not be starved of "
+            "budget.",
+            float(cap), effective_cap, floor,
+        )
+    return meta
+
+
+def _turnover_diagnostics(
+    weights: np.ndarray, w_prev: np.ndarray, turnover_meta: dict
+) -> dict:
+    """Turnover observability, emitted on EVERY solve including the fallback
+    and the budget-disabled path — a field that appears only on the
+    interesting path is indistinguishable from a dead emitter.
+
+    ``requested_turnover_one_way`` deliberately equals the EXECUTED one-way
+    turnover now. Under the old post-solve shrink the two differed, and the
+    gap was the only published evidence that the optimizer wanted to move
+    more than it was allowed to. That evidence has not been dropped, it has
+    moved to a better instrument: ``turnover_constraint_binding`` says the
+    budget bound the solve, and ``turnover_constraint_shadow_price`` is the
+    constraint's dual — the marginal objective value of one more unit of
+    turnover budget, i.e. exactly what the restraint cost.
+    """
+    executed = float(np.sum(np.abs(weights - w_prev)) / 2)
+    cap = turnover_meta.get("turnover_constraint_cap")
+    out: dict = {
+        "requested_turnover_one_way": executed,
+        "turnover_constraint_applied": bool(
+            turnover_meta.get("turnover_constraint_applied")
+        ),
+        "turnover_constraint_cap": cap,
+        "turnover_mandatory_floor": turnover_meta.get("turnover_mandatory_floor"),
+        "turnover_constraint_binding": False,
+        "turnover_constraint_shadow_price": None,
+    }
+    if cap is not None:
+        constraint = turnover_meta.get("turnover_constraint")
+        dual = getattr(constraint, "dual_value", None) if constraint is not None else None
+        if dual is not None:
+            try:
+                out["turnover_constraint_shadow_price"] = float(np.ravel(dual)[0])
+            except (TypeError, ValueError, IndexError):
+                out["turnover_constraint_shadow_price"] = None
+        # The DUAL is the primary binding test, not a comparison of the final
+        # turnover against the cap. `weights` here is post-clip-and-renormalize,
+        # so its turnover is a few bp off the solver's own — measured 2026-08-14
+        # on the live book: solver at the 0.2000 cap, post-clip 0.19978, which a
+        # numeric ">= cap − ε" test reads as NOT binding while the dual is
+        # 0.00926. A strictly positive dual is the definition of an active
+        # constraint; the numeric test is kept only as the fallback for solvers
+        # or statuses that return no dual.
+        shadow = out["turnover_constraint_shadow_price"]
+        if shadow is not None:
+            out["turnover_constraint_binding"] = bool(shadow > 1e-9)
+        else:
+            out["turnover_constraint_binding"] = bool(
+                executed >= float(cap) * (1.0 - 1e-3) - 1e-6
+            )
+    # ``turnover_capped`` keeps its consumer-facing meaning — "the daily
+    # turnover budget bound this solve" — which is now the binding test
+    # rather than "a post-hoc shrink was applied".
+    out["turnover_capped"] = out["turnover_constraint_binding"]
+    return out
+
+
+class TurnoverBudgetError(RuntimeError):
+    """The solved weight vector exceeds the daily turnover budget.
+
+    Raised, not silently corrected. Under the constraint construction
+    (alpha-engine-config-I7346) the budget is enforced INSIDE the convex
+    program, so a vector that violates it means the solver returned a point
+    that does not satisfy a constraint it was given, or the post-solve
+    clip/renormalize moved it further than that step can account for. Both
+    are bugs in this module, not market conditions.
+
+    RAISE rather than degrade, deliberately. ``run_shadow_optimizer`` catches
+    it, writes the ``shadow_status: "failed"`` sentinel, and
+    ``optimizer_cutover.is_log_usable`` then returns False, so the planner
+    falls back to an EMPTY order book: the book is HELD for the session. The
+    alternative — shrinking the vector back under the budget — is precisely
+    the mechanism this change removes, and it would restore the failure it
+    fixed while now also hiding a solver bug behind a plausible-looking
+    order book. Holding a book for one session is recoverable and loud;
+    trading a book the optimizer did not sanction is neither.
+    """
 
 
 def _apply_turnover_governor(
-    weights: np.ndarray, w_prev: np.ndarray, cfg: dict
+    weights: np.ndarray,
+    w_prev: np.ndarray,
+    cfg: dict,
+    *,
+    turnover_meta: dict | None = None,
+    clip_mass_zeroed: float = 0.0,
 ) -> tuple[np.ndarray, dict]:
-    """Cap one-way daily turnover by scaling the step ``w_prev → weights``.
+    """Post-solve ASSERTION that the daily turnover budget held.
 
-    Gradual-rebalance guardrail: institutional books walk to the target over
-    several days rather than jumping. When the optimizer's target implies a
-    one-way turnover above ``max_daily_turnover``, take a PARTIAL step toward
-    it — ``w_exec = w_prev + (w_target - w_prev) · (cap / requested)`` — which
-    bounds executed one-way turnover to the cap while preserving direction.
-    The scaled vector is a convex combination of two cap-feasible points
-    (``w_prev`` and the clipped ``weights``), so it stays within all linear
-    constraints (Σw=1, sector caps, per-name caps). The book converges to the
-    target over subsequent daily re-solves.
+    Historically this function ENFORCED the budget, by scaling the whole step
+    ``w_prev → weights`` uniformly by ``cap / requested``. That is no longer
+    its job: the budget is a constraint inside the convex program
+    (``_apply_turnover_constraint``), so the solver returns a vector that
+    already satisfies it. This function's role is inverted — it measures and
+    raises, and NEVER modifies ``weights``.
 
-    A REQUESTED (pre-cap) turnover above ``large_move_turnover_flag`` sets
-    ``large_move_flagged`` so the planner alerts for operator approval — the
-    move is never executed in one jump regardless, only surfaced.
+    The tolerance is derived, not chosen. ``_clip_and_renormalize`` runs
+    between the solve and this check and may legitimately add turnover by
+    dropping sub-``min_position_pct`` dust and renormalizing the survivors;
+    that step's whole footprint is bounded by ``2 · clip_mass_zeroed`` of L1,
+    i.e. ``clip_mass_zeroed`` of one-way turnover. Anything beyond that plus
+    solver numerical slack is unexplained, and unexplained is what this
+    raises on.
 
-    Returns ``(possibly-scaled weights, governor diagnostics)``. With
-    ``max_daily_turnover=None`` the step is returned unchanged (legacy).
+    ``max_daily_turnover=None`` disables the budget; the function then only
+    reports, exactly as before.
     """
+    meta = turnover_meta or {}
     requested = float(np.sum(np.abs(weights - w_prev)) / 2)
-    cap = cfg.get("max_daily_turnover")
     flag = cfg.get("large_move_turnover_flag")
-    gov: dict = {
-        "requested_turnover_one_way": requested,
-        "turnover_capped": False,
-        "large_move_flagged": bool(flag is not None and requested > flag),
-    }
-    if cap is not None and cap > 0 and requested > cap:
-        # The scaling (a convex combination of w_prev and the target) only
-        # preserves Σw=1 when w_prev is itself a normalized portfolio. In
-        # production w_prev = positions/NAV + cash sentinel and always sums to
-        # 1; if it doesn't, scaling would silently de-normalize the book, so
-        # leave the step ungoverned and surface the anomaly rather than corrupt
-        # the weights. See [[feedback_no_silent_fails]].
-        if abs(float(w_prev.sum()) - 1.0) > 1e-6:
-            logger.warning(
-                "turnover governor SKIPPED: w_prev sums to %.4f (≠ 1) — cannot "
-                "scale without de-normalizing; executing the full target step "
-                "(requested one-way turnover %.3f).",
-                float(w_prev.sum()), requested,
+    gov = _turnover_diagnostics(weights, w_prev, meta)
+    binding = bool(gov["turnover_constraint_binding"])
+    above_flag = bool(flag is not None and requested > flag)
+    gov["large_move_flagged"] = bool(above_flag or binding)
+    # Why it was flagged, so the operator alert can say the true thing. Under
+    # the constraint construction the executed turnover can no longer exceed
+    # the flag on a capped day, so a flag driven ONLY by the raw comparison
+    # would go permanently silent — a detector killed by a fix is a worse
+    # outcome than the fix is good. `binding` is the honest successor signal:
+    # the optimizer wanted to move more than the budget allowed.
+    if above_flag:
+        gov["large_move_reason"] = "executed_turnover_above_flag"
+    elif binding:
+        gov["large_move_reason"] = "turnover_budget_binding"
+    else:
+        gov["large_move_reason"] = None
+
+    cap = meta.get("turnover_constraint_cap")
+    if cap is not None:
+        tolerance = float(clip_mass_zeroed) + 1e-6
+        if requested > float(cap) + tolerance:
+            raise TurnoverBudgetError(
+                f"solved one-way turnover {requested:.6f} exceeds the daily "
+                f"budget {float(cap):.6f} by more than the post-solve clip can "
+                f"account for (clip zeroed {float(clip_mass_zeroed):.6f} of "
+                f"weight, tolerance {tolerance:.6f}). The budget is a "
+                f"constraint inside the convex program, so this is a solver or "
+                f"config defect, not a market condition. Holding the book for "
+                f"this session rather than trading an unsanctioned vector "
+                f"(alpha-engine-config-I7346)."
             )
-        else:
-            scale = cap / requested
-            weights = w_prev + (weights - w_prev) * scale
-            gov["turnover_capped"] = True
-            gov["turnover_scale_applied"] = float(scale)
     return weights, gov
 
 
