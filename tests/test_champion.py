@@ -28,6 +28,7 @@ from executor.champion import (
     CHAMPION_POINTER_KEY,
     COHORT_FRESH_MAX_DAYS,
     RESEARCH_FREE_PARQUET_KEY,
+    THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS,
     ChampionPointerError,
     StaleChampionFeedError,
     apply_champion_selection,
@@ -641,7 +642,7 @@ class TestThinktankCoverage:
 
     def test_stale_trading_day_raises(self):
         signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
-        # trading_day is 20 days before run_date; max allowed is 8.
+        # trading_day is 20 days before run_date; the arm's own bound is 3.
         s3 = self._s3(trading_day="2026-06-23", n=3)
 
         with pytest.raises(StaleChampionFeedError):
@@ -657,8 +658,9 @@ class TestThinktankCoverage:
 
     def test_trading_day_within_freshness_window_does_not_raise(self):
         signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
-        # exactly 8 days old — boundary, should be allowed (<=).
-        s3 = self._s3(trading_day="2026-07-05", n=2)
+        # exactly 3 days old — boundary of THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS,
+        # should be allowed (<=). alpha-engine-config-I7232.
+        s3 = self._s3(trading_day="2026-07-10", n=2)
 
         out_signals, _ = apply_champion_selection(
             signals_raw,
@@ -670,6 +672,90 @@ class TestThinktankCoverage:
             s3_client=s3,
         )
         assert len(out_signals["buy_candidates"]) == 2
+
+    def test_freshness_bound_is_3_and_independent_of_shared_config_constant(self):
+        """alpha-engine-config-I7232 (Brian ruling 2026-08-14): the
+        thinktank_coverage arm's freshness bound is a fixed module constant
+        (3, matching crucible-research-PR630's POINTER_LAG_ERROR_DAYS), NOT
+        derived from — or equal to by coincidence with — the shared
+        `champion_freshness_max_days` config default (8) used by the
+        scanner_predictor_direct arm. A future change to the shared constant
+        must not silently change this arm's behavior."""
+        assert THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS == 3
+        assert THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS != _CONFIG["champion_freshness_max_days"]
+
+        # Even if a caller's config explicitly sets champion_freshness_max_days
+        # to something else entirely, the thinktank arm's bound must not move:
+        # a pointer 4 days old still raises regardless of the shared knob.
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(trading_day="2026-07-09", n=2)  # 4 days old
+        cfg = dict(_CONFIG, champion_freshness_max_days=30)  # would NOT raise if shared
+
+        with pytest.raises(StaleChampionFeedError):
+            apply_champion_selection(
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=cfg,
+                sector_map={},
+                s3_client=s3,
+            )
+
+    def test_scanner_arm_still_uses_shared_config_constant_unaffected(self):
+        """The scanner_predictor_direct arm's freshness bound is untouched by
+        I7232 — it still reads `champion_freshness_max_days` from config
+        (default 8), not THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS. A cohort 4
+        days old (which now fails the thinktank arm's 3-day bound) must
+        continue to pass for the scanner arm under the unchanged 8-day
+        default."""
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = _FakeS3(
+            {
+                CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
+                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-07-09", n=2)),  # 4 days old
+            }
+        )
+
+        out_signals, _ = apply_champion_selection(
+            signals_raw,
+            {},
+            bucket="test-bucket",
+            run_date="2026-07-13",
+            config=_CONFIG,
+            sector_map={},
+            s3_client=s3,
+        )
+        assert len(out_signals["buy_candidates"]) == 2
+
+    def test_4_day_old_pointer_now_raises_but_would_not_have_under_old_8_day_bound(self):
+        """Proves the BEHAVIOR CHANGE from I7232, not just the constant: a
+        challenger-selection pointer aged 4 calendar days — well within the
+        old shared 8-day `champion_freshness_max_days` bound, so it would
+        NOT have raised before this fix — now raises StaleChampionFeedError
+        under the arm's own 3-day bound. This is exactly the frozen-pointer
+        shape the ruling closes (config-I7232): a stale Think Tank selection
+        that would previously have passed silently into a live champion
+        feed."""
+        signals_raw = {"date": "2026-07-13", "buy_candidates": [], "universe": []}
+        s3 = self._s3(trading_day="2026-07-09", n=2)  # 4 days old
+
+        # Sanity: 4 days is within the OLD shared 8-day bound — confirms this
+        # case would have passed under the pre-fix behavior.
+        assert 4 <= _CONFIG["champion_freshness_max_days"]
+        # And outside the NEW arm-specific 3-day bound.
+        assert 4 > THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS
+
+        with pytest.raises(StaleChampionFeedError):
+            apply_champion_selection(
+                signals_raw,
+                {},
+                bucket="test-bucket",
+                run_date="2026-07-13",
+                config=_CONFIG,
+                sector_map={},
+                s3_client=s3,
+            )
 
     def test_coverage_incomplete_raises(self):
         """Brian's ruling (config#1580): coverage_complete=False must never
