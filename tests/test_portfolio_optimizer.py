@@ -21,6 +21,9 @@ import pytest
 from executor.portfolio_optimizer import (
     OPTIMIZER_CONFIG_DEFAULTS,
     OptimizerResult,
+    TurnoverBudgetError,
+    _apply_turnover_governor,
+    _mandatory_turnover_floor,
     solve_target_weights,
 )
 
@@ -982,29 +985,37 @@ def test_missing_returns_panel_without_covariance_raises():
         solve_target_weights(**{**u, "returns_panel": None})
 
 
-class TestTurnoverGovernor:
-    """Gradual-rebalance guardrail: the book walks to the optimizer's target
-    over several days; a single-day target above the cap is scaled down, and a
-    large REQUESTED move is flagged for operator approval (still executed
-    gradually). See executor/portfolio_optimizer.py::_apply_turnover_governor.
+class TestTurnoverBudgetConstraint:
+    """The daily turnover budget is a CONSTRAINT inside the convex program,
+    not a post-solve uniform shrink (alpha-engine-config-I7346).
+
+    The distinction is the whole point: a shrink scales EVERY name's delta by
+    ``cap / requested``, including names whose entire delta is an intended new
+    position, so a hard enough shrink pushes a whole entry cohort under the
+    downstream rebalance band and deletes it unnamed. A constraint makes the
+    optimizer CHOOSE which trades fit the budget, and every surviving name
+    lands at the size it actually wants.
+    See executor/portfolio_optimizer.py::_apply_turnover_constraint.
     """
 
-    def _solve_from_prev(self, prev_active=0.0, cap=0.20, flag=0.35):
-        # One active name with strong α̂ so the MVO wants a large allocation.
-        # w_prev sums to 1 (the production invariant: positions/NAV + cash
-        # sentinel) — prev_active in the name, the rest in cash. From all-cash
-        # (prev_active=0) the MVO target is a ~0.97 one-way jump.
-        u = _baseline_universe(n_active=1)
-        u["alpha_hat"][0] = 0.08
+    def _solve_from_prev(self, cap=0.20, flag=0.35):
+        # Six attractive names, each capped at 0.08, against an all-SPY book.
+        # The unconstrained MVO target is ~0.48 one-way away, so a 0.20 budget
+        # genuinely binds. w_prev sums to 1 and sits exactly ON the cash sleeve
+        # and inside every stance cap — the MANDATORY floor is therefore zero
+        # and the budget is purely discretionary, which is the regime these
+        # assertions are about.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.08, 0.078, 0.076, 0.074, 0.072, 0.070]
         w_prev = np.zeros(len(u["tickers"]))
-        w_prev[0] = prev_active
-        w_prev[u["cash_idx"]] = 1.0 - prev_active
+        w_prev[u["spy_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
         u["w_prev"] = w_prev
         u["cfg"] = {"max_daily_turnover": cap, "large_move_turnover_flag": flag}
         return _solve(u)
 
-    def test_small_move_below_cap_is_not_governed(self):
-        # Already near target → requested turnover < cap → untouched + no flag.
+    def test_small_move_below_budget_is_untouched(self):
+        # Already near target → budget never binds → no flag.
         u = _baseline_universe(n_active=1)
         u["alpha_hat"][0] = 0.08
         # Seed w_prev close to the expected target (0.08 / 0.89 SPY / 0.03 cash).
@@ -1015,45 +1026,311 @@ class TestTurnoverGovernor:
         u["w_prev"] = w_prev
         u["cfg"] = {"max_daily_turnover": 0.20, "large_move_turnover_flag": 0.35}
         result = _solve(u)
+        assert result.diagnostics["turnover_constraint_applied"] is True
+        assert result.diagnostics["turnover_constraint_binding"] is False
         assert result.diagnostics["turnover_capped"] is False
         assert result.diagnostics["large_move_flagged"] is False
         assert result.diagnostics["turnover_one_way"] < 0.20
 
-    def test_large_target_is_capped_to_max_daily_turnover(self):
-        # From all-cash (w_prev=0) the MVO target is a ~0.5 turnover jump;
-        # the governor must scale executed one-way turnover down to the cap.
-        # (Universe: T0, SPY, CASH.)
+    def test_solved_vector_satisfies_the_budget(self):
+        # The solver, not a post-hoc shrink, keeps executed turnover at/below
+        # the cap. (Universe: T0, SPY, CASH.)
         result = self._solve_from_prev(cap=0.20)
         d = result.diagnostics
+        assert d["turnover_constraint_binding"] is True
         assert d["turnover_capped"] is True
-        assert d["requested_turnover_one_way"] > 0.20
-        # executed turnover lands at the cap (within solver/clip tolerance)
-        assert d["turnover_one_way"] == pytest.approx(0.20, abs=1e-3)
+        assert d["turnover_one_way"] <= 0.20 + 1e-3
+        assert d["turnover_one_way"] == pytest.approx(0.20, abs=1e-2)
 
-    def test_capped_weights_stay_feasible(self):
-        # Scaled step = convex combo of two feasible points → Σw=1 preserved.
+    def test_no_post_hoc_scale_factor_is_reported(self):
+        # `turnover_scale_applied` was the shrink's signature. Nothing is
+        # scaled any more, so the key must be gone rather than reported as 1.0
+        # (a reported 1.0 would read as "a shrink ran and was a no-op").
+        result = self._solve_from_prev(cap=0.20)
+        assert "turnover_scale_applied" not in result.diagnostics
+
+    def test_budget_shadow_price_is_published(self):
+        # The dual of the turnover constraint: the marginal objective value of
+        # one more unit of budget. It is what the restraint COST, and it
+        # replaces the old "requested vs executed" gap as the evidence that
+        # the optimizer wanted to move further.
+        result = self._solve_from_prev(cap=0.20)
+        sp = result.diagnostics["turnover_constraint_shadow_price"]
+        assert sp is not None and sp > 0.0
+
+    def test_binding_budget_sets_large_move_flag(self):
+        # A binding budget means the optimizer wanted more than it was
+        # allowed. Under the constraint construction executed turnover can no
+        # longer exceed the flag on a capped day, so without this branch the
+        # large-move detector would have gone permanently silent.
+        result = self._solve_from_prev(cap=0.20, flag=0.35)
+        assert result.diagnostics["large_move_flagged"] is True
+        assert result.diagnostics["large_move_reason"] == "turnover_budget_binding"
+
+    def test_flag_without_budget_flags_but_does_not_constrain(self):
+        # flag set, budget disabled → flagged on the raw comparison, weights
+        # unconstrained (flagging never substitutes for the budget). The flag
+        # is set below the fixture's unconstrained move so the raw comparison
+        # is what fires, with no budget present to bind.
+        result = self._solve_from_prev(cap=None, flag=0.10)
+        assert result.diagnostics["large_move_flagged"] is True
+        assert result.diagnostics["large_move_reason"] == "executed_turnover_above_flag"
+        assert result.diagnostics["turnover_constraint_applied"] is False
+        assert result.diagnostics["turnover_capped"] is False
+
+    def test_budget_disabled_is_bit_identical(self):
+        # max_daily_turnover=None → no constraint, no flag, legacy behaviour.
+        result = self._solve_from_prev(cap=None, flag=None)
+        assert result.diagnostics["turnover_constraint_applied"] is False
+        assert result.diagnostics["turnover_constraint_cap"] is None
+        assert result.diagnostics["turnover_capped"] is False
+        assert result.diagnostics["large_move_flagged"] is False
+
+    def test_turnover_fields_present_on_every_solve(self):
+        # A field that appears only on the interesting path is
+        # indistinguishable from a dead emitter.
+        for cap in (0.20, None):
+            d = self._solve_from_prev(cap=cap).diagnostics
+            for key in (
+                "requested_turnover_one_way",
+                "turnover_constraint_applied",
+                "turnover_constraint_cap",
+                "turnover_mandatory_floor",
+                "turnover_constraint_binding",
+                "turnover_constraint_shadow_price",
+                "turnover_capped",
+                "large_move_flagged",
+                "large_move_reason",
+            ):
+                assert key in d, f"{key} missing with cap={cap}"
+
+    def test_weights_stay_feasible_under_the_budget(self):
         result = self._solve_from_prev(cap=0.20)
         assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
         assert np.all(result.weights >= -1e-9)
 
-    def test_large_requested_move_sets_flag(self):
-        # Requested turnover ~0.5 > 0.35 flag → flagged (but still capped).
-        result = self._solve_from_prev(cap=0.20, flag=0.35)
-        assert result.diagnostics["large_move_flagged"] is True
-        assert result.diagnostics["turnover_capped"] is True  # cap independent of flag
 
-    def test_flag_without_cap_does_not_scale(self):
-        # flag set, cap disabled → flagged but weights untouched (cap is the
-        # only thing that scales; flagging never bypasses or replaces it).
-        result = self._solve_from_prev(cap=None, flag=0.35)
-        assert result.diagnostics["large_move_flagged"] is True
-        assert result.diagnostics["turnover_capped"] is False
+class TestTurnoverBudgetDoesNotDeleteAnEntryCohort:
+    """The regression the issue is about (alpha-engine-config-I7346).
 
-    def test_governor_disabled_is_bit_identical(self):
-        # max_daily_turnover=None → no governor; turnover_capped False, no scale.
-        result = self._solve_from_prev(cap=None, flag=None)
-        assert result.diagnostics["turnover_capped"] is False
-        assert result.diagnostics["large_move_flagged"] is False
+    Shape: a book far from target (one oversized legacy holding to unwind)
+    plus SEVERAL new small candidates. Under the old post-solve uniform
+    shrink, the whole step scaled by ``cap / requested``; with requested
+    turnover large the scale factor is small enough that every new position's
+    delta lands under the downstream ``rebalance_band_pct`` and the entire
+    entry cohort is deleted while the solve still reports ``optimal``.
+
+    Under the constraint construction the optimizer spends the budget on the
+    trades it most wants, so whatever it does enter, it enters at a TRADEABLE
+    size — never a uniformly-shrunk sliver.
+    """
+
+    BAND = 0.005  # executor/optimizer_shadow.py rebalance_band_pct
+
+    N_ENTRIES = 8
+
+    def _far_from_target(self, cap):
+        # Eight new candidates against a book parked almost entirely in SPY —
+        # the live 2026-08-14 shape (SPY 0.832, one held name, eight fresh
+        # entries). The unconstrained MVO wants ~0.5 one-way, so a 0.20 budget
+        # binds hard, and every entry is a NEW position: exactly the cohort a
+        # uniform shrink scales toward zero.
+        u = _baseline_universe(n_active=self.N_ENTRIES)
+        u["alpha_hat"][: self.N_ENTRIES] = np.linspace(0.08, 0.06, self.N_ENTRIES)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[u["spy_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["cfg"] = {"max_daily_turnover": cap, "min_position_pct": 0.005}
+        return u
+
+    @staticmethod
+    def _uniform_shrink(weights, w_prev, cap):
+        """The OLD mechanism, reproduced locally so the test states what it is
+        protecting against rather than merely asserting today's numbers:
+
+            w_exec = w_prev + (w_target − w_prev) · (cap / requested)
+        """
+        requested = float(np.sum(np.abs(weights - w_prev)) / 2)
+        if requested <= cap:
+            return weights
+        return w_prev + (weights - w_prev) * (cap / requested)
+
+    def test_new_positions_survive_the_band_at_tradeable_sizes(self):
+        cap = 0.20
+        u = self._far_from_target(cap)
+        w_prev = u["w_prev"].copy()
+        result = _solve(u)
+
+        assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
+        assert result.diagnostics["turnover_one_way"] <= cap + 1e-3
+        assert result.diagnostics["turnover_constraint_binding"] is True
+
+        entered = [
+            i for i in range(self.N_ENTRIES)
+            if w_prev[i] == 0.0 and result.weights[i] > 0.0
+        ]
+        assert entered, "the solve entered nothing — fixture no longer exercises entries"
+        for i in entered:
+            delta = float(result.weights[i] - w_prev[i])
+            assert delta >= self.BAND, (
+                f"entry T{i} sized at {delta:.5f}, under the {self.BAND} "
+                "rebalance band — it would be deleted downstream, unnamed"
+            )
+
+    def test_the_old_uniform_shrink_deletes_an_entry_cohort(self):
+        # The counterfactual that makes the fix load-bearing. Stated as
+        # arithmetic on the shrink formula rather than as a second solve: the
+        # failure is a property of scaling every delta by cap/requested, not
+        # of any particular solver output, and a test that depends on the
+        # solver landing on a specific vector would rot into a tautology.
+        #
+        # Book: 0.85 in one legacy name to be unwound, plus eight intended
+        # entries of 0.02 each. One-way requested = 0.85, cap 0.20 →
+        # scale 0.235 → each 0.02 entry becomes 0.0047, under the 0.005 band.
+        n = self.N_ENTRIES
+        size = 0.02
+        w_prev = np.zeros(n + 2)
+        w_prev[n] = 0.85      # legacy holding, index n
+        w_prev[n + 1] = 0.12  # SPY-ish remainder
+        target = np.zeros(n + 2)
+        target[:n] = size
+        target[n] = 0.0
+        target[n + 1] = 1.0 - n * size
+
+        requested = float(np.sum(np.abs(target - w_prev)) / 2)
+        cap = 0.20
+        assert requested > cap
+        shrunk = self._uniform_shrink(target, w_prev, cap)
+
+        killed = [i for i in range(n) if abs(shrunk[i] - w_prev[i]) < self.BAND]
+        assert len(killed) == n, (
+            f"only {len(killed)}/{n} entries fell under the band — the fixture "
+            "no longer demonstrates the failure mode"
+        )
+        # And the same shrink applied to the LARGE leg leaves it comfortably
+        # tradeable: the cohort is deleted while the rebalance survives, which
+        # is why the solve still looked healthy.
+        assert abs(shrunk[n] - w_prev[n]) > self.BAND
+
+    def test_budget_is_not_starved_by_a_mandated_exit(self):
+        # A held name that goes INELIGIBLE is pinned to w=0, which mandates
+        # turnover whether or not there is budget for it. If the constraint's
+        # RHS were the raw config cap, the program would be infeasible and the
+        # whole book would fall to the hold path — a new failure mode
+        # introduced by the fix, on the day a forced exit is what must happen.
+        u = _baseline_universe(n_active=2)
+        u["alpha_hat"][:2] = [0.05, 0.04]
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[0] = 0.70  # held, and about to be gated off
+        w_prev[u["spy_idx"]] = 0.27
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["eligibility"] = np.ones(len(u["tickers"]), dtype=bool)
+        u["eligibility"][0] = False
+        # 0.70 must go to zero → 0.35 one-way, far above a 0.05 budget.
+        u["cfg"] = {"max_daily_turnover": 0.05}
+        result = _solve(u)
+
+        d = result.diagnostics
+        assert d["status"] in ("optimal", "optimal_inaccurate"), (
+            "the mandated exit made the program infeasible — the turnover "
+            "budget starved a non-discretionary trade"
+        )
+        assert result.weights[0] == pytest.approx(0.0, abs=1e-6)
+        assert d["turnover_mandatory_floor"] >= 0.30
+        assert d["turnover_constraint_cap"] >= d["turnover_mandatory_floor"]
+
+
+class TestTurnoverBudgetAssertion:
+    """``_apply_turnover_governor`` no longer shrinks — it asserts, and raises
+    when the solved vector exceeds the budget by more than the post-solve
+    clip can account for."""
+
+    def test_conforming_vector_passes_and_is_unmodified(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.15, 0.82, 0.03])  # one-way 0.05
+        meta = {
+            "turnover_constraint_applied": True,
+            "turnover_constraint_cap": 0.20,
+            "turnover_mandatory_floor": 0.0,
+            "turnover_constraint": None,
+        }
+        out, gov = _apply_turnover_governor(
+            weights, w_prev, {"large_move_turnover_flag": None},
+            turnover_meta=meta, clip_mass_zeroed=0.0,
+        )
+        assert out is weights
+        assert gov["requested_turnover_one_way"] == pytest.approx(0.05)
+
+    def test_violation_raises_rather_than_shrinking(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.60, 0.37, 0.03])  # one-way 0.50, cap 0.20
+        meta = {
+            "turnover_constraint_applied": True,
+            "turnover_constraint_cap": 0.20,
+            "turnover_mandatory_floor": 0.0,
+            "turnover_constraint": None,
+        }
+        with pytest.raises(TurnoverBudgetError, match="exceeds the daily"):
+            _apply_turnover_governor(
+                weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.0,
+            )
+
+    def test_clip_mass_is_the_tolerance(self):
+        # The dust-drop + renormalize step legitimately adds up to
+        # `clip_mass_zeroed` of one-way turnover. Within that budget the
+        # assertion must NOT fire; beyond it, it must.
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.30, 0.67, 0.03])  # one-way 0.20 exactly
+        meta = {"turnover_constraint_cap": 0.19, "turnover_constraint": None}
+        # 0.20 > 0.19 by 0.01 — explained by a 0.02 clip, not by a 0.001 one.
+        _apply_turnover_governor(
+            weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.02,
+        )
+        with pytest.raises(TurnoverBudgetError):
+            _apply_turnover_governor(
+                weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.001,
+            )
+
+    def test_disabled_budget_never_raises(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        weights = np.array([0.90, 0.07, 0.03])
+        meta = {"turnover_constraint_applied": False, "turnover_constraint_cap": None}
+        out, gov = _apply_turnover_governor(
+            weights, w_prev, {}, turnover_meta=meta, clip_mass_zeroed=0.0,
+        )
+        assert out is weights
+        assert gov["turnover_capped"] is False
+
+
+class TestMandatoryTurnoverFloor:
+    def test_zero_when_w_prev_already_satisfies_the_box(self):
+        w_prev = np.array([0.10, 0.87, 0.03])
+        caps = np.array([0.50, 1.0, 1.0])
+        floor = _mandatory_turnover_floor(
+            w_prev, caps, cash_idx=2, cfg={"cash_sleeve_pct": 0.03},
+        )
+        assert floor == pytest.approx(0.0, abs=1e-12)
+
+    def test_counts_a_forced_exit(self):
+        # A held 0.40 pinned to zero forces 0.40 of L1 out and 0.40 back in
+        # elsewhere → 0.40 one-way.
+        w_prev = np.array([0.40, 0.57, 0.03])
+        caps = np.array([0.0, 1.0, 1.0])  # name 0 gated off
+        floor = _mandatory_turnover_floor(
+            w_prev, caps, cash_idx=2, cfg={"cash_sleeve_pct": 0.03},
+        )
+        assert floor == pytest.approx(0.40, abs=1e-9)
+
+    def test_counts_the_cash_sleeve_pin(self):
+        # Cash at 0.00 must reach the 0.03 sleeve: 0.03 in, 0.03 out.
+        w_prev = np.array([0.10, 0.90, 0.00])
+        caps = np.array([0.50, 1.0, 1.0])
+        floor = _mandatory_turnover_floor(
+            w_prev, caps, cash_idx=2, cfg={"cash_sleeve_pct": 0.03},
+        )
+        assert floor == pytest.approx(0.03, abs=1e-9)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

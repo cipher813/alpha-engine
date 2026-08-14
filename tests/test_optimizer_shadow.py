@@ -31,6 +31,7 @@ from executor.optimizer_shadow import (
     _build_stance_caps,
     _build_universe,
     _build_w_prev,
+    _compute_trade_deltas,
     _extract_universe_tickers,
     run_shadow_optimizer,
 )
@@ -821,3 +822,97 @@ def test_dropped_candidates_groups_repetition_but_keeps_every_member():
     assert grp["count"] == 3
     # One record for three names, not three records.
     assert len([g for g in dropped if g["source"] == "signals_universe"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# band_dropped_trades — naming every trade the rebalance band removes
+# (alpha-engine-config-I7346)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestBandDroppedTrades:
+    """The anti-churn rebalance band suppresses per-name DRIFT. It cannot, on
+    its own, tell drift apart from an intended NEW position that something
+    upstream shrank into the band — and until this record existed nothing
+    named what it removed: the solve reported ``optimal``, ``entries_blocked``
+    stayed empty, and a deleted entry cohort rendered exactly like a quiet
+    hold day.
+    """
+
+    CFG = {"rebalance_band_pct": 0.005}
+    NAV = 1_000_000.0
+
+    def test_drift_under_the_band_is_recorded_not_silently_dropped(self):
+        tickers = ["AAA", "SPY", "CASH"]
+        target = np.array([0.102, 0.868, 0.03])
+        current = np.array([0.100, 0.870, 0.03])
+        trades, dropped = _compute_trade_deltas(
+            tickers, target, current, self.NAV, self.CFG
+        )
+        assert trades == []
+        by_ticker = {d["ticker"]: d for d in dropped}
+        assert set(by_ticker) == {"AAA", "SPY"}
+        assert by_ticker["AAA"]["delta"] == pytest.approx(0.002, abs=1e-9)
+        assert by_ticker["AAA"]["band"] == 0.005
+        assert by_ticker["AAA"]["is_new_position"] is False
+
+    def test_a_shrunken_entry_is_marked_as_a_new_position(self):
+        # The failure mode itself: an intended entry sized under the band.
+        # `is_new_position` is what separates it from drift on a held name.
+        tickers = ["NEW", "SPY", "CASH"]
+        target = np.array([0.004, 0.966, 0.03])
+        current = np.array([0.000, 0.970, 0.03])
+        _trades, dropped = _compute_trade_deltas(
+            tickers, target, current, self.NAV, self.CFG
+        )
+        new = next(d for d in dropped if d["ticker"] == "NEW")
+        assert new["is_new_position"] is True
+        assert new["current_weight"] == 0.0
+        assert new["target_weight"] == pytest.approx(0.004)
+
+    def test_universe_names_the_optimizer_never_picked_are_not_recorded(self):
+        # A zero-target, zero-current name is not a trade the band removed —
+        # it is a name the optimizer did not pick. Recording those would bury
+        # the real drops under the whole universe.
+        tickers = ["UNPICKED", "SPY", "CASH"]
+        target = np.array([0.0, 0.97, 0.03])
+        current = np.array([0.0, 0.97, 0.03])
+        trades, dropped = _compute_trade_deltas(
+            tickers, target, current, self.NAV, self.CFG
+        )
+        assert trades == []
+        assert dropped == []
+
+    def test_tradeable_deltas_are_not_recorded_as_dropped(self):
+        tickers = ["AAA", "SPY", "CASH"]
+        target = np.array([0.10, 0.87, 0.03])
+        current = np.array([0.00, 0.97, 0.03])
+        trades, dropped = _compute_trade_deltas(
+            tickers, target, current, self.NAV, self.CFG
+        )
+        assert {t["ticker"] for t in trades} == {"AAA", "SPY"}
+        assert dropped == []
+
+    def test_cash_sentinel_is_never_a_trade_or_a_drop(self):
+        tickers = ["AAA", "SPY", "CASH"]
+        target = np.array([0.10, 0.87, 0.03])
+        current = np.array([0.10, 0.869, 0.031])
+        _trades, dropped = _compute_trade_deltas(
+            tickers, target, current, self.NAV, self.CFG
+        )
+        assert "CASH" not in {d["ticker"] for d in dropped}
+
+
+def test_band_dropped_trades_is_on_the_artifact_every_run(monkeypatch):
+    """Emitted even when empty. A field that appears only on the bad path is
+    indistinguishable from a dead emitter — the same rule dropped_candidates
+    was given in config-I7337."""
+    inputs = _baseline_inputs()
+    s3 = MagicMock()
+    log = run_shadow_optimizer(**inputs, s3_client=s3)
+    assert log is not None
+    assert log["shadow_status"] == "ok"
+    assert "band_dropped_trades" in log
+    assert isinstance(log["band_dropped_trades"], list)
+    body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+    assert "band_dropped_trades" in body
