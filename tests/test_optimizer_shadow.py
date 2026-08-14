@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from executor.alpha_contract import OPTIMIZER_ALPHA_ANCHOR
 from executor.optimizer_shadow import (
     _build_alpha_uncertainty,
     _build_eligibility,
@@ -72,14 +73,28 @@ def _baseline_inputs():
         "universe": tickers_with_pred,
         "signals": {
             "AAPL": {"signal": "ENTER", "score": 72, "sector": "Technology"},
-            "MSFT": {"signal": "HOLD",  "score": 65, "sector": "Technology"},
-            "JNJ":  {"signal": "ENTER", "score": 60, "sector": "Healthcare"},
+            "MSFT": {"signal": "HOLD", "score": 65, "sector": "Technology"},
+            "JNJ": {"signal": "ENTER", "score": 60, "sector": "Healthcare"},
         },
     }
+    # `alpha_anchor` is REQUIRED on every numeric predicted_alpha reaching the
+    # solve (alpha-engine-config-I7337) — the executor's read/inject adapters
+    # stamp it, and `_build_alpha_hat` refuses a batch that mixes anchors or
+    # omits one. Fixtures declare it for the same reason the live path does.
     predictions_by_ticker = {
-        "AAPL": {"predicted_alpha":  0.04, "gbm_veto": False, "stance": "momentum"},
-        "MSFT": {"predicted_alpha":  0.02, "gbm_veto": False, "stance": "quality"},
-        "JNJ":  {"predicted_alpha": -0.01, "gbm_veto": False, "stance": "value"},
+        "AAPL": {
+            "predicted_alpha": 0.04,
+            "gbm_veto": False,
+            "stance": "momentum",
+            "alpha_anchor": OPTIMIZER_ALPHA_ANCHOR,
+        },
+        "MSFT": {
+            "predicted_alpha": 0.02,
+            "gbm_veto": False,
+            "stance": "quality",
+            "alpha_anchor": OPTIMIZER_ALPHA_ANCHOR,
+        },
+        "JNJ": {"predicted_alpha": -0.01, "gbm_veto": False, "stance": "value", "alpha_anchor": OPTIMIZER_ALPHA_ANCHOR},
     }
     current_positions = {
         "MSFT": {"market_value": 50_000.0, "sector": "Technology"},
@@ -134,7 +149,7 @@ def test_adv_coverage_engages_participation_aware_tcost(monkeypatch):
         lambda *a, **k: {
             "AAPL": {"adv_usd": 8.0e9, "tradeability_score": 95.0},
             "MSFT": {"adv_usd": 6.0e9, "tradeability_score": 92.0},
-            "JNJ":  {"adv_usd": 3.0e9, "tradeability_score": 80.0},
+            "JNJ": {"adv_usd": 3.0e9, "tradeability_score": 80.0},
         },
     )
     s3 = MagicMock()
@@ -180,9 +195,7 @@ def test_shadow_optimizer_failsoft_when_tradeability_read_has_no_credentials(mon
     s3 = MagicMock()
     log = run_shadow_optimizer(s3_client=s3, **inputs)
 
-    assert log is not None, (
-        "Shadow optimizer must survive a no-credentials tradeability read"
-    )
+    assert log is not None, "Shadow optimizer must survive a no-credentials tradeability read"
     assert log["shadow_status"] == "ok"
     diag = log["diagnostics"]
     assert diag["tcost_term_mode"] == "flat_l1"
@@ -238,8 +251,10 @@ def test_build_universe_accepts_production_universe_dict_shape():
         {"ticker": "JNJ", "signal": "ENTER", "score": 60.0},
     ]
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
     )
     assert set(tickers[:-2]) == {"AAPL", "MSFT", "JNJ"}
     assert tickers[-2:] == ["SPY", "CASH"]
@@ -250,8 +265,10 @@ def test_universe_assembly_filters_tickers_without_history():
     inputs["price_histories"]["AAPL"] = _synthetic_price_df(n_rows=30)
 
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
     )
 
     assert "AAPL" not in tickers, "Tickers with <60 rows of history must be dropped"
@@ -264,8 +281,10 @@ def test_universe_requires_spy_history():
 
     with pytest.raises(RuntimeError, match="SPY price history"):
         _build_universe(
-            inputs["signals_raw"], inputs["predictions_by_ticker"],
-            inputs["current_positions"], inputs["price_histories"],
+            inputs["signals_raw"],
+            inputs["predictions_by_ticker"],
+            inputs["current_positions"],
+            inputs["price_histories"],
         )
 
 
@@ -274,17 +293,23 @@ def test_exit_signal_makes_ticker_ineligible():
     inputs["signals_raw"]["signals"]["AAPL"]["signal"] = "EXIT"
 
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
     )
     spy_idx = tickers.index("SPY")
     cash_idx = tickers.index("CASH")
     aapl_idx = tickers.index("AAPL")
 
     eligibility, _reasons = _build_eligibility(
-        tickers, inputs["signals_raw"]["signals"],
-        inputs["predictions_by_ticker"], inputs["current_positions"],
-        inputs["config"], spy_idx, cash_idx,
+        tickers,
+        inputs["signals_raw"]["signals"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["config"],
+        spy_idx,
+        cash_idx,
     )
     assert not eligibility[aapl_idx], "EXIT signal must zero eligibility"
     assert eligibility[spy_idx]
@@ -296,17 +321,23 @@ def test_gbm_veto_makes_ticker_ineligible():
     inputs["predictions_by_ticker"]["AAPL"]["gbm_veto"] = True
 
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
     )
     aapl_idx = tickers.index("AAPL")
     spy_idx = tickers.index("SPY")
     cash_idx = tickers.index("CASH")
 
     eligibility, _reasons = _build_eligibility(
-        tickers, inputs["signals_raw"]["signals"],
-        inputs["predictions_by_ticker"], inputs["current_positions"],
-        inputs["config"], spy_idx, cash_idx,
+        tickers,
+        inputs["signals_raw"]["signals"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["config"],
+        spy_idx,
+        cash_idx,
     )
     assert not eligibility[aapl_idx]
 
@@ -314,28 +345,33 @@ def test_gbm_veto_makes_ticker_ineligible():
 def test_w_prev_reflects_current_positions():
     inputs = _baseline_inputs()
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
     )
     cash_idx = tickers.index("CASH")
     msft_idx = tickers.index("MSFT")
 
     w_prev = _build_w_prev(
-        tickers, inputs["current_positions"], inputs["portfolio_nav"],
-        cash_idx, {},
+        tickers,
+        inputs["current_positions"],
+        inputs["portfolio_nav"],
+        cash_idx,
+        {},
     )
-    assert w_prev[msft_idx] == pytest.approx(0.05, abs=1e-6), \
-        "MSFT mkt_val=50k on 1M NAV → 5% weight"
-    assert w_prev[cash_idx] == pytest.approx(0.95, abs=1e-6), \
-        "Cash should absorb the residual pre-optimization"
+    assert w_prev[msft_idx] == pytest.approx(0.05, abs=1e-6), "MSFT mkt_val=50k on 1M NAV → 5% weight"
+    assert w_prev[cash_idx] == pytest.approx(0.95, abs=1e-6), "Cash should absorb the residual pre-optimization"
     assert w_prev.sum() == pytest.approx(1.0, abs=1e-6)
 
 
 def test_stance_caps_apply_multiplier_when_stance_present():
     inputs = _baseline_inputs()
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
     )
     spy_idx = tickers.index("SPY")
     cash_idx = tickers.index("CASH")
@@ -344,13 +380,17 @@ def test_stance_caps_apply_multiplier_when_stance_present():
     jnj_idx = tickers.index("JNJ")
 
     caps = _build_stance_caps(
-        tickers, inputs["signals_raw"]["signals"],
-        inputs["predictions_by_ticker"], inputs["config"], {},
-        spy_idx, cash_idx,
+        tickers,
+        inputs["signals_raw"]["signals"],
+        inputs["predictions_by_ticker"],
+        inputs["config"],
+        {},
+        spy_idx,
+        cash_idx,
     )
     assert caps[aapl_idx] == pytest.approx(0.08 * 1.0), "momentum mult = 1.0"
     assert caps[msft_idx] == pytest.approx(0.08 * 0.8), "quality mult = 0.8"
-    assert caps[jnj_idx]  == pytest.approx(0.08 * 0.7), "value mult = 0.7"
+    assert caps[jnj_idx] == pytest.approx(0.08 * 0.7), "value mult = 0.7"
     assert caps[spy_idx] == 1.0
     assert caps[cash_idx] == 1.0
 
@@ -389,7 +429,7 @@ class TestBuildAlphaUncertainty:
         preds = {
             "AAPL": {"predicted_alpha": 0.04, "predicted_alpha_std": 0.021},
             "MSFT": {"predicted_alpha": 0.02, "predicted_alpha_std": 0.018},
-            "JNJ":  {"predicted_alpha": -0.01, "predicted_alpha_std": 0.030},
+            "JNJ": {"predicted_alpha": -0.01, "predicted_alpha_std": 0.030},
         }
         sigma = _build_alpha_uncertainty(tickers, preds, spy_idx=3, cash_idx=4)
         assert sigma[0] == pytest.approx(0.021)
@@ -407,7 +447,7 @@ class TestBuildAlphaUncertainty:
         preds = {
             "AAPL": {"predicted_alpha": 0.04},  # no std (legacy Ridge)
             "MSFT": {"predicted_alpha": 0.02},
-            "JNJ":  {"predicted_alpha": -0.01},
+            "JNJ": {"predicted_alpha": -0.01},
         }
         sigma = _build_alpha_uncertainty(tickers, preds, spy_idx=3, cash_idx=4)
         assert np.isnan(sigma[0])
@@ -492,7 +532,7 @@ class TestShadowWiringAndAblation:
         # AAPL appears in the universe with predicted_alpha_std=0.040
         assert log["alpha_uncertainty"][tickers.index("AAPL")] == pytest.approx(0.040)
         assert log["alpha_uncertainty"][tickers.index("MSFT")] == pytest.approx(0.005)
-        assert log["alpha_uncertainty"][tickers.index("JNJ")]  == pytest.approx(0.020)
+        assert log["alpha_uncertainty"][tickers.index("JNJ")] == pytest.approx(0.020)
 
     def test_ablation_skipped_when_gamma_zero(self):
         """Default γ=0 → no ablation block (active solve already IS no-penalty)."""
@@ -573,22 +613,24 @@ class TestLoadAutoTunedOptimizerCfg:
 
     def test_loads_allowlisted_and_clamps(self):
         from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
-        s3 = _s3_returning({"risk_aversion": 4.0, "tcost_bps": 3.0,
-                            "max_sector_pct": 0.99, "updated_at": "2026-06-14"})
+
+        s3 = _s3_returning({"risk_aversion": 4.0, "tcost_bps": 3.0, "max_sector_pct": 0.99, "updated_at": "2026-06-14"})
         out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
         # only the two writable knobs survive
         assert out == {"risk_aversion": 4.0, "tcost_bps": 3.0}
 
     def test_out_of_band_value_is_reclamped(self):
         from executor.optimizer_shadow import _AUTO_TUNED_BOUNDS, _load_auto_tuned_optimizer_cfg
+
         s3 = _s3_returning({"risk_aversion": 999.0, "tcost_bps": -5.0})
         out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
         assert out["risk_aversion"] == _AUTO_TUNED_BOUNDS["risk_aversion"][1]  # hi
-        assert out["tcost_bps"] == _AUTO_TUNED_BOUNDS["tcost_bps"][0]          # lo
+        assert out["tcost_bps"] == _AUTO_TUNED_BOUNDS["tcost_bps"][0]  # lo
 
     def test_private_floor_override_admits_aggressive_lambda(self):
         # Public default floor is 3.0 → λ=2.0 clamps up to 3.0 ...
         from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+
         s3 = _s3_returning({"risk_aversion": 2.0})
         out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
         assert out["risk_aversion"] == 3.0
@@ -596,12 +638,12 @@ class TestLoadAutoTunedOptimizerCfg:
         # so a more aggressive auto-tuned book is admitted without shipping the
         # aggressive floor in the public default.
         s3b = _s3_returning({"risk_aversion": 2.0})
-        out2 = _load_auto_tuned_optimizer_cfg(
-            self._cfg(tuner_risk_aversion_floor=1.0), s3_client=s3b)
+        out2 = _load_auto_tuned_optimizer_cfg(self._cfg(tuner_risk_aversion_floor=1.0), s3_client=s3b)
         assert out2["risk_aversion"] == 2.0
 
     def test_kill_switch_disables_consumption(self):
         from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+
         s3 = _s3_returning({"risk_aversion": 4.0})
         out = _load_auto_tuned_optimizer_cfg(self._cfg(consume_auto_tuned=False), s3_client=s3)
         assert out == {}
@@ -609,16 +651,19 @@ class TestLoadAutoTunedOptimizerCfg:
 
     def test_failsafe_on_s3_error_returns_empty(self):
         from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+
         s3 = MagicMock()
         s3.get_object.side_effect = RuntimeError("NoSuchKey")
         assert _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3) == {}
 
     def test_no_bucket_returns_empty(self):
         from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+
         assert _load_auto_tuned_optimizer_cfg({"portfolio_optimizer": {}}, s3_client=MagicMock()) == {}
 
     def test_non_numeric_value_ignored(self):
         from executor.optimizer_shadow import _load_auto_tuned_optimizer_cfg
+
         s3 = _s3_returning({"risk_aversion": "oops", "tcost_bps": 3.0})
         out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
         assert out == {"tcost_bps": 3.0}
@@ -643,8 +688,10 @@ def test_dropped_candidates_are_named_with_a_typed_reason():
     dropped: list[dict] = []
 
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
         price_histories_requested=set(inputs["price_histories"]),
         dropped_out=dropped,
     )
@@ -662,7 +709,9 @@ def test_a_predicted_ticker_never_requested_raises_rather_than_vanishing():
     not be solved around silently."""
     inputs = _baseline_inputs()
     inputs["predictions_by_ticker"]["NVDA"] = {
-        "ticker": "NVDA", "predicted_alpha": 0.05, "predicted_direction": "UP",
+        "ticker": "NVDA",
+        "predicted_alpha": 0.05,
+        "predicted_direction": "UP",
     }
     # NVDA is predicted but was never requested from the loader — exactly the
     # live shape: the whole attractiveness cut, absent from price_histories.
@@ -670,8 +719,10 @@ def test_a_predicted_ticker_never_requested_raises_rather_than_vanishing():
 
     with pytest.raises(RuntimeError, match="never requested"):
         _build_universe(
-            inputs["signals_raw"], inputs["predictions_by_ticker"],
-            inputs["current_positions"], inputs["price_histories"],
+            inputs["signals_raw"],
+            inputs["predictions_by_ticker"],
+            inputs["current_positions"],
+            inputs["price_histories"],
             price_histories_requested=requested,
         )
 
@@ -682,14 +733,18 @@ def test_a_predicted_ticker_the_cache_lacked_is_recorded_not_raised():
     plumbing bug. Record it; do not raise."""
     inputs = _baseline_inputs()
     inputs["predictions_by_ticker"]["NVDA"] = {
-        "ticker": "NVDA", "predicted_alpha": 0.05, "predicted_direction": "UP",
+        "ticker": "NVDA",
+        "predicted_alpha": 0.05,
+        "predicted_direction": "UP",
     }
     requested = set(inputs["price_histories"]) | {"NVDA"}
     dropped: list[dict] = []
 
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
         price_histories_requested=requested,
         dropped_out=dropped,
     )
@@ -706,21 +761,23 @@ def test_unknown_requested_set_degrades_rather_than_raising():
     the data-condition reason rather than raise on a claim it cannot support."""
     inputs = _baseline_inputs()
     inputs["predictions_by_ticker"]["NVDA"] = {
-        "ticker": "NVDA", "predicted_alpha": 0.05, "predicted_direction": "UP",
+        "ticker": "NVDA",
+        "predicted_alpha": 0.05,
+        "predicted_direction": "UP",
     }
     dropped: list[dict] = []
 
     tickers = _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
         price_histories_requested=None,
         dropped_out=dropped,
     )
 
     assert "NVDA" not in tickers
-    assert next(g for g in dropped if "NVDA" in g["tickers"])["reason"] == (
-        "history_absent_in_cache"
-    )
+    assert next(g for g in dropped if "NVDA" in g["tickers"])["reason"] == ("history_absent_in_cache")
 
 
 def test_dropped_candidates_is_emitted_on_the_clean_path_too():
@@ -730,8 +787,10 @@ def test_dropped_candidates_is_emitted_on_the_clean_path_too():
     dropped: list[dict] = []
 
     _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
         price_histories_requested=set(inputs["price_histories"]),
         dropped_out=dropped,
     )
@@ -744,14 +803,14 @@ def test_dropped_candidates_groups_repetition_but_keeps_every_member():
     grouping must carry the full ticker list — it removes repetition of the two
     constant fields, never a name."""
     inputs = _baseline_inputs()
-    inputs["signals_raw"]["universe"] = [
-        {"ticker": t, "signal": "HOLD"} for t in ("ZZA", "ZZB", "ZZC")
-    ]
+    inputs["signals_raw"]["universe"] = [{"ticker": t, "signal": "HOLD"} for t in ("ZZA", "ZZB", "ZZC")]
     dropped: list[dict] = []
 
     _build_universe(
-        inputs["signals_raw"], inputs["predictions_by_ticker"],
-        inputs["current_positions"], inputs["price_histories"],
+        inputs["signals_raw"],
+        inputs["predictions_by_ticker"],
+        inputs["current_positions"],
+        inputs["price_histories"],
         price_histories_requested=set(inputs["price_histories"]),
         dropped_out=dropped,
     )

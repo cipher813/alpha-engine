@@ -31,6 +31,10 @@ import boto3
 import numpy as np
 import pandas as pd
 
+from executor.alpha_contract import (
+    _numeric_alpha,
+    assert_optimizer_anchor,
+)
 from executor.portfolio_optimizer import (
     OPTIMIZER_CONFIG_DEFAULTS,
     _estimate_covariance_daily,
@@ -115,7 +119,12 @@ def _load_auto_tuned_optimizer_cfg(config: dict, s3_client=None) -> dict:
         cv = min(max(v, lo), hi)
         if cv != v:
             logger.warning(
-                "auto-tuned %s=%s clamped to %s (band [%s, %s])", k, v, cv, lo, hi,
+                "auto-tuned %s=%s clamped to %s (band [%s, %s])",
+                k,
+                v,
+                cv,
+                lo,
+                hi,
             )
         out[k] = cv
     if out:
@@ -160,6 +169,7 @@ def run_shadow_optimizer(
         # rolling) BEFORE the artifact write so the verdict rides the daily
         # shadow log. check_turnover_tripwire never raises (sentinel on error).
         from executor.turnover_tripwire import check_turnover_tripwire
+
         log["turnover_tripwire"] = check_turnover_tripwire(
             log.get("diagnostics") or {},
             log.get("optimizer_cfg") or {},
@@ -228,15 +238,20 @@ def _build_and_solve(
     _derisk_gate = evaluate_derisk_gate(config, bucket=signals_bucket)
     if _derisk_gate.active:
         optimizer_cfg["risk_aversion"] = apply_risk_aversion_floor(
-            optimizer_cfg["risk_aversion"], _derisk_gate,
+            optimizer_cfg["risk_aversion"],
+            _derisk_gate,
         )
         logger.warning(
             "[derisk_gate] optimizer risk_aversion floored at %.2f (%s)",
-            optimizer_cfg["risk_aversion"], _derisk_gate.reason,
+            optimizer_cfg["risk_aversion"],
+            _derisk_gate.reason,
         )
     dropped_candidates: list[dict] = []
     tickers = _build_universe(
-        signals_raw, predictions_by_ticker, current_positions, price_histories,
+        signals_raw,
+        predictions_by_ticker,
+        current_positions,
+        price_histories,
         price_histories_requested=price_histories_requested,
         dropped_out=dropped_candidates,
     )
@@ -245,9 +260,22 @@ def _build_and_solve(
     cash_idx = tickers.index(_CASH)
 
     signals_by_ticker = signals_raw.get("signals", {})
+    # Raises AlphaAnchorError on a mixed- or undeclared-anchor batch before
+    # anything is solved (alpha-engine-config-I7337). The returned block is
+    # published on the artifact below so the check's verdict is a number an
+    # operator can read, not an inference from the absence of a traceback.
+    alpha_anchor = assert_optimizer_anchor(
+        tickers,
+        predictions_by_ticker,
+        spy_idx=spy_idx,
+        cash_idx=cash_idx,
+    )
     alpha_hat = _build_alpha_hat(tickers, predictions_by_ticker, spy_idx, cash_idx)
     alpha_uncertainty = _build_alpha_uncertainty(
-        tickers, predictions_by_ticker, spy_idx, cash_idx,
+        tickers,
+        predictions_by_ticker,
+        spy_idx,
+        cash_idx,
     )
     returns_panel = _build_returns_panel(tickers, price_histories, cash_idx)
     # Σ_daily (pre-horizon) is persisted below for the daemon's intraday
@@ -258,19 +286,33 @@ def _build_and_solve(
     w_prev = _build_w_prev(tickers, current_positions, portfolio_nav, cash_idx, optimizer_cfg)
     sectors = _build_sectors(tickers, signals_by_ticker, spy_idx, cash_idx)
     stance_caps = _build_stance_caps(
-        tickers, signals_by_ticker, predictions_by_ticker,
-        config, optimizer_cfg, spy_idx, cash_idx,
+        tickers,
+        signals_by_ticker,
+        predictions_by_ticker,
+        config,
+        optimizer_cfg,
+        spy_idx,
+        cash_idx,
     )
     eligibility, eligibility_reasons = _build_eligibility(
-        tickers, signals_by_ticker, predictions_by_ticker,
-        current_positions, config, spy_idx, cash_idx,
+        tickers,
+        signals_by_ticker,
+        predictions_by_ticker,
+        current_positions,
+        config,
+        spy_idx,
+        cash_idx,
     )
     # Per-name ADV$ from the scanner tradeability artifact (crucible-research#343)
     # drives the participation-aware √-impact cost term + max-%-ADV constraint
     # (config#1401). Fail-soft: absent artifact → all-NaN adv_usd → the optimizer
     # degrades to the flat L1 tcost penalty (bit-identical pre-tradeability).
     adv_usd, adv_coverage = _build_adv_usd(
-        tickers, signals_bucket, run_date, spy_idx, cash_idx,
+        tickers,
+        signals_bucket,
+        run_date,
+        spy_idx,
+        cash_idx,
     )
     # Per-name daily σ for the Almgren-Chriss σ-scaling of the impact term.
     # Reuse the returns panel we already built (no extra I/O); σ-agnostic when
@@ -310,7 +352,10 @@ def _build_and_solve(
             "Optimizer large-move flag: requested one-way turnover %.1f%% "
             "> flag %.0f%% — executing gradually under the %.0f%%/day cap "
             "(run_date=%s)",
-            _req * 100, (_flag or 0) * 100, (_cap or 0) * 100, run_date,
+            _req * 100,
+            (_flag or 0) * 100,
+            (_cap or 0) * 100,
+            run_date,
         )
         try:
             from executor.notifier import publish_ops_alert
@@ -329,12 +374,16 @@ def _build_and_solve(
             )
         except Exception as _alert_err:  # noqa: BLE001 — secondary observability
             logger.warning(
-                "large-move alert publish failed (non-fatal, cap already "
-                "applied): %s", _alert_err,
+                "large-move alert publish failed (non-fatal, cap already applied): %s",
+                _alert_err,
             )
 
     would_be_trades = _compute_trade_deltas(
-        tickers, result.weights, w_prev, portfolio_nav, optimizer_cfg,
+        tickers,
+        result.weights,
+        w_prev,
+        portfolio_nav,
+        optimizer_cfg,
     )
 
     # B.4 ablation: when the α̂-uncertainty penalty is configured ON, solve
@@ -368,6 +417,11 @@ def _build_and_solve(
         "target_weights": [float(x) for x in result.weights],
         "current_weights": [float(x) for x in w_prev],
         "alpha_hat": [float(x) for x in alpha_hat],
+        # Which anchor every solved alpha declared, and how many names were
+        # checked (alpha-engine-config-I7337). Emitted every run, healthy
+        # included — `{"n_checked": 0}` says the contract measured nothing,
+        # which is a finding, not a pass.
+        "alpha_anchor": alpha_anchor,
         "alpha_uncertainty": _alpha_uncertainty_to_json(alpha_uncertainty),
         "eligibility": [bool(x) for x in eligibility],
         "eligibility_reasons": list(eligibility_reasons),
@@ -464,17 +518,15 @@ def _maybe_run_ablation(
     per_ticker = []
     for i, t in enumerate(tickers):
         if abs(deltas[i]) >= 1e-4:
-            per_ticker.append({
-                "ticker": t,
-                "with_penalty": float(active[i]),
-                "no_penalty": float(no_penalty_weights[i]),
-                "delta": float(deltas[i]),
-                "sigma_alpha": (
-                    float(alpha_uncertainty[i])
-                    if np.isfinite(alpha_uncertainty[i])
-                    else None
-                ),
-            })
+            per_ticker.append(
+                {
+                    "ticker": t,
+                    "with_penalty": float(active[i]),
+                    "no_penalty": float(no_penalty_weights[i]),
+                    "delta": float(deltas[i]),
+                    "sigma_alpha": (float(alpha_uncertainty[i]) if np.isfinite(alpha_uncertainty[i]) else None),
+                }
+            )
     return {
         "gamma": gamma,
         "no_penalty_weights": [float(x) for x in no_penalty_weights],
@@ -561,8 +613,10 @@ def _build_universe(
             "ticker": t,
             "reason": _classify_drop(t, price_histories, price_histories_requested),
             "source": (
-                "prediction" if t in predictions_by_ticker
-                else "position" if t in current_positions
+                "prediction"
+                if t in predictions_by_ticker
+                else "position"
+                if t in current_positions
                 else "signals_universe"
             ),
         }
@@ -585,10 +639,7 @@ def _build_universe(
             for (src, rsn), names in sorted(groups.items())
         )
 
-    plumbing_bugs = [
-        d for d in dropped
-        if d["reason"] == "no_history_loaded" and d["source"] == "prediction"
-    ]
+    plumbing_bugs = [d for d in dropped if d["reason"] == "no_history_loaded" and d["source"] == "prediction"]
     if plumbing_bugs:
         names = ", ".join(d["ticker"] for d in plumbing_bugs)
         raise RuntimeError(
@@ -656,6 +707,22 @@ def _build_alpha_hat(
     spy_idx: int,
     cash_idx: int,
 ) -> np.ndarray:
+    """Assemble the solve's alpha vector, on ONE declared market-relative
+    anchor (alpha-engine-config-I7337).
+
+    The anchor assertion runs FIRST, before a single value is read: the
+    optimizer compares every entry against a SPY=0.0 sentinel, so a batch
+    mixing a market-relative alpha with a raw one carrying the meta-L2's
+    common-mode macro level cannot be solved — it flushes the whole book to
+    zero weights and renders as a normal `optimizer_target_zero` decision.
+    See `executor/alpha_contract.py` for the measured incident.
+    """
+    assert_optimizer_anchor(
+        tickers,
+        predictions_by_ticker,
+        spy_idx=spy_idx,
+        cash_idx=cash_idx,
+    )
     alpha = np.zeros(len(tickers))
     for i, t in enumerate(tickers):
         if i == spy_idx:
@@ -664,14 +731,14 @@ def _build_alpha_hat(
         if i == cash_idx:
             alpha[i] = _CASH_ALPHA_HINT
             continue
-        pred = predictions_by_ticker.get(t, {})
-        raw_alpha = pred.get("predicted_alpha") or pred.get("canonical_predicted_alpha") or 0.0
-        try:
-            alpha[i] = float(raw_alpha)
-        except (TypeError, ValueError):
-            alpha[i] = 0.0
-        if not math.isfinite(alpha[i]):
-            alpha[i] = 0.0
+        pred = predictions_by_ticker.get(t) or {}
+        # `_numeric_alpha` returns None only for a genuinely absent/None/
+        # non-numeric opinion. An exact 0.0 is a real opinion and survives —
+        # the previous `a or b or 0.0` chain treated 0.0 as missing and fell
+        # through to the next field, which is the same falsy-`or` class as
+        # the present-and-zero `pullback_pct` defect fixed in PR477.
+        val = _numeric_alpha(pred)
+        alpha[i] = 0.0 if val is None else val
     return alpha
 
 
@@ -743,8 +810,7 @@ def _build_adv_usd(
     adv = np.full(len(tickers), np.nan)
     n_real = sum(1 for i in range(len(tickers)) if i not in (spy_idx, cash_idx))
     if not signals_bucket:
-        return adv, {"adv_names_covered": 0, "adv_names_total": n_real,
-                     "adv_source": "none_no_bucket"}
+        return adv, {"adv_names_covered": 0, "adv_names_total": n_real, "adv_source": "none_no_bucket"}
     # The reader already fails soft (returns {} on any S3/credential/parse
     # error), but wrap defensively so NO tradeability-read failure mode can
     # ever propagate up into run_shadow_optimizer and null the shadow log.
@@ -753,11 +819,10 @@ def _build_adv_usd(
         tradeability = read_universe_tradeability(signals_bucket, run_date)
     except Exception as exc:  # noqa: BLE001 — construction refinement, never a gate
         logger.warning(
-            "Universe tradeability read raised (%s) — ADV absent, flat-L1 "
-            "tcost fallback.", exc,
+            "Universe tradeability read raised (%s) — ADV absent, flat-L1 tcost fallback.",
+            exc,
         )
-        return adv, {"adv_names_covered": 0, "adv_names_total": n_real,
-                     "adv_source": "none_read_error"}
+        return adv, {"adv_names_covered": 0, "adv_names_total": n_real, "adv_source": "none_read_error"}
     adv_by_ticker = extract_adv_usd(tradeability)
     covered = 0
     for i, t in enumerate(tickers):
@@ -775,7 +840,9 @@ def _build_adv_usd(
 
 
 def _build_name_sigma(
-    returns_panel: np.ndarray, spy_idx: int, cash_idx: int,
+    returns_panel: np.ndarray,
+    spy_idx: int,
+    cash_idx: int,
 ) -> np.ndarray:
     """Per-name daily return σ from the returns panel, for the Almgren-Chriss
     σ-scaling of the impact term. SPY/CASH → NaN (excluded from the impact
@@ -890,8 +957,8 @@ def _build_stance_caps(
     base_cap = float(config.get("max_position_pct", 0.08))
     stance_multipliers = {
         "momentum": float(config.get("stance_size_momentum", 1.0)),
-        "value":    float(config.get("stance_size_value",    0.7)),
-        "quality":  float(config.get("stance_size_quality",  0.8)),
+        "value": float(config.get("stance_size_value", 0.7)),
+        "quality": float(config.get("stance_size_quality", 0.8)),
         "catalyst": float(config.get("stance_size_catalyst", 0.6)),
     }
     caps = np.full(len(tickers), base_cap)
@@ -982,25 +1049,39 @@ def _compute_trade_deltas(
         if abs(delta_pct) < band:
             continue
         delta_dollars = delta_pct * float(portfolio_nav)
-        trades.append({
-            "ticker": t,
-            "action": "BUY" if delta_pct > 0 else "SELL",
-            "delta_weight": round(delta_pct, 6),
-            "delta_dollars": round(delta_dollars, 2),
-            "target_weight": round(float(target_weights[i]), 6),
-            "current_weight": round(float(current_weights[i]), 6),
-        })
+        trades.append(
+            {
+                "ticker": t,
+                "action": "BUY" if delta_pct > 0 else "SELL",
+                "delta_weight": round(delta_pct, 6),
+                "delta_dollars": round(delta_dollars, 2),
+                "target_weight": round(float(target_weights[i]), 6),
+                "current_weight": round(float(current_weights[i]), 6),
+            }
+        )
     return trades
 
 
 def _redact_order(order: dict) -> dict:
-    keep = {"ticker", "action", "shares", "limit_price", "dollar_size",
-            "position_pct", "stance", "score", "signal_type"}
+    keep = {
+        "ticker",
+        "action",
+        "shares",
+        "limit_price",
+        "dollar_size",
+        "position_pct",
+        "stance",
+        "score",
+        "signal_type",
+    }
     return {k: order.get(k) for k in keep if k in order}
 
 
 def _write_shadow_log_to_s3(
-    log: dict, bucket: str, run_date: str, s3_client=None,
+    log: dict,
+    bucket: str,
+    run_date: str,
+    s3_client=None,
 ) -> None:
     s3 = s3_client or boto3.client("s3")
     body = json.dumps(log, default=str, indent=2).encode("utf-8")
