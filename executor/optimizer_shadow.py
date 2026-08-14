@@ -569,7 +569,21 @@ def _build_universe(
         for t in sorted(candidates - set(eligible))
     ]
     if dropped_out is not None:
-        dropped_out.extend(dropped)
+        # Grouped by (source, reason), each group carrying its FULL member list.
+        # Measured on the 2026-08-14 inputs, the flat per-ticker form added ~67 KB
+        # to a 10 KB artifact — 881 of the 891 records were byte-identical apart
+        # from the ticker, because `candidates` also absorbs the whole 903-name
+        # `signals.json::universe` sizing envelope (config#5809). Grouping keeps
+        # every member name — a count without its members is the defect
+        # config-I7324 exists for — and drops only the repetition of the two
+        # constant fields.
+        groups: dict[tuple[str, str], list[str]] = {}
+        for d in dropped:
+            groups.setdefault((d["source"], d["reason"]), []).append(d["ticker"])
+        dropped_out.extend(
+            {"source": src, "reason": rsn, "count": len(names), "tickers": names}
+            for (src, rsn), names in sorted(groups.items())
+        )
 
     plumbing_bugs = [
         d for d in dropped
