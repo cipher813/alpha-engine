@@ -1581,9 +1581,37 @@ def run(
 
         # Load price histories from predictor S3 cache (unless injected by backtester)
         # Include ENTER tickers for ATR sizing, momentum gate, and correlation check
+        #
+        # ── The universe determines the data, never the reverse (config-I7337) ──
+        #
+        # `predictions_by_ticker` is included because `optimizer_shadow.
+        # _build_universe` DECLARES every predicted ticker a candidate
+        # (`candidates.update(predictions_by_ticker.keys())`) and then drops any
+        # whose price history is absent. Loading only held + ENTER names made
+        # that declaration unsatisfiable: the optimizer asked for the predictor's
+        # cut and this loader had already decided it would never have it.
+        #
+        # Measured 2026-08-14, the defect this closes: the scanner's
+        # `attractiveness_top_20` reached the predictor correctly (20 names
+        # scored, `n_predictions: 23`), and `predictor/optimizer_shadow/
+        # latest.json` solved over **14** tickers of which ZERO were from that
+        # cut — 10 champion-injected names, 2 held positions, SPY and CASH. The
+        # book was AMD 0.11 / SPY 0.86 / CASH 0.03.
+        #
+        # Why the cut was invisible here specifically: the entry-selection role
+        # moved out of the signals producer when the champion pointer flipped to
+        # `scanner_predictor_direct` (2026-07-13), so `signals.json` has emitted
+        # `signal: "HOLD"` on all 903 rows with `buy_candidates: []` since
+        # 2026-07-18 — correctly, by design. Nothing re-labels the predictor's
+        # cut as ENTER, so a loader keyed on ENTER can never see it. The two
+        # changes are individually right and jointly delete the signal.
         if price_histories is None:
             enter_tickers = [s["ticker"] for s in signals.get("enter", [])]
-            all_tickers = list(set(list(current_positions.keys()) + enter_tickers))
+            all_tickers = list(set(
+                list(current_positions.keys())
+                + enter_tickers
+                + list(predictions_by_ticker.keys())
+            ))
             # Also load sector ETF histories for sector-relative exit veto
             held_sectors = {pos.get("sector", "") for pos in current_positions.values()}
             etf_tickers = [SECTOR_ETF_MAP.get(s, "SPY") for s in held_sectors if s]
@@ -1596,6 +1624,16 @@ def run(
                 )
             else:
                 price_histories = {}
+            # What was ASKED FOR, so `_build_universe` can tell a ticker this
+            # loader never requested (a plumbing contradiction — raise) from one
+            # it requested and the cache did not have (a data condition —
+            # record). Without this the two are indistinguishable downstream,
+            # which is precisely how the defect above stayed silent.
+            price_histories_requested = set(all_tickers_with_etfs)
+        else:
+            # Injected by the backtester: it supplies exactly what it loaded, so
+            # requested == delivered and no candidate can be a plumbing bug.
+            price_histories_requested = set(price_histories)
 
         # Previous-day VWAP per ENTER-signal ticker for intraday entry triggers.
         # Sourced from the ArcticDB universe library; hard-fails on any miss
@@ -2016,6 +2054,11 @@ def run(
                     signals_bucket=signals_bucket,
                     run_date=run_date,
                     legacy_orders=orders,
+                    # What the loader was ASKED for, so `_build_universe` can
+                    # separate a plumbing contradiction (declared a candidate,
+                    # never requested → raise) from a data condition (requested,
+                    # cache empty → record). config-I7337.
+                    price_histories_requested=price_histories_requested,
                 )
             except Exception as _shadow_err:
                 logger.warning(

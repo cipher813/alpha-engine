@@ -622,3 +622,117 @@ class TestLoadAutoTunedOptimizerCfg:
         s3 = _s3_returning({"risk_aversion": "oops", "tcost_bps": 3.0})
         out = _load_auto_tuned_optimizer_cfg(self._cfg(), s3_client=s3)
         assert out == {"tcost_bps": 3.0}
+
+
+# ── config-I7337: a dropped candidate is NAMED, and a plumbing bug RAISES ────
+#
+# The defect: `_build_universe` declares every predicted ticker a candidate,
+# then drops any whose price history is absent — while `executor.main` loaded
+# histories only for held + ENTER names. Measured 2026-08-14, the live solve
+# ran over 14 tickers containing ZERO of the day's `attractiveness_top_20`,
+# and the artifact said nothing about it. `_has_usable_history` collapsed
+# "never loaded" and "too short" into one False, so a data-plumbing bug and a
+# legitimate exclusion were byte-identical downstream.
+
+
+def test_dropped_candidates_are_named_with_a_typed_reason():
+    """A dropped candidate leaves a record. `eligibility_reasons` explains an
+    INCLUDED name's zero weight and is blind to names deleted before it."""
+    inputs = _baseline_inputs()
+    inputs["price_histories"]["AAPL"] = _synthetic_price_df(n_rows=30)
+    dropped: list[dict] = []
+
+    tickers = _build_universe(
+        inputs["signals_raw"], inputs["predictions_by_ticker"],
+        inputs["current_positions"], inputs["price_histories"],
+        price_histories_requested=set(inputs["price_histories"]),
+        dropped_out=dropped,
+    )
+
+    assert "AAPL" not in tickers
+    rec = next(d for d in dropped if d["ticker"] == "AAPL")
+    assert rec["reason"] == "history_too_short"
+    assert rec["source"] in {"prediction", "position", "signals_universe"}
+
+
+def test_a_predicted_ticker_never_requested_raises_rather_than_vanishing():
+    """THE regression guard. A name this module declared a candidate, that the
+    loader was never asked for, is a contract violated inside one run — it must
+    not be solved around silently."""
+    inputs = _baseline_inputs()
+    inputs["predictions_by_ticker"]["NVDA"] = {
+        "ticker": "NVDA", "predicted_alpha": 0.05, "predicted_direction": "UP",
+    }
+    # NVDA is predicted but was never requested from the loader — exactly the
+    # live shape: the whole attractiveness cut, absent from price_histories.
+    requested = set(inputs["price_histories"])
+
+    with pytest.raises(RuntimeError, match="never requested"):
+        _build_universe(
+            inputs["signals_raw"], inputs["predictions_by_ticker"],
+            inputs["current_positions"], inputs["price_histories"],
+            price_histories_requested=requested,
+        )
+
+
+def test_a_predicted_ticker_the_cache_lacked_is_recorded_not_raised():
+    """The distinction that keeps this from being a trading halt: a name the
+    loader ASKED for and the cache did not have is a data condition, not a
+    plumbing bug. Record it; do not raise."""
+    inputs = _baseline_inputs()
+    inputs["predictions_by_ticker"]["NVDA"] = {
+        "ticker": "NVDA", "predicted_alpha": 0.05, "predicted_direction": "UP",
+    }
+    requested = set(inputs["price_histories"]) | {"NVDA"}
+    dropped: list[dict] = []
+
+    tickers = _build_universe(
+        inputs["signals_raw"], inputs["predictions_by_ticker"],
+        inputs["current_positions"], inputs["price_histories"],
+        price_histories_requested=requested,
+        dropped_out=dropped,
+    )
+
+    assert "NVDA" not in tickers
+    rec = next(d for d in dropped if d["ticker"] == "NVDA")
+    assert rec["reason"] == "history_absent_in_cache"
+    assert rec["source"] == "prediction"
+
+
+def test_unknown_requested_set_degrades_rather_than_raising():
+    """`price_histories_requested=None` means the caller could not say what was
+    asked for — the plumbing distinction is unprovable, so it must degrade to
+    the data-condition reason rather than raise on a claim it cannot support."""
+    inputs = _baseline_inputs()
+    inputs["predictions_by_ticker"]["NVDA"] = {
+        "ticker": "NVDA", "predicted_alpha": 0.05, "predicted_direction": "UP",
+    }
+    dropped: list[dict] = []
+
+    tickers = _build_universe(
+        inputs["signals_raw"], inputs["predictions_by_ticker"],
+        inputs["current_positions"], inputs["price_histories"],
+        price_histories_requested=None,
+        dropped_out=dropped,
+    )
+
+    assert "NVDA" not in tickers
+    assert next(d for d in dropped if d["ticker"] == "NVDA")["reason"] == (
+        "history_absent_in_cache"
+    )
+
+
+def test_dropped_candidates_is_emitted_on_the_clean_path_too():
+    """Emitted every run, including empty. A field that appears only when
+    something is wrong is indistinguishable from a dead emitter."""
+    inputs = _baseline_inputs()
+    dropped: list[dict] = []
+
+    _build_universe(
+        inputs["signals_raw"], inputs["predictions_by_ticker"],
+        inputs["current_positions"], inputs["price_histories"],
+        price_histories_requested=set(inputs["price_histories"]),
+        dropped_out=dropped,
+    )
+
+    assert dropped == []
