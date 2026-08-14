@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pandas as pd
 
 from executor.strategies.config import load_strategy_config
@@ -110,6 +111,112 @@ def regime_conditional_threshold_scale(
     return max(float(floor), min(float(ceil), raw))
 
 
+# ── correlation-check hot path (alpha-engine-config-I7259) ──────────────────
+# `check_correlation` is the dominant cost of the pit_parity WALK-FORWARD pass.
+# Measured by py-spy stack sampling of the live pass on 2026-08-13
+# (i-034c3cd083f586064, pid 27417): 5 of 6 samples were inside this function —
+# in `Series.dropna`, `Series.reset_index`, and `numpy.corrcoef` via pandas
+# `nancorr`. The lookahead pass, which runs ONE simulation, completed in 922 s;
+# the walk-forward pass runs `param_sweep.sweep` -> `_run_combos` (one full
+# simulation PER COMBO) and blew its 2700 s ceiling.
+#
+# The waste is structural, not incidental. The per-ticker trailing return series
+# depends only on (ticker, lookback, that date's price_histories) — never on the
+# candidate — yet it was recomputed for every held position on every candidate
+# order:
+#
+#     cost = combos x dates x candidate_orders x held_positions
+#            x (iloc + pct_change + dropna + reset_index + corrcoef)
+#
+# With ~20 held names and ~20 candidates a day, that is 400 constructions of 20
+# distinct series, then multiplied again by the sweep's combo count.
+#
+# Two changes, both exactly value-preserving (see
+# tests/test_risk_guard_correlation_equivalence.py, which asserts bit-level
+# agreement with the pandas implementation over random and adversarial inputs):
+#
+#  1. Memoise the trailing return array per (ticker, lookback), keyed on the
+#     IDENTITY of the `price_histories` mapping. `_simulate_single_date` builds
+#     a fresh dict per simulated date (`_build_filtered_price_histories`), so
+#     the cache is naturally scoped to one date and every candidate on that date
+#     shares it. The owner dict is held by a STRONG reference: without it, the
+#     dict could be freed and a later dict could be allocated at the same id(),
+#     silently serving one date's returns to another.
+#
+#  2. Pearson on numpy tails instead of `Series.corr`. pandas routes to
+#     `nanops.nancorr` -> `np.corrcoef`, which builds a 2x2 covariance matrix to
+#     read one off-diagonal scalar. Both inputs are already NaN-free here (both
+#     were `dropna()`d), so pairwise NaN masking has nothing to do. The direct
+#     form also removes the two `reset_index(drop=True)` allocations, which only
+#     existed to make pandas align positionally.
+#
+# Non-finite handling is preserved exactly: `pct_change` yields `inf` across a
+# zero price, `dropna` does NOT remove it, `np.corrcoef` propagates it to NaN,
+# and the caller's `pd.notna(corr)` drops the pair. `_pearson` returns NaN in
+# the same cases (non-finite input, zero variance, n < 2).
+_CORR_CACHE_OWNER: dict | None = None
+_CORR_CACHE: dict[tuple[str, int], np.ndarray] = {}
+
+
+def _cached_returns_tail(
+    price_histories: dict[str, pd.DataFrame], ticker: str, lookback: int
+) -> np.ndarray | None:
+    """Trailing simple returns for ``ticker`` over the last ``lookback`` bars,
+    as a float64 array with the leading pct_change NaN dropped.
+
+    Returns ``None`` when the ticker is absent or has fewer than ``lookback``
+    bars — the same two conditions the callers already skip on.
+    """
+    global _CORR_CACHE_OWNER, _CORR_CACHE
+    if price_histories is not _CORR_CACHE_OWNER:
+        # New date (or new caller) — the previous date's returns are stale.
+        _CORR_CACHE_OWNER = price_histories
+        _CORR_CACHE = {}
+
+    key = (ticker, lookback)
+    if key in _CORR_CACHE:
+        return _CORR_CACHE[key]
+
+    history = price_histories.get(ticker)
+    if history is None or len(history) < lookback:
+        _CORR_CACHE[key] = None
+        return None
+
+    closes = history["close"].to_numpy(dtype=np.float64)[-lookback:]
+    # pct_change: r[i] = c[i]/c[i-1] - 1, and drop the leading NaN — identical
+    # to `Series.pct_change().dropna()` on the same window, including the inf
+    # produced by a zero denominator (dropna keeps inf; so does this).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rets = closes[1:] / closes[:-1] - 1.0
+    # `dropna()` removes NaN but NOT inf. Match that exactly.
+    rets = rets[~np.isnan(rets)]
+    _CORR_CACHE[key] = rets
+    return rets
+
+
+def _pearson(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation of two equal-length arrays, matching
+    ``pd.Series.corr`` (method='pearson') on NaN-free input.
+
+    Returns NaN — never raises — when the result is undefined: fewer than two
+    points, zero variance in either input, or any non-finite value (the `inf`
+    that `pct_change` produces across a zero price and `dropna` does not
+    remove). `np.corrcoef` returns NaN in each of those cases too; this is the
+    same contract without the 2x2 matrix allocation.
+    """
+    n = a.size
+    if n < 2 or b.size != n:
+        return float("nan")
+    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return float("nan")
+    a_c = a - a.mean()
+    b_c = b - b.mean()
+    denom = np.sqrt(float(a_c @ a_c) * float(b_c @ b_c))
+    if denom == 0.0:
+        return float("nan")
+    return float(a_c @ b_c) / denom
+
+
 def check_correlation(
     ticker: str,
     current_positions: dict[str, dict],
@@ -145,12 +252,10 @@ def check_correlation(
             candidate_sector = pos.get("sector", "")
             break
 
-    # Compute daily returns for candidate (vectorized; drops the N=1 NaN
-    # produced by pct_change at the head)
-    candidate_returns = (
-        candidate_history["close"].iloc[-lookback:].pct_change().dropna()
-    )
-    if candidate_returns.empty:
+    # Daily returns for the candidate. Memoised per (ticker, lookback) against
+    # this date's price_histories — see the module comment above.
+    candidate_returns = _cached_returns_tail(price_histories, ticker, lookback)
+    if candidate_returns is None or candidate_returns.size == 0:
         return True, "no returns computed for candidate"
 
     # Compare with same-sector held positions
@@ -162,24 +267,21 @@ def check_correlation(
         if candidate_sector and held_sector != candidate_sector:
             continue  # only compare within same sector
 
-        held_history = price_histories.get(held_ticker)
-        if held_history is None or len(held_history) < lookback:
+        held_returns = _cached_returns_tail(price_histories, held_ticker, lookback)
+        if held_returns is None:
             continue
 
-        held_returns = held_history["close"].iloc[-lookback:].pct_change().dropna()
-
-        # Align lengths (and indices — the two series may have different
-        # last bars if one ticker has missing data). Pearson on aligned
-        # tail of length ≥ 10.
-        min_len = min(len(candidate_returns), len(held_returns))
+        # Align lengths (the two series may have different last bars if one
+        # ticker has missing data). Pearson on aligned tail of length >= 10.
+        min_len = min(candidate_returns.size, held_returns.size)
         if min_len < 10:
             continue
 
-        cr = candidate_returns.iloc[-min_len:].reset_index(drop=True)
-        hr = held_returns.iloc[-min_len:].reset_index(drop=True)
-
-        # Pearson correlation via pandas (NaN if degenerate variance)
-        corr = cr.corr(hr)
+        # Positional tail alignment — what `reset_index(drop=True)` bought the
+        # pandas form, without the two Series allocations.
+        corr = _pearson(
+            candidate_returns[-min_len:], held_returns[-min_len:]
+        )
         if pd.notna(corr):
             correlations.append((held_ticker, float(corr)))
 
