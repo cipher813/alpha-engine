@@ -1188,10 +1188,25 @@ def decide_exits_and_reduces(
             all_exit_tickers.add(strat_sig["ticker"])
             all_exits.append(strat_sig)
 
+    # alpha-engine-config-I7396: one aggregated line, not one per ticker.
+    # This is called once per simulated DATE, and the exit signal set spans the
+    # whole universe, so at INFO it emitted hundreds of lines per date and tens
+    # of thousands per backtest. On 2026-08-15 that chatter consumed the entire
+    # SSM diagnostic window for a FAILED predictor-backtest — the stdout tail
+    # in `_spot_diagnostics/ae-predictor-backtest/2026-08-15.json` was
+    # end-to-end `SKIP EXIT … not in portfolio` and carried no trace of the
+    # exception that killed the stage. Same class as config-I7021 (an
+    # unbounded diagnostic evicts the ERROR beside it and the artifact still
+    # looks like evidence), recurring on a new emitter.
+    #
+    # Per-ticker detail stays at DEBUG: it is occasionally wanted when
+    # reconciling a single name, and never wanted 40,000 times.
+    _skipped_not_held: list[str] = []
     for sig in all_exits:
         ticker = sig["ticker"]
         if ticker not in current_positions:
-            logger.info(f"SKIP EXIT {ticker} — not in portfolio")
+            _skipped_not_held.append(ticker)
+            logger.debug(f"SKIP EXIT {ticker} — not in portfolio")
             continue
 
         shares_held = int(current_positions[ticker]["shares"])
@@ -1237,6 +1252,18 @@ def decide_exits_and_reduces(
             "prediction_confidence": pred.get("prediction_confidence"),
             "predicted_alpha": pred.get("predicted_alpha"),
         })
+
+    if _skipped_not_held:
+        # The count is the operationally interesting fact; the roster is not.
+        # Named tickers are capped so this line can never itself become the
+        # chatter it replaces.
+        _shown = ", ".join(sorted(_skipped_not_held)[:8])
+        _more = len(_skipped_not_held) - 8
+        logger.info(
+            "SKIP EXIT: %d of %d exit signal(s) not in portfolio (%s%s)",
+            len(_skipped_not_held), len(all_exits), _shown,
+            f", +{_more} more" if _more > 0 else "",
+        )
 
     # ── REDUCEs ──────────────────────────────────────────────────────
     all_reduce_tickers: set[str] = set()
