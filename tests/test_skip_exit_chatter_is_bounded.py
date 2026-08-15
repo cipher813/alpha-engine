@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from executor.deciders import decide_exits_and_reduces
 
 
@@ -37,7 +35,7 @@ def _plan(caplog, held, exiting, level=logging.INFO):
             signals=_exit_signals(exiting),
             strategy_exits=[],
             current_positions=_positions(held),
-            prices_now={t: 10.0 for t in held},
+            prices_now=dict.fromkeys(held, 10.0),
             predictions_by_ticker={},
             config={},
             market_regime="neutral",
