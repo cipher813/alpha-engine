@@ -362,17 +362,20 @@ class TestComputePositionSize:
         to differentiate. Two extreme confidences must now size identically.
         """
         enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
-        kwargs = dict(
-            ticker="AAPL", portfolio_nav=100_000, enter_signals=enter_signals,
-            signal=_base_signal(), sector_rating="market_weight",
-            current_price=150.0,
+        kwargs = {
+            "ticker": "AAPL",
+            "portfolio_nav": 100_000,
+            "enter_signals": enter_signals,
+            "signal": _base_signal(),
+            "sector_rating": "market_weight",
+            "current_price": 150.0,
             # The retired keys are passed deliberately: they must be INERT, not
             # merely absent. A caller with a stale risk.yaml must not resurrect
             # the factor.
-            config=_base_config(confidence_sizing_enabled=True,
-                                confidence_sizing_min=0.7,
-                                confidence_sizing_range=0.6),
-        )
+            "config": _base_config(confidence_sizing_enabled=True,
+                                   confidence_sizing_min=0.7,
+                                   confidence_sizing_range=0.6),
+        }
         low = compute_position_size(**kwargs, prediction_confidence=0.0)
         high = compute_position_size(**kwargs, prediction_confidence=1.0)
         assert low["position_pct"] == high["position_pct"]
