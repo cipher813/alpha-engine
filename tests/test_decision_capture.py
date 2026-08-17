@@ -431,7 +431,7 @@ def _make_sizing_result(shares: int = 150) -> dict:
         "upside_adj": 1.00,
         "dd_multiplier": 1.0,
         "atr_adj": 0.95,
-        "confidence_adj": 1.10,
+        "p_up_adj": 1.10,
         "staleness_adj": 1.0,
         "earnings_adj": 1.0,
         "coverage_adj": 1.0,
@@ -534,7 +534,7 @@ class TestPositionSizerPayloadShape:
         assert output["upside_adj"] == 1.00
         assert output["dd_multiplier"] == 1.0
         assert output["atr_adj"] == 0.95
-        assert output["confidence_adj"] == 1.10
+        assert output["p_up_adj"] == 1.10
         assert output["staleness_adj"] == 1.0
         assert output["earnings_adj"] == 1.0
         assert output["coverage_adj"] == 1.0
