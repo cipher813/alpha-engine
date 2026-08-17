@@ -318,7 +318,7 @@ def build_position_sizer_payload(
 
     ``agent_output`` records the sized result (shares + dollars + pct NAV)
     plus the per-multiplier breakdown (sector_adj, conviction_adj,
-    upside_adj, drawdown_multiplier, atr_adj, confidence_adj,
+    upside_adj, drawdown_multiplier, atr_adj, p_up_adj,
     staleness_adj, earnings_adj, coverage_adj, stance_adj). Joining
     against ``trades.csv`` by ``ticker + date`` lets the backtester
     grading analytics (PR 5) measure sizing-skill — e.g. did high-
@@ -369,7 +369,7 @@ def build_position_sizer_payload(
         "upside_adj": sizing_result.get("upside_adj"),
         "dd_multiplier": sizing_result.get("dd_multiplier"),
         "atr_adj": sizing_result.get("atr_adj"),
-        "confidence_adj": sizing_result.get("confidence_adj"),
+        "p_up_adj": sizing_result.get("p_up_adj"),
         "staleness_adj": sizing_result.get("staleness_adj"),
         "earnings_adj": sizing_result.get("earnings_adj"),
         "coverage_adj": sizing_result.get("coverage_adj"),

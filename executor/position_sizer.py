@@ -129,21 +129,54 @@ def compute_position_size(
     else:
         atr_adj = 1.0
 
-    # Confidence-weighted sizing (Task 2.2)
-    if config.get("confidence_sizing_enabled", True) and prediction_confidence is not None:
-        prediction_confidence = max(0.0, min(1.0, prediction_confidence))
-        conf_min = config.get("confidence_sizing_min", 0.7)
-        conf_range = config.get("confidence_sizing_range", 0.6)
-        confidence_adj = conf_min + conf_range * prediction_confidence
-    else:
-        confidence_adj = 1.0
+    # Confidence-weighted sizing: RETIRED 2026-08-17 (alpha-engine-config-I7525,
+    # Brian ruling). ``prediction_confidence`` no longer scales position size.
+    #
+    # The block read ``confidence_adj = confidence_sizing_min + confidence_sizing_range
+    # * prediction_confidence`` with 0.70 / 0.60 from risk.yaml. Those constants
+    # were derived when confidence was ``max(p_up, p_down)`` ∈ [0.5, 1.0], where
+    # the map produced [1.00, 1.30] — a conviction BOOST. Since crucible-predictor
+    # PR #143 (2026-05-12) confidence is ``|p_up - 0.5| * 2`` ∈ [0, 1], and the
+    # same constants produce 0.77–0.81 on the live distribution: a near-uniform
+    # ~20% haircut that no config line asks for, on a factor whose entire purpose
+    # is to DIFFERENTIATE between names. The constants were never rescaled, and
+    # `crucible-backtester/analysis/param_sweep.py:78` records that sweeping them
+    # was a no-op because the sim runs with ``predictions_by_ticker={}``.
+    #
+    # It is retired rather than re-derived because it is not in the live path:
+    # ``use_portfolio_optimizer: true`` skips ``_plan_entries``, the only route to
+    # this function, so live entries are sized by the MVO optimizer from
+    # ``predicted_alpha`` (with ``alpha_uncertainty_penalty`` carrying conviction).
+    # A decision rule outside the live path is retired, not maintained in a stale
+    # state — and leaving it armed meant flipping that flag back would have
+    # silently re-applied the haircut on the first run after.
+    #
+    # ``prediction_confidence`` remains a PARAMETER and is still recorded in the
+    # decision-capture snapshot (``build_position_sizer_payload``), so grading
+    # analytics can still ask whether confidence predicted anything. It just no
+    # longer multiplies the position.
 
-    # p_up-weighted sizing (Phase 4d): blend p_up into confidence if IC is positive
+    # p_up-weighted sizing (Phase 4d), now standalone rather than a blend INTO
+    # the retired confidence factor. Unlike confidence, ``p_up`` is a PROBABILITY
+    # on [0, 1] centered at the 0.5 coin-flip, so ``0.7 + 0.6 * p_up`` maps a
+    # coin-flip to exactly 1.0x and is correct by construction under any
+    # recalibration — the property the retired factor lacked.
+    #
+    # ``p_up_sizing_blend`` keeps its meaning: how much weight the p_up tilt
+    # carries. It used to blend p_up_adj against ``confidence_adj``; it now blends
+    # against 1.0 (no adjustment), which is what the confidence factor was
+    # supposed to be and no longer was. blend=1.0 gives the full [0.7, 1.3] tilt,
+    # the 0.3 default a gentler one. Keeping the key meaningful rather than
+    # accepted-but-ignored — an inert config key that reads as live is the exact
+    # class this issue is closing.
+    #
+    # Default OFF (``use_p_up_sizing`` absent ⇒ falsy).
     if config.get("use_p_up_sizing") and p_up is not None:
         p_up = max(0.0, min(1.0, p_up))
         blend = config.get("p_up_sizing_blend", 0.3)
-        p_up_adj = 0.7 + 0.6 * p_up  # map p_up [0,1] → [0.7, 1.3]
-        confidence_adj = confidence_adj * (1 - blend) + p_up_adj * blend
+        p_up_adj = 1.0 * (1 - blend) + (0.7 + 0.6 * p_up) * blend
+    else:
+        p_up_adj = 1.0
 
     # Signal staleness discount (Task 2.3)
     # Decay applies only to age BEYOND the source's expected refresh cadence.
@@ -263,7 +296,7 @@ def compute_position_size(
 
     max_pct = config.get("max_position_pct", 0.05)
     raw_weight = (base_weight * sector_adj * conviction_adj * upside_adj
-                  * drawdown_multiplier * derisk_multiplier * atr_adj * confidence_adj
+                  * drawdown_multiplier * derisk_multiplier * atr_adj * p_up_adj
                   * staleness_adj * earnings_adj * coverage_adj
                   * stance_adj * regime_adj * barrier_win_prob_adj)
     position_weight = min(raw_weight, max_pct)
@@ -319,7 +352,7 @@ def compute_position_size(
         f"{ticker} sizing: n={n} base={base_weight:.3f} sector_adj={sector_adj} "
         f"conviction_adj={conviction_adj} upside_adj={upside_adj} "
         f"dd_mult={drawdown_multiplier} derisk_mult={derisk_multiplier} atr_adj={atr_adj} "
-        f"confidence_adj={confidence_adj} staleness_adj={staleness_adj} "
+        f"p_up_adj={p_up_adj} staleness_adj={staleness_adj} "
         f"earnings_adj={earnings_adj} coverage_adj={coverage_adj} "
         f"stance_adj={stance_adj} regime_adj={regime_adj} "
         f"barrier_win_prob_adj={barrier_win_prob_adj} "
@@ -337,7 +370,11 @@ def compute_position_size(
         "dd_multiplier": drawdown_multiplier,
         "derisk_multiplier": derisk_multiplier,
         "atr_adj": atr_adj,
-        "confidence_adj": confidence_adj,
+        # Renamed from ``confidence_adj`` when confidence-weighted sizing was
+        # retired (I7525) — the multiplier now reflects p_up only, and a field
+        # named for a factor that no longer exists is how a stale reading gets
+        # made. Consumers use ``.get()``, so historical artifacts still load.
+        "p_up_adj": p_up_adj,
         "staleness_adj": staleness_adj,
         "earnings_adj": earnings_adj,
         "coverage_adj": coverage_adj,

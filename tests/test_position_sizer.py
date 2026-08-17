@@ -349,53 +349,117 @@ class TestComputePositionSize:
         )
         assert result["atr_adj"] == 1.0
 
-    # ── Confidence sizing ──
+    # ── Confidence sizing: RETIRED (alpha-engine-config-I7525) ──
 
-    def test_confidence_sizing_high_confidence(self):
-        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
-        result = compute_position_size(
-            ticker="AAPL",
-            portfolio_nav=100_000,
-            enter_signals=enter_signals,
-            signal=_base_signal(),
-            sector_rating="market_weight",
-            current_price=150.0,
-            config=_base_config(confidence_sizing_enabled=True,
-                                confidence_sizing_min=0.7, confidence_sizing_range=0.6),
-            prediction_confidence=1.0,  # max confidence → adj = 0.7 + 0.6*1.0 = 1.3
-        )
-        assert abs(result["confidence_adj"] - 1.3) < 0.01
+    def test_prediction_confidence_no_longer_scales_position_size(self):
+        """The pin for the retirement (Brian ruling 2026-08-17).
 
-    def test_confidence_sizing_low_confidence(self):
+        `confidence_adj = 0.70 + 0.60 * prediction_confidence` was derived when
+        confidence was `max(p_up, p_down)` in [0.5, 1.0], where it produced a
+        [1.00, 1.30] BOOST. Since crucible-predictor PR #143 confidence is
+        `|p_up - 0.5| * 2` in [0, 1], and the same constants produce ~0.77 on the
+        live distribution — a near-uniform haircut, on a factor whose purpose is
+        to differentiate. Two extreme confidences must now size identically.
+        """
         enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
-        result = compute_position_size(
-            ticker="AAPL",
-            portfolio_nav=100_000,
-            enter_signals=enter_signals,
-            signal=_base_signal(),
-            sector_rating="market_weight",
-            current_price=150.0,
-            config=_base_config(confidence_sizing_enabled=True,
-                                confidence_sizing_min=0.7, confidence_sizing_range=0.6),
-            prediction_confidence=0.0,  # min confidence → adj = 0.7
-        )
-        assert abs(result["confidence_adj"] - 0.7) < 0.01
+        kwargs = {
+            "ticker": "AAPL",
+            "portfolio_nav": 100_000,
+            "enter_signals": enter_signals,
+            "signal": _base_signal(),
+            "sector_rating": "market_weight",
+            "current_price": 150.0,
+            # The retired keys are passed deliberately: they must be INERT, not
+            # merely absent. A caller with a stale risk.yaml must not resurrect
+            # the factor.
+            "config": _base_config(confidence_sizing_enabled=True,
+                                   confidence_sizing_min=0.7,
+                                   confidence_sizing_range=0.6),
+        }
+        low = compute_position_size(**kwargs, prediction_confidence=0.0)
+        high = compute_position_size(**kwargs, prediction_confidence=1.0)
+        assert low["position_pct"] == high["position_pct"]
+        assert low["shares"] == high["shares"]
 
-    def test_confidence_clamped_to_0_1(self):
-        """Confidence > 1 should be clamped."""
-        enter_signals = [{"ticker": f"T{i}"} for i in range(25)]
+    def test_confidence_adj_is_no_longer_emitted(self):
+        """A field named for a factor that no longer exists is how a stale
+        reading gets made — the breakdown reports `p_up_adj` instead."""
         result = compute_position_size(
-            ticker="AAPL",
-            portfolio_nav=100_000,
-            enter_signals=enter_signals,
-            signal=_base_signal(),
-            sector_rating="market_weight",
-            current_price=150.0,
-            config=_base_config(confidence_sizing_enabled=True,
-                                confidence_sizing_min=0.7, confidence_sizing_range=0.6),
-            prediction_confidence=5.0,  # way above 1 → clamped to 1.0
+            ticker="AAPL", portfolio_nav=100_000,
+            enter_signals=[{"ticker": f"T{i}"} for i in range(25)],
+            signal=_base_signal(), sector_rating="market_weight",
+            current_price=150.0, config=_base_config(),
+            prediction_confidence=0.9,
         )
-        assert abs(result["confidence_adj"] - 1.3) < 0.01
+        assert "confidence_adj" not in result
+        assert result["p_up_adj"] == 1.0  # use_p_up_sizing off by default
+
+    # ── p_up sizing (standalone since I7525) ──
+
+    def test_p_up_sizing_off_by_default(self):
+        result = compute_position_size(
+            ticker="AAPL", portfolio_nav=100_000,
+            enter_signals=[{"ticker": f"T{i}"} for i in range(25)],
+            signal=_base_signal(), sector_rating="market_weight",
+            current_price=150.0, config=_base_config(), p_up=0.9,
+        )
+        assert result["p_up_adj"] == 1.0
+
+    def test_p_up_coin_flip_is_exactly_neutral(self):
+        """The property the retired confidence factor lacked: p_up is a
+        PROBABILITY centered at 0.5, so a coin-flip maps to exactly 1.0x at any
+        blend — correct by construction under recalibration."""
+        for blend in (0.0, 0.3, 1.0):
+            result = compute_position_size(
+                ticker="AAPL", portfolio_nav=100_000,
+                enter_signals=[{"ticker": f"T{i}"} for i in range(25)],
+                signal=_base_signal(), sector_rating="market_weight",
+                current_price=150.0,
+                config=_base_config(use_p_up_sizing=True, p_up_sizing_blend=blend),
+                p_up=0.5,
+            )
+            assert abs(result["p_up_adj"] - 1.0) < 1e-9, f"blend={blend}"
+
+    def test_p_up_full_blend_spans_the_declared_range(self):
+        def adj(p_up):
+            return compute_position_size(
+                ticker="AAPL", portfolio_nav=100_000,
+                enter_signals=[{"ticker": f"T{i}"} for i in range(25)],
+                signal=_base_signal(), sector_rating="market_weight",
+                current_price=150.0,
+                config=_base_config(use_p_up_sizing=True, p_up_sizing_blend=1.0),
+                p_up=p_up,
+            )["p_up_adj"]
+        assert abs(adj(0.0) - 0.7) < 1e-9
+        assert abs(adj(1.0) - 1.3) < 1e-9
+
+    def test_p_up_blend_still_scales_the_tilt(self):
+        """`p_up_sizing_blend` keeps its meaning after the retirement — it now
+        blends against 1.0 rather than against the confidence factor, so the key
+        stays live rather than accepted-but-ignored."""
+        def adj(blend):
+            return compute_position_size(
+                ticker="AAPL", portfolio_nav=100_000,
+                enter_signals=[{"ticker": f"T{i}"} for i in range(25)],
+                signal=_base_signal(), sector_rating="market_weight",
+                current_price=150.0,
+                config=_base_config(use_p_up_sizing=True, p_up_sizing_blend=blend),
+                p_up=1.0,
+            )["p_up_adj"]
+        assert abs(adj(0.0) - 1.0) < 1e-9    # no tilt
+        assert abs(adj(0.5) - 1.15) < 1e-9   # half of the way to 1.3
+        assert abs(adj(1.0) - 1.3) < 1e-9    # full tilt
+
+    def test_p_up_clamped_to_0_1(self):
+        result = compute_position_size(
+            ticker="AAPL", portfolio_nav=100_000,
+            enter_signals=[{"ticker": f"T{i}"} for i in range(25)],
+            signal=_base_signal(), sector_rating="market_weight",
+            current_price=150.0,
+            config=_base_config(use_p_up_sizing=True, p_up_sizing_blend=1.0),
+            p_up=5.0,
+        )
+        assert abs(result["p_up_adj"] - 1.3) < 1e-9
 
     # ── Staleness discount ──
 

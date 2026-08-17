@@ -1132,7 +1132,7 @@ def decide_entries(
                 "upside_adj": sizing.get("upside_adj"),
                 "dd_multiplier": sizing.get("dd_multiplier"),
                 "atr_adj": sizing.get("atr_adj"),
-                "confidence_adj": sizing.get("confidence_adj"),
+                "p_up_adj": sizing.get("p_up_adj"),
                 "staleness_adj": sizing.get("staleness_adj"),
                 "earnings_adj": sizing.get("earnings_adj"),
                 "stance_adj": sizing.get("stance_adj"),

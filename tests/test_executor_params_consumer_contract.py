@@ -21,8 +21,11 @@ from executor import main
 PRODUCER_APPLIED_PARAMS = {
     "atr_multiplier", "time_decay_reduce_days", "time_decay_exit_days",
     "min_score", "max_position_pct", "reduce_fraction",
-    "atr_sizing_target_risk", "confidence_sizing_min",
-    "confidence_sizing_range", "staleness_decay_per_day",
+    # confidence_sizing_min/range REMOVED 2026-08-17 (alpha-engine-config-I7525,
+    # Brian ruling): confidence-weighted sizing is retired, so the executor no
+    # longer applies them and the producer no longer declares them. Dropped from
+    # PIPELINE_CONTRACT.yaml + the backtester producer contract in the same arc.
+    "atr_sizing_target_risk", "staleness_decay_per_day",
     "earnings_sizing_reduction", "earnings_proximity_days",
     "momentum_gate_threshold", "correlation_block_threshold",
     "profit_take_pct", "momentum_exit_threshold",
