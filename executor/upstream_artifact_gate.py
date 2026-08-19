@@ -28,13 +28,22 @@ EXECUTOR_UPSTREAM_SPECS: tuple[ArtifactSpec, ...] = (
         artifact_id="research_signals",
         s3_bucket=_DEFAULT_BUCKET,
         s3_key_template="signals/{trading_day}/signals.json",
-        # eod_sf, not saturday_sf (config-I6658): the weekly pipeline is
-        # chain-launched by every trading day's postclose while
-        # exercise_cadence=daily, so this artifact is written on every NYSE
-        # trading day, not just Saturday. Mirrors ARTIFACT_REGISTRY.yaml's
-        # research_signals row — see that row's comment for the full
-        # rationale and the reversion condition if exercise_cadence changes.
-        cadence="eod_sf",
+        # saturday_sf (config-I6658's declared reversion condition, taken
+        # 2026-08-19). I6658 set this to eod_sf because the weekly pipeline
+        # was chain-launched by every trading day's postclose while
+        # /alpha-engine/weekly-sf/exercise-cadence == "daily". That knob was
+        # ruled to "off" on 2026-08-13 (SSM version 2), so the ONLY producer
+        # of signals/ is now the alpha-engine-saturday cron (THU-SAT 09:00
+        # UTC) — an eod_sf floor (~2 trading days) demands a daily artifact
+        # from a weekly producer and hard-halts the morning planner. Measured:
+        # preopen execution 8af9e934 aborted 2026-08-19 on
+        # "research_signals: stale ... older than freshness floor
+        # 2026-08-17T00:00:00+00:00" with the freshest instance being
+        # signals/2026-08-14 — the same artifact 08-17 and 08-18 traded on.
+        # saturday_sf's floor is now-10d, which covers the THU-SAT producer.
+        # Mirrors ARTIFACT_REGISTRY.yaml's research_signals row; the pairing
+        # is asserted by the cadence-parity preflight (config-I7708).
+        cadence="saturday_sf",
         sla_minutes_after_cron=180,
         severity="critical",
         owner_repo="alpha-engine-research",
