@@ -22,6 +22,14 @@ from executor.alpha_contract import (
 
 logger = logging.getLogger(__name__)
 
+# How far back `read_universe_tradeability` walks for a scanner universe
+# artifact. Mirrors crucible-predictor's MEMBERSHIP_MAX_AGE_DAYS (10): both
+# artifacts are written by the same weekly scanner run, so a single number
+# governs how stale either consumer will tolerate. A weekly cut is at most 7
+# days old and sits inside this window by construction
+# (alpha-engine-config-I7811).
+UNIVERSE_MAX_AGE_DAYS = 10
+
 REGIME_SUBSTRATE_PREFIX = "regime"
 
 
@@ -326,23 +334,69 @@ def read_universe_tradeability(
     Mirrors the fail-soft except-style of the ``read_*`` helpers above.
     """
     d = run_date or str(date.today())
-    key = f"scanner/universe/{d}/universe.json"
     s3 = boto3.client("s3")
+
+    # Resolve the NEWEST AVAILABLE instance, walking back from the run date —
+    # not the exact date (alpha-engine-config-I7811). The scanner forms its cuts
+    # WEEKLY as of Brian's 2026-08-20 ruling, so `scanner/universe/{today}` does
+    # not exist Tue-Fri. An exact-date read would miss on four days in five and,
+    # because this function is fail-soft by contract, return {} — silently
+    # switching the optimizer to its flat-L1 fallback with no ADV$ at all, with
+    # nothing raising and nothing reporting it.
+    #
+    # Same backward-scan idiom `read_signals_with_fallback` uses below, and the
+    # same window as crucible-predictor's MEMBERSHIP_MAX_AGE_DAYS: both artifacts
+    # are written by the same weekly scanner run, so one number governs how stale
+    # either consumer will tolerate.
     try:
-        obj = s3.get_object(Bucket=s3_bucket, Key=key)
-        data = json.loads(obj["Body"].read())
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code in ("NoSuchKey", "404"):
-            logger.info(
-                "No scanner universe artifact at s3://%s/%s — optimizer will "
-                "run without per-name ADV (flat-L1 tcost fallback).",
-                s3_bucket,
-                key,
+        start = date.fromisoformat(d)
+    except ValueError:
+        logger.warning(
+            "Unparseable run_date %r for universe tradeability — ADV absent", d,
+        )
+        return {}
+
+    key: str | None = None
+    data: dict | None = None
+    tried: list[str] = []
+    try:
+        for days_back in range(UNIVERSE_MAX_AGE_DAYS + 1):
+            candidate_date = start - timedelta(days=days_back)
+            candidate = f"scanner/universe/{candidate_date}/universe.json"
+            try:
+                obj = s3.get_object(Bucket=s3_bucket, Key=candidate)
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code")
+                if code in ("NoSuchKey", "404"):
+                    tried.append(str(candidate_date))
+                    continue
+                raise
+            key = candidate
+            data = json.loads(obj["Body"].read())
+            if days_back:
+                logger.info(
+                    "Universe tradeability resolved %d calendar day(s) back of "
+                    "run_date=%s → s3://%s/%s (weekly scanner cadence, "
+                    "config-I7811). Dates tried: %s",
+                    days_back, d, s3_bucket, key, tried,
+                )
+            break
+        if data is None:
+            # An absence is no longer routine: the window now spans a whole
+            # scanner cycle, so nothing inside it means the producer has not run.
+            # WARN, not INFO — the flat-L1 fallback is still taken, but it is
+            # taken on a real condition rather than an ordinary weekday.
+            logger.warning(
+                "No scanner universe artifact within %d days of run_date=%s under "
+                "s3://%s/scanner/universe/ — optimizer runs without per-name ADV "
+                "(flat-L1 tcost fallback). Dates tried: %s",
+                UNIVERSE_MAX_AGE_DAYS, d, s3_bucket, tried,
             )
             return {}
+    except ClientError as e:
         logger.warning("Failed reading universe tradeability (%s) — ADV absent", e)
         return {}
+
     except BotoCoreError as e:
         # Credential / endpoint / connection-level failures (NoCredentialsError,
         # EndpointConnectionError, ConnectTimeoutError, …) all subclass
