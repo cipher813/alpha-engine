@@ -5,7 +5,7 @@ alpha-engine-config-I7966: crucible-executor pinned nousergon-lib by bare SHA
 every cross-repo drift check — `crucible-predictor/inference/lib_pin_drift.py`
 covered only `_CO_INSTALL_PAIR` (backtester + predictor) and `_FLOOR_REPOS`
 (data + research). The executor is now in that probe's `_FLOOR_REPOS`
-(predictor#<i7966-pr>), reading THIS repo's `requirements.in` — see the
+(crucible-predictor-PR539), reading THIS repo's `requirements.in` — see the
 "scope" note below for why not `requirements.txt`.
 
 `crucible-predictor` and `nousergon-data` already guard the identical class
