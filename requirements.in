@@ -66,7 +66,17 @@ websocket-client~=1.9
 # v0.83.0 floor (config#1741): fleet forum-topic Telegram config
 # (nousergon_lib.flow_doctor_fleet) + flow-doctor notify_event routing.
 # v0.75.0 added canonical √-impact TransactionCostModel (ARCHITECTURE §15/§43).
-nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.77
+# v0.124.79 (alpha-engine-config-I7966, 2026-08-21): re-pins from a bare
+# commit SHA (crucible-executor's requirements.txt had drifted onto
+# fb383a98..., v0.124.77) back to a tag. The bare SHA in requirements.txt was
+# the compiled lockfile's normal `uv pip compile` resolution of THIS line
+# (see tests/test_requirements_lockstep.py), but this source-of-truth line
+# had never been a SHA — it was already tag-pinned, just stale. Re-pinning by
+# tag here also brings the executor into
+# crucible-predictor/inference/lib_pin_drift.py's floor-repo scope for the
+# first time, which reads THIS file (not requirements.txt) for exactly the
+# uv-resolves-to-SHA reason above.
+nousergon-lib[flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.79
 # krepis (MIT foundation) — direct pin: eod_emailer.py now imports the lifted
 # console deep-link chokepoint `krepis.console.console_url` (config#1300, krepis
 # v0.4.0 added it). nousergon-lib pulls krepis transitively, but the direct
