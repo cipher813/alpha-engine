@@ -1124,6 +1124,10 @@ def run_daemon(dry_run: bool = False) -> None:
                         "fill_price": fill_price,
                         "fill_time": order_result.get("fill_time"),
                         "filled_shares": order_result.get("filled_shares"),
+                        # Per-execution commission as IB reported it, or None
+                        # when it reported none — a cost line that cannot be
+                        # absent is the defect alpha-engine-config-I8188 fixes.
+                        "commission_usd": order_result.get("commission_usd"),
                         "status": order_result.get("status"),
                         "research_score": urgent.get("research_score"),
                         "research_conviction": urgent.get("research_conviction"),
@@ -2018,6 +2022,9 @@ def _execute_exit(
             "fill_price": fill_price,
             "fill_time": order_result.get("fill_time"),
             "filled_shares": order_result.get("filled_shares"),
+            # Per-execution commission as IB reported it, or None when it
+            # reported none (alpha-engine-config-I8188).
+            "commission_usd": order_result.get("commission_usd"),
             "status": order_result.get("status"),
             "exit_reason": exit_signal.get("reason"),
             "rationale_json": json.dumps(
@@ -2256,6 +2263,9 @@ def _execute_entry(
             "fill_price": fill_price,
             "fill_time": order_result.get("fill_time"),
             "filled_shares": order_result.get("filled_shares"),
+            # Per-execution commission as IB reported it, or None when it
+            # reported none (alpha-engine-config-I8188).
+            "commission_usd": order_result.get("commission_usd"),
             "status": order_result.get("status"),
             "research_score": entry.get("research_score"),
             "research_conviction": entry.get("research_conviction"),

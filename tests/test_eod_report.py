@@ -439,8 +439,8 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_3(self):
-        assert SCHEMA_VERSION == "2.3"
+    def test_schema_version_is_2_4(self):
+        assert SCHEMA_VERSION == "2.4"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -492,7 +492,18 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.3"
+        assert report["schema_version"] == "2.4"
+        # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
+        # and the integrity-gate verdict reach the artifact. Before this the
+        # only cost figure anywhere in the P&L path was the portfolio
+        # optimizer's ex-ante estimate, and nothing published the realized one.
+        assert set(report["transaction_costs"]) == {
+            "commission_usd", "commission_available", "slippage_usd",
+            "slippage_bps", "traded_notional_usd", "total_cost_usd",
+            "daily_return_net_pct", "daily_return_gross_pct",
+        }
+        assert report["integrity"]["breaches"] == []
+        assert report["integrity"]["spy_return_basis"] == "total_return"
         # config#6349/#6818 deliverable 3: ib_market_value + the out-of-range
         # flag reach the artifact even when absent from the input position
         # (legacy/no-flag path defaults cleanly).

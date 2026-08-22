@@ -76,6 +76,16 @@ Dividends earned are folded into each position's ``daily_return_usd`` (hence int
 identity has no separate dividend term and dividends are neither double-counted
 nor dropped.
 
+That last sentence was true of the MECHANISM and false of the RESULT until
+alpha-engine-config-I8188: the only dividend source was IB's per-symbol accrual,
+which a paper account never populates, so ``dividend_usd`` was $0.00 on all 115
+live sessions while the book held seven payers. The dividends were not dropped
+from the RETURN (NAV is IB NetLiquidation, which the cash reaches) — they were
+dropped from the ATTRIBUTION and silently credited to ``unattributed_usd``.
+``executor/dividends.py`` now accrues them explicitly on the ex-date from the
+Polygon corporate-actions feed, and ``spy_return_pct`` is TOTAL return on the
+benchmark leg so both sides of the comparison use the same return definition.
+
 This also fixes the old emailer's "α % of Total" column, which divided each
 position's alpha by the *signed* grand-total alpha — so a position with genuinely
 positive alpha rendered negative whenever the day's total alpha was negative, and
@@ -93,7 +103,13 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.3"
+SCHEMA_VERSION = "2.4"
+# 2.4 (alpha-engine-config-I8188): adds the ``transaction_costs`` block
+# (named commission/slippage lines plus the gross-of-cost vs net-of-cost
+# split) and the ``integrity`` block (residual-bound / custodian-mark /
+# TWR-closure gate outcomes, dividend-accrual availability, and the explicit
+# declaration that ``spy_return_pct`` is now TOTAL return, not price return).
+# Both are additive; no 2.3 field changed meaning.
 
 # Sell-side trade actions whose fills realize P&L on shares rotated out today.
 _SELL_ACTIONS = {
@@ -433,6 +449,9 @@ def build_eod_report(
     conn: sqlite3.Connection,
     account_snapshot: dict | None = None,
     nav_reconciliation: dict | None = None,
+    integrity_breaches: list | None = None,
+    twr_closure: dict | None = None,
+    dividend_accrual_available: bool | None = None,
     position_narratives: dict[str, str] | None = None,
     sector_attribution: dict | None = None,
     roundtrip_stats: dict | None = None,
@@ -543,6 +562,8 @@ def build_eod_report(
             "position_pnl_usd": recon.get("position_pnl_usd"),
             "interest_usd": recon.get("interest_usd"),
             "dividend_usd": recon.get("dividend_usd"),
+            "dividend_timing_usd": recon.get("dividend_timing_usd"),
+            "dividend_receivable_usd": recon.get("dividend_receivable_usd"),
             "unattributed_usd": recon.get("unattributed_usd"),
             "pricing_timing_usd": recon.get("pricing_timing_usd"),
             "pricing_timing_available": recon.get("pricing_timing_available"),
@@ -558,6 +579,30 @@ def build_eod_report(
             "pricing_timing_unattributable_usd": (
                 attribution.get("pricing_timing_unattributable_usd") if attribution else None
             ),
+        },
+        # ── Explicit transaction costs (alpha-engine-config-I8188) ──────────
+        # Named cost lines and the gross/net split they make possible. Before
+        # this block there was no transaction-cost figure anywhere in the P&L
+        # artifacts, so gross and net performance were the same number and
+        # neither was labelled. ``commission_available`` is carried so an
+        # ABSENT commission figure never renders as a measured $0.00.
+        "transaction_costs": {
+            "commission_usd": recon.get("commission_usd"),
+            "commission_available": recon.get("commission_available"),
+            "slippage_usd": recon.get("slippage_usd"),
+            "slippage_bps": recon.get("slippage_bps"),
+            "traded_notional_usd": recon.get("traded_notional_usd"),
+            "total_cost_usd": recon.get("total_cost_usd"),
+            "daily_return_net_pct": recon.get("daily_return_net_pct"),
+            "daily_return_gross_pct": recon.get("daily_return_gross_pct"),
+        },
+        # Outcome of the integrity gates, so the surface a human reads carries
+        # the same verdict the pipeline exit code does.
+        "integrity": {
+            "breaches": list(integrity_breaches or []),
+            "twr_closure": twr_closure,
+            "dividend_accrual_available": dividend_accrual_available,
+            "spy_return_basis": "total_return",
         },
         "data_warnings": list(data_warnings or []),
         "alpha_attribution": attribution,

@@ -25,14 +25,31 @@ from nousergon_lib.logging import guard_entrypoint, setup_logging
 from nousergon_lib.trading_calendar import previous_trading_day
 
 from executor import reference_rate
+from executor.dividends import (
+    SPY_TICKER,
+    accrue_position_dividends,
+    fetch_ex_dividends,
+    spy_total_return_pct,
+)
 from executor.eod_emailer import send_eod_email
 from executor.eod_report import build_eod_report, write_eod_report
+from executor.pnl_integrity import (
+    check_custodian_marks,
+    check_residual_bounds,
+    gross_net_returns,
+    plan_twr_self_heal,
+    session_costs,
+    verify_twr_closes,
+)
 from executor.trade_logger import (
     backup_to_s3,
+    dividend_receivable_usd,
     get_entry_trade,
     get_todays_trades,
     init_db,
     log_eod,
+    record_dividend_accrual,
+    settle_due_dividend_accruals,
 )
 
 # See executor/main.py for the rationale on IB Error 10197 / 10349 suppression.
@@ -964,6 +981,33 @@ def run(
     # prior *eod_pnl* DATE (the same baseline ``prior_nav`` uses, so SPY and
     # the portfolio measure the same interval across a skipped session), but
     # the close VALUE is always the authoritative settled close for that date.
+    # ── Ex-date dividends for the interval (alpha-engine-config-I8188) ──────
+    # Fetched ONCE for the held names and SPY together, so both legs of the
+    # comparison are on the same return definition and the same interval.
+    # The window is (prior eod_pnl date, run_date] — the same interval
+    # prior_nav spans — so a skipped session cannot drop a dividend or count
+    # one twice.
+    prior_date_str = prior_row[0] if prior_row and prior_row[0] else None
+    (
+        ex_dividends,
+        ex_dividend_pay_dates,
+        dividend_accrual_available,
+        dividend_warning,
+    ) = fetch_ex_dividends(
+        list(positions.keys()), run_date, prior_date=prior_date_str,
+    )
+    if dividend_warning:
+        data_warnings.append(dividend_warning)
+    spy_dividend_per_share = ex_dividends.get(SPY_TICKER, 0.0)
+
+    # SPY TOTAL return, not price return (alpha-engine-config-I8188, defect 3).
+    # The portfolio leg is NAV-based and therefore already total return, so
+    # leaving the benchmark on price return understated it by ~0.50pp over
+    # 2026-03-09 -> 2026-08-21 and overstated reported alpha by the same
+    # amount. Distributions going ex in the interval are added to the ending
+    # close; spy_close itself is left as the PRICE close so the stored column
+    # keeps its meaning and the adjustment stays inspectable
+    # (spy_dividend_per_share is persisted beside it).
     spy_price = _spy_close(run_date, config)
     spy_return = None
     if spy_price:
@@ -974,7 +1018,17 @@ def run(
         if prior_date_row:
             prior_spy = _spy_close(prior_date_row[0], config)
             if prior_spy:
-                spy_return = (spy_price / prior_spy - 1) * 100
+                spy_return = spy_total_return_pct(
+                    spy_close=spy_price,
+                    prior_spy_close=prior_spy,
+                    spy_dividend_per_share=spy_dividend_per_share,
+                )
+                if spy_dividend_per_share:
+                    logger.info(
+                        "SPY total return for %s includes $%.4f/share of "
+                        "distributions going ex in (%s, %s]",
+                        run_date, spy_dividend_per_share, prior_date_row[0], run_date,
+                    )
             else:
                 logger.warning("Could not fetch settled SPY close for prior date %s", prior_date_row[0])
         else:
@@ -1196,6 +1250,51 @@ def run(
             ),
         )
 
+    # ── Explicit ex-date dividend accrual (alpha-engine-config-I8188) ───────
+    # dividend_usd summed to exactly $0.00 across all 115 live sessions while
+    # the book held LMT (34 sessions), CTAS (27), MA, COST, AXP, BRO and FAST
+    # — all payers — because the only source was IB's per-symbol accrual,
+    # which a paper account never populates (measured: 0 non-zero
+    # accrued_dividend values across 114 persisted snapshots) and which the
+    # code read as a genuine zero. The dividends were not lost from the RETURN
+    # (NAV is IB NetLiquidation, which the cash reaches); they were lost from
+    # the ATTRIBUTION and silently credited to the unattributed plug. This
+    # accrual moves them into a named line. SPY's own distribution is applied
+    # on the benchmark leg, not here.
+    dividend_accruals = accrue_position_dividends(
+        positions, prior_positions, ex_dividends,
+    )
+    dividend_accrued_usd = sum(a["amount_usd"] for a in dividend_accruals)
+    for accrual in dividend_accruals:
+        record_dividend_accrual(
+            conn,
+            ticker=accrual["ticker"],
+            ex_date=run_date,
+            pay_date=ex_dividend_pay_dates.get(accrual["ticker"]),
+            per_share=accrual["per_share"],
+            shares=accrual["shares"],
+            amount_usd=accrual["amount_usd"],
+        )
+    # Release every receivable whose pay date has arrived. NAV is cash-basis on
+    # this account, so this is the day the dividend actually reaches NAV.
+    dividend_released_usd, dividend_released_rows = settle_due_dividend_accruals(
+        conn, run_date,
+    )
+    # The term that keeps the identity closed on BOTH dates: on the ex-date
+    # position P&L gains the accrual while NAV has not moved, on the pay date
+    # NAV gains the cash while position P&L has not moved, and this difference
+    # cancels each in turn.
+    dividend_timing_usd = dividend_accrued_usd - dividend_released_usd
+    dividend_receivable = dividend_receivable_usd(conn)
+    if dividend_accruals or dividend_released_rows:
+        logger.info(
+            "Dividends %s: accrued $%.2f across %d name(s) | released $%.2f "
+            "across %d accrual(s) | timing $%+.2f | receivable outstanding $%.2f",
+            run_date, dividend_accrued_usd, len(dividend_accruals),
+            dividend_released_usd, len(dividend_released_rows),
+            dividend_timing_usd, dividend_receivable,
+        )
+
     # data_warnings was initialized at the top of run() and accumulates gap
     # flags (per-position N/A, headline multi-session) plus the NAV residual
     # appended below; it is also extended by _build_position_contexts.
@@ -1230,7 +1329,17 @@ def run(
         # only, summing positive accrual deltas for the email.
         dividend_usd = sum(p.get("dividend_usd", 0.0) for p in positions.values())
 
-        unattributed_usd = total_nav_change - total_day_usd - interest_usd
+        # dividend_timing_usd is SUBTRACTED because it is the difference
+        # between what position P&L has recognised and what NAV has received:
+        # on the ex-date it is +dividend and NAV has not moved, on the pay date
+        # it is -dividend and position P&L has not moved. Without this term,
+        # ex-date accrual against a cash-basis NAV would trade the attribution
+        # error for a timing one -- the residual would read -dividend on the
+        # ex-date and +dividend on the pay date instead of simply +dividend
+        # once (alpha-engine-config-I8188, defect 3).
+        unattributed_usd = (
+            total_nav_change - total_day_usd - interest_usd + dividend_timing_usd
+        )
 
         # ── Pricing & timing reconciliation ──────────────────────────────────
         # The headline NAV is IB NetLiquidation; per-position P&L is settled
@@ -1284,17 +1393,67 @@ def run(
             unattributed_usd - rotation_realized_usd - pricing_timing_usd
         )
 
+        # ── Explicit transaction costs (alpha-engine-config-I8188, defect 2) ──
+        # There was no transaction-cost line anywhere in the P&L schema, so
+        # gross and net performance were the same number and neither was
+        # labelled. Sourced from FILLS: commission from IB's per-execution
+        # commissionReport, slippage as implementation shortfall against the
+        # arrival price (measured over the live window: 468 fills, +6.4bp
+        # of traded notional).
+        #
+        # NOTE the residual measurement that reshaped this deliverable: the
+        # residual's turnover dependence (-$222/turnover-day) is NOT these
+        # costs. Reconstructing rotation_realized_usd over the 74 sessions
+        # with attribution columns accounts for -$20,815 of the -$20,293 raw
+        # plug, leaving +$522. Costs are a real and separate gap; they were
+        # never the residual, and the cost lines are therefore reported
+        # alongside the reconciliation rather than folded into it.
+        costs = session_costs(trades_today_rows)
+        returns_split = gross_net_returns(
+            nav_change_usd=total_nav_change,
+            prior_nav=prior_nav,
+            commission_usd=costs["commission_usd"],
+            slippage_usd=costs["slippage_usd"],
+        )
+        if costs["n_fills"] and not costs["commission_available"]:
+            data_warnings.append(
+                f"Commission unknown for {run_date}: {costs['n_fills']} fill(s) "
+                "executed and IB attached no commissionReport to any of them. "
+                "The net-of-cost return is therefore missing its commission "
+                "leg — an ABSENT figure, not a measured $0.00."
+            )
+
         nav_reconciliation = {
             "nav_change_usd": total_nav_change,
             "position_pnl_usd": total_day_usd,
             "interest_usd": interest_usd,
             "dividend_usd": dividend_usd,
+            "dividend_timing_usd": dividend_timing_usd,
+            "dividend_receivable_usd": dividend_receivable,
             "unattributed_usd": unattributed_usd,
             "pricing_timing_usd": pricing_timing_usd,
             "pricing_timing_available": pricing_timing_available,
             "rotation_realized_usd": rotation_realized_usd,
             "unattributed_true_usd": unattributed_true_usd,
+            "commission_usd": costs["commission_usd"],
+            "slippage_usd": costs["slippage_usd"],
+            "traded_notional_usd": costs["traded_notional_usd"],
+            "commission_available": costs["commission_available"],
+            "slippage_bps": costs["slippage_bps"],
+            "daily_return_net_pct": returns_split["daily_return_net_pct"],
+            "daily_return_gross_pct": returns_split["daily_return_gross_pct"],
+            "total_cost_usd": returns_split["total_cost_usd"],
         }
+        logger.info(
+            "Costs: commission=$%.2f (available=%s) | slippage=$%+.0f (%s) | "
+            "notional=$%.0f | net=%s | gross=%s",
+            costs["commission_usd"], costs["commission_available"],
+            costs["slippage_usd"],
+            f"{costs['slippage_bps']:.1f}bp" if costs["slippage_bps"] is not None else "n/a",
+            costs["traded_notional_usd"],
+            f"{returns_split['daily_return_net_pct']:.4f}%" if returns_split["daily_return_net_pct"] is not None else "n/a",
+            f"{returns_split['daily_return_gross_pct']:.4f}%" if returns_split["daily_return_gross_pct"] is not None else "n/a",
+        )
         logger.info(
             "NAV recon: Δ=$%.0f | positions=$%.0f | interest=$%.0f | "
             "dividends=$%.0f | rotation=$%.0f | pricing&timing=$%.0f | "
@@ -1472,6 +1631,56 @@ def run(
     unattributed_pct_for_log = _compute_unattributed_residual_pct(
         unattributed_for_log, nav,
     )
+
+    # ── Integrity gates (alpha-engine-config-I8188) ─────────────────────────
+    # Both gates are evaluated BEFORE the row is written and their outcome is
+    # persisted with it, so a red pipeline never costs us the evidence that
+    # made it red. The RAISE is deferred to the end of run() — after the row,
+    # the S3 exports, the report artifact and the email — because losing the
+    # day's artifacts is strictly worse than a late failure, and the operator
+    # needs the artifacts to diagnose the breach.
+    integrity_breaches: list[dict] = []
+
+    # Bound the residual. Prefer the TRUE residual (rotation + pricing&timing
+    # lifted out); fall back to the raw plug only when the sleeves could not
+    # be computed, and say so — bounding the plug means bounding a number that
+    # legitimately moves with turnover.
+    residual_bounded = nav_reconciliation.get("unattributed_true_usd")
+    residual_basis = "unattributed_true_usd"
+    if residual_bounded is None:
+        residual_bounded = unattributed_for_log
+        residual_basis = "unattributed_usd (raw plug — sleeves unavailable)"
+    trailing_residuals = [
+        float(r[0])
+        for r in conn.execute(
+            "SELECT COALESCE(unattributed_true_usd, unattributed_usd) FROM eod_pnl "
+            "WHERE date < ? AND COALESCE(unattributed_true_usd, unattributed_usd) "
+            "IS NOT NULL ORDER BY date DESC LIMIT ?",
+            (run_date, 200),
+        ).fetchall()
+    ][::-1]
+    residual_breaches = check_residual_bounds(
+        unattributed_true_usd=residual_bounded,
+        nav=nav,
+        trailing_residuals_usd=trailing_residuals,
+        run_date=run_date,
+    )
+    for breach in residual_breaches:
+        breach["basis"] = residual_basis
+        logger.error("P&L INTEGRITY BREACH: %s", breach["message"])
+        data_warnings.append(breach["message"])
+    integrity_breaches.extend(residual_breaches)
+
+    # Custodian marks: promoted from flag to failure. The soft
+    # ib_mark_outside_range flag is unchanged and still populates.
+    mark_breaches = check_custodian_marks(
+        ib_mark_range_flags, nav=nav, run_date=run_date,
+    )
+    for breach in mark_breaches:
+        logger.error("CUSTODIAN MARK BREACH: %s", breach["message"])
+        data_warnings.append(breach["message"])
+    integrity_breaches.extend(mark_breaches)
+
     log_eod(conn, {
         "date": run_date,
         "portfolio_nav": nav,
@@ -1490,7 +1699,111 @@ def run(
         "dividend_usd": nav_reconciliation.get("dividend_usd"),
         "unattributed_usd": unattributed_for_log,
         "unattributed_residual_pct": unattributed_pct_for_log,
+        "pricing_timing_usd": nav_reconciliation.get("pricing_timing_usd"),
+        "rotation_realized_usd": nav_reconciliation.get("rotation_realized_usd"),
+        "unattributed_true_usd": nav_reconciliation.get("unattributed_true_usd"),
+        "commission_usd": nav_reconciliation.get("commission_usd"),
+        "slippage_usd": nav_reconciliation.get("slippage_usd"),
+        "traded_notional_usd": nav_reconciliation.get("traded_notional_usd"),
+        "commission_available": nav_reconciliation.get("commission_available"),
+        "daily_return_net_pct": nav_reconciliation.get("daily_return_net_pct"),
+        "daily_return_gross_pct": nav_reconciliation.get("daily_return_gross_pct"),
+        "dividend_accrual_available": dividend_accrual_available,
+        "spy_dividend_per_share": spy_dividend_per_share,
+        "dividend_timing_usd": dividend_timing_usd,
+        "dividend_receivable_usd": dividend_receivable,
+        "integrity_breach_json": (
+            json.dumps(integrity_breaches) if integrity_breaches else None
+        ),
     })
+
+    # ── TWR closure + self-heal (alpha-engine-config-I8188, defect 4) ────────
+    # Runs AFTER today's row is persisted so the check covers the session being
+    # written. Chain-linked daily_return_pct and the NAV ratio are identically
+    # equal by construction absent external flows — every stored return is
+    # (nav - prior_nav)/prior_nav against the immediately preceding persisted
+    # row — so any drift is a stored value that no longer agrees with the NAV
+    # series it came from. Measured live: 17.4bp of drift, 100% of it from ONE
+    # row (2026-04-07, whose 2026-04-06 baseline was corrected after it was
+    # written and never recomputed). Recomputing that row moves the chain-link
+    # from +3.8261% to +3.6526%, matching the NAV ratio to 3e-5pp.
+    #
+    # The repair is applied here rather than filed as an operator step, per the
+    # automation principle: a detector that stays red until a human runs a
+    # backfill is a page, not a fix. It is bounded — a correction larger than
+    # TWR_SELF_HEAL_MAX_CORRECTION_PCT is REFUSED and raises instead, because
+    # at that size the disagreement is a different NAV series (an external
+    # flow, a restated snapshot), not a stale derived value.
+    twr_rows = [
+        {"date": r[0], "portfolio_nav": r[1], "daily_return_pct": r[2]}
+        for r in conn.execute(
+            "SELECT date, portfolio_nav, daily_return_pct FROM eod_pnl "
+            "WHERE portfolio_nav IS NOT NULL ORDER BY date"
+        ).fetchall()
+    ]
+    heal_plan = plan_twr_self_heal(twr_rows)
+    for correction in heal_plan["corrections"]:
+        conn.execute(
+            "UPDATE eod_pnl SET daily_return_pct = ?, "
+            "daily_alpha_pct = CASE WHEN spy_return_pct IS NULL THEN NULL "
+            "ELSE ? - spy_return_pct END WHERE date = ?",
+            (correction["to_pct"], correction["to_pct"], correction["date"]),
+        )
+        logger.warning(
+            "TWR self-heal: %s daily_return_pct %+.6f%% -> %+.6f%% "
+            "(%+.6fpp) — the stored value disagreed with the persisted NAV "
+            "series, which is ground truth. daily_alpha_pct recomputed on the "
+            "same row.",
+            correction["date"], correction["from_pct"],
+            correction["to_pct"], correction["delta_pct"],
+        )
+        data_warnings.append(
+            f"TWR self-heal restated {correction['date']} daily_return_pct "
+            f"{correction['from_pct']:+.4f}% -> {correction['to_pct']:+.4f}% "
+            "(stored value disagreed with the persisted NAV series)."
+        )
+    if heal_plan["corrections"]:
+        conn.commit()
+        twr_rows = [
+            {"date": r[0], "portfolio_nav": r[1], "daily_return_pct": r[2]}
+            for r in conn.execute(
+                "SELECT date, portfolio_nav, daily_return_pct FROM eod_pnl "
+                "WHERE portfolio_nav IS NOT NULL ORDER BY date"
+            ).fetchall()
+        ]
+    for refusal in heal_plan["refused"]:
+        msg = (
+            f"TWR self-heal REFUSED for {refusal['date']}: stored "
+            f"{refusal['from_pct']:+.4f}% vs NAV-implied {refusal['to_pct']:+.4f}% "
+            f"— {refusal['reason']}"
+        )
+        logger.error(msg)
+        data_warnings.append(msg)
+        integrity_breaches.append({"kind": "twr_self_heal_refused", **refusal,
+                                   "message": msg})
+
+    twr = verify_twr_closes(twr_rows)
+    if twr.get("status") == "ok" and not twr["closes"]:
+        logger.error("TWR CLOSURE BREACH: %s", twr["message"])
+        data_warnings.append(twr["message"])
+        integrity_breaches.append({"kind": "twr_closure", **{
+            k: twr[k] for k in
+            ("chain_linked_pct", "nav_ratio_pct", "drift_bps", "tolerance_bps",
+             "n_sessions", "message")
+        }})
+    elif twr.get("status") == "ok":
+        logger.info(
+            "TWR closes: chain-linked %+.4f%% vs NAV ratio %+.4f%% over %d "
+            "sessions (%+.2fbp drift, tolerance %.0fbp)",
+            twr["chain_linked_pct"], twr["nav_ratio_pct"], twr["n_sessions"],
+            twr["drift_bps"], twr["tolerance_bps"],
+        )
+    if integrity_breaches:
+        conn.execute(
+            "UPDATE eod_pnl SET integrity_breach_json = ? WHERE date = ?",
+            (json.dumps(integrity_breaches), run_date),
+        )
+        conn.commit()
 
     # ── Sector attribution ──────────────────────────────────────────────────
     # Daily contribution = today's per-position P&L as % of NAV (not cumulative
@@ -1666,6 +1979,9 @@ def run(
             conn=conn,
             account_snapshot=account,
             nav_reconciliation=nav_reconciliation,
+            integrity_breaches=integrity_breaches,
+            twr_closure=twr,
+            dividend_accrual_available=dividend_accrual_available,
             position_narratives=position_narratives,
             sector_attribution=sector_attribution,
             roundtrip_stats=roundtrip_stats,
@@ -1779,6 +2095,34 @@ def run(
     if fd:
         fd.log_summary(logger)
     conn.close()
+
+    # ── Deferred integrity RAISE (alpha-engine-config-I8188) ────────────────
+    # Every artifact of the session is now durable — the eod_pnl row (with the
+    # breach recorded in integrity_breach_json), the S3 CSV exports, the
+    # reconciliation audit, the report artifact, the email. Only now does the
+    # run fail, so the pipeline goes red WITHOUT costing the operator the
+    # evidence needed to diagnose it. Default is RAISE per the fleet fail-loud
+    # rule: a residual bound that only warns is the defect this closes.
+    if integrity_breaches:
+        summary = "; ".join(b.get("message", b.get("kind", "?")) for b in integrity_breaches)
+        if fd:
+            fd.report(
+                RuntimeError(summary),
+                severity="error",
+                context={
+                    "site": "eod_pnl_integrity_gate",
+                    "run_date": run_date,
+                    "kinds": sorted({b.get("kind", "?") for b in integrity_breaches}),
+                    "n_breaches": len(integrity_breaches),
+                },
+            )
+        raise RuntimeError(
+            f"EOD P&L integrity gate failed for {run_date} "
+            f"({len(integrity_breaches)} breach(es)). All artifacts for the "
+            f"session were written before this raise; the breach detail is "
+            f"persisted in eod_pnl.integrity_breach_json. {summary}"
+        )
+
     logger.info("EOD reconciliation complete")
 
 
