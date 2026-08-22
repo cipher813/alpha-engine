@@ -14,6 +14,8 @@ import logging
 
 from ib_insync import MarketOrder, Order, Stock
 
+from executor.ibkr import fill_commission_usd
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +61,7 @@ def place_bracket_with_stop(
             "filled_shares": None,
             "fill_time": None,
             "trail_amount": None,
+            "commission_usd": None,
         }
 
     trail_amount = round(atr_value * atr_multiple, 2)
@@ -95,6 +98,7 @@ def place_bracket_with_stop(
     fill_price = None
     filled_shares = None
     fill_time = None
+    commission_usd = None
 
     if buy_trade.fills:
         total_qty = sum(f.execution.shares for f in buy_trade.fills)
@@ -102,6 +106,7 @@ def place_bracket_with_stop(
         fill_price = round(total_cost / total_qty, 4) if total_qty > 0 else None
         filled_shares = int(total_qty)
         fill_time = buy_trade.fills[-1].execution.time.isoformat() if buy_trade.fills[-1].execution.time else None
+        commission_usd = fill_commission_usd(buy_trade.fills)
 
     # Normalize status
     if status == "Filled":
@@ -158,4 +163,5 @@ def place_bracket_with_stop(
         "filled_shares": filled_shares,
         "fill_time": fill_time,
         "trail_amount": trail_amount,
+        "commission_usd": commission_usd,
     }

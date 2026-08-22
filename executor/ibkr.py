@@ -39,6 +39,41 @@ the stalled subscription is registered against this clientId on the
 gateway, so a fresh request on the same socket inherits the stall."""
 
 
+def fill_commission_usd(fills) -> float | None:
+    """Σ of the per-execution commission IB reports on ``fills``, or None.
+
+    ``None`` and ``0.0`` are DIFFERENT facts and must not render identically:
+    ``None`` means IB attached no ``commissionReport`` to any execution (the
+    figure is unknown), ``0.0`` means it reported zero. Collapsing the two is
+    how "paper-account commissions are trivial" became "there is no
+    transaction-cost line anywhere in the P&L schema"
+    (alpha-engine-config-I8188, defect 2) — the caller persists this onto
+    ``trades.commission_usd`` and ``pnl_integrity.session_costs`` reports
+    ``commission_available`` from whether any row carried a value.
+
+    Sign is normalised to POSITIVE = a cost to the book; IB reports the debit
+    as a positive number already, but a negative rebate must not silently
+    subtract from the session's cost line.
+    """
+    if not fills:
+        return None
+    total = 0.0
+    seen = False
+    for f in fills:
+        report = getattr(f, "commissionReport", None)
+        if report is None:
+            continue
+        value = getattr(report, "commission", None)
+        if value in (None, ""):
+            continue
+        try:
+            total += abs(float(value))
+        except (TypeError, ValueError):
+            continue
+        seen = True
+    return total if seen else None
+
+
 class IBKRClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 1, reconnect_attempts: int = 3):
         self.ib = IB()
@@ -373,12 +408,14 @@ class IBKRClient:
         filled_shares = None
         fill_time = None
 
+        commission_usd = None
         if trade.fills:
             total_qty = sum(f.execution.shares for f in trade.fills)
             total_cost = sum(f.execution.shares * f.execution.price for f in trade.fills)
             fill_price = round(total_cost / total_qty, 4) if total_qty > 0 else None
             filled_shares = int(total_qty)
             fill_time = trade.fills[-1].execution.time.isoformat() if trade.fills[-1].execution.time else None
+            commission_usd = fill_commission_usd(trade.fills)
 
         # Normalize status
         if status == "Filled":
@@ -405,6 +442,7 @@ class IBKRClient:
             "fill_price": fill_price,
             "filled_shares": filled_shares,
             "fill_time": fill_time,
+            "commission_usd": commission_usd,
         }
 
     # ── Historical data ───────────────────────────────────────────────────────
@@ -611,6 +649,11 @@ class SimulatedIBKRClient:
             "fill_price": price,
             "filled_shares": shares,
             "fill_time": None,
+            # Simulated fills have no broker commission report. None (not 0.0)
+            # is the honest value: the simulator does not know what the
+            # commission would have been, and a simulated run must not
+            # manufacture a $0.00 cost line (alpha-engine-config-I8188).
+            "commission_usd": None,
         }
 
     def get_historical_bar(self, ticker: str, date: str) -> dict | None:

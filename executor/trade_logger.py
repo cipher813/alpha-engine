@@ -129,6 +129,18 @@ _TRADES_MIGRATIONS = [
     # "does this ticker have ANY executed entry today" (get_executed_entry_tickers,
     # too coarse — would also block a legitimate same-day top-up decision).
     "ALTER TABLE trades ADD COLUMN entry_id TEXT",
+    # ── Explicit transaction costs (alpha-engine-config-I8188, defect 2) ──
+    # Per-execution commission as IB reports it
+    # (``Fill.commissionReport.commission``, summed by
+    # ``ibkr.fill_commission_usd``). NULL means IB attached no commission
+    # report to any execution — an UNKNOWN figure, which is a different fact
+    # from a reported $0.00 and must not render identically. Before this
+    # column there was no transaction-cost line anywhere in the schema, so
+    # gross and net performance were the same number and neither was
+    # labelled; ``pnl_integrity.session_costs`` aggregates this into the
+    # session's ``commission_usd`` and reports ``commission_available`` from
+    # whether any filled row carried a value.
+    "ALTER TABLE trades ADD COLUMN commission_usd REAL",
 ]
 
 _EOD_MIGRATIONS = [
@@ -150,6 +162,41 @@ _EOD_MIGRATIONS = [
     "ALTER TABLE eod_pnl ADD COLUMN dividend_usd REAL",
     "ALTER TABLE eod_pnl ADD COLUMN unattributed_usd REAL",
     "ALTER TABLE eod_pnl ADD COLUMN unattributed_residual_pct REAL",
+    # ── Performance-measurement integrity (alpha-engine-config-I8188) ──────
+    # The attribution sleeves eod_reconcile has computed since config#2457 but
+    # never persisted. Without them eod_pnl.csv carried ONE undifferentiated
+    # plug, which is why −$20,293 of "unexplained" P&L looked unexplained:
+    # reconstructing rotation_realized_usd over the 74 sessions with
+    # attribution columns accounts for −$20,815 of it, leaving a TRUE residual
+    # of +$522. The bounded quantity is unattributed_true_usd, not the plug.
+    "ALTER TABLE eod_pnl ADD COLUMN pricing_timing_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN rotation_realized_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN unattributed_true_usd REAL",
+    # Explicit transaction costs + the gross/net split they make possible.
+    # commission_usd is a real cash debit already inside nav_change_usd;
+    # slippage_usd is implementation shortfall vs the arrival price, which
+    # never touched NAV, so the gross figure is an explicit counterfactual.
+    "ALTER TABLE eod_pnl ADD COLUMN commission_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN slippage_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN traded_notional_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN commission_available INTEGER",
+    "ALTER TABLE eod_pnl ADD COLUMN daily_return_net_pct REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN daily_return_gross_pct REAL",
+    # Dividend accrual honesty: an absent accrual and a genuine $0 day are
+    # different facts. dividend_usd summed to exactly $0.00 across all 115
+    # live sessions while the book held seven payers, because the IB paper
+    # feed populates no per-symbol accrual and the code read that as zero.
+    "ALTER TABLE eod_pnl ADD COLUMN dividend_accrual_available INTEGER",
+    "ALTER TABLE eod_pnl ADD COLUMN spy_dividend_per_share REAL",
+    # Integrity-gate outcomes, persisted BEFORE the run raises so a red
+    # pipeline never costs us the evidence that made it red.
+    "ALTER TABLE eod_pnl ADD COLUMN integrity_breach_json TEXT",
+    # accrued_today - released_today; the term that keeps the reconciliation
+    # identity closed on BOTH the ex-date and the pay date once dividends are
+    # accrued on the ex-date against a cash-basis NAV. See
+    # CREATE_DIVIDEND_ACCRUALS_TABLE above.
+    "ALTER TABLE eod_pnl ADD COLUMN dividend_timing_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN dividend_receivable_usd REAL",
 ]
 
 CREATE_SHADOW_BOOK_TABLE = """
@@ -195,6 +242,39 @@ CREATE TABLE IF NOT EXISTS eod_pnl (
 # log that answers *"how often is rule X firing, and how close was the
 # measured value to the threshold?"* — the answer the inventory checklist
 # requires per gate.
+# ── Dividend accrual ledger (alpha-engine-config-I8188, defect 3) ──────────
+# Dividends are accrued on the EX-DATE (the GIPS-correct treatment, and the
+# date on which the settled close drops by the distribution), but the headline
+# NAV is IB NetLiquidation, which is CASH-BASIS on this account: no per-symbol
+# AccruedDividend is reported and AccruedCash carries interest only. So the
+# cash reaches NAV weeks later, on the PAY date.
+#
+# Without a ledger, ex-date accrual would trade one attribution error for a
+# timing one: the residual would read -dividend on the ex-date and +dividend on
+# the pay date instead of simply +dividend once. This table is the receivable
+# that closes that gap. Each ex-date accrual is recorded with its pay date and
+# its dollar amount computed from the shares actually entitled; the reconcile
+# releases it on the pay date and reports the day's
+# ``dividend_timing_usd = accrued_today - released_today``, which is exactly
+# the term that makes the reconciliation identity hold on BOTH dates.
+#
+# ``accrual_id`` is ``ticker|ex_date`` so a re-reconcile of the same session is
+# idempotent — INSERT OR IGNORE, never a second accrual for the same event.
+CREATE_DIVIDEND_ACCRUALS_TABLE = """
+CREATE TABLE IF NOT EXISTS dividend_accruals (
+    accrual_id      TEXT PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    ex_date         TEXT NOT NULL,
+    pay_date        TEXT,
+    per_share       REAL,
+    shares          REAL,
+    amount_usd      REAL,
+    settled_date    TEXT,
+    created_at      TEXT NOT NULL
+);
+"""
+
+
 CREATE_RISK_EVENTS_TABLE = """
 CREATE TABLE IF NOT EXISTS risk_events (
     event_id          TEXT PRIMARY KEY,
@@ -232,6 +312,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
         + CREATE_EOD_TABLE
         + CREATE_SHADOW_BOOK_TABLE
         + CREATE_RISK_EVENTS_TABLE
+        + CREATE_DIVIDEND_ACCRUALS_TABLE
     )
     for migration in _TRADES_MIGRATIONS:
         try:
@@ -333,8 +414,8 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             spy_return_during_hold, realized_alpha_pct, days_held,
             slippage_vs_signal, trading_day, signal_trading_day,
             signal_date, prediction_date, entry_trigger,
-            stance, catalyst_date, entry_id, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            stance, catalyst_date, entry_id, commission_usd, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             trade_id,
@@ -383,6 +464,7 @@ def log_trade(conn: sqlite3.Connection, trade: dict) -> str:
             trade.get("stance"),
             trade.get("catalyst_date"),
             trade.get("entry_id"),
+            trade.get("commission_usd"),
             datetime.now(UTC).isoformat(),
         ),
     )
@@ -494,6 +576,19 @@ def log_risk_event(conn: sqlite3.Connection, event: dict) -> str:
     return event_id
 
 
+def _as_int_flag(value) -> int | None:
+    """SQLite has no BOOLEAN: persist a tri-state flag as 1/0/NULL.
+
+    NULL means "not evaluated this run" and is deliberately distinct from 0
+    ("evaluated, and the answer is no") — the whole class of defect
+    alpha-engine-config-I8188 records is an absent measurement rendering
+    identically to a measured zero.
+    """
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
 def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
     """Insert or replace an EOD P&L record.
 
@@ -513,8 +608,14 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
              total_cash, accrued_interest, unrealized_pnl, realized_pnl,
              nav_change_usd, position_pnl_usd, interest_usd, dividend_usd,
              unattributed_usd, unattributed_residual_pct,
+             pricing_timing_usd, rotation_realized_usd, unattributed_true_usd,
+             commission_usd, slippage_usd, traded_notional_usd,
+             commission_available, daily_return_net_pct, daily_return_gross_pct,
+             dividend_accrual_available, spy_dividend_per_share,
+             integrity_breach_json, dividend_timing_usd,
+             dividend_receivable_usd,
              created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             eod["date"],
@@ -534,6 +635,20 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("dividend_usd"),
             eod.get("unattributed_usd"),
             eod.get("unattributed_residual_pct"),
+            eod.get("pricing_timing_usd"),
+            eod.get("rotation_realized_usd"),
+            eod.get("unattributed_true_usd"),
+            eod.get("commission_usd"),
+            eod.get("slippage_usd"),
+            eod.get("traded_notional_usd"),
+            _as_int_flag(eod.get("commission_available")),
+            eod.get("daily_return_net_pct"),
+            eod.get("daily_return_gross_pct"),
+            _as_int_flag(eod.get("dividend_accrual_available")),
+            eod.get("spy_dividend_per_share"),
+            eod.get("integrity_breach_json"),
+            eod.get("dividend_timing_usd"),
+            eod.get("dividend_receivable_usd"),
             datetime.now(UTC).isoformat(),
         ),
     )
@@ -689,3 +804,93 @@ def backup_to_s3(db_path: str, run_date: str, s3_bucket: str) -> None:
         logger.info(f"trades.db backed up to s3://{s3_bucket}/trades/trades_latest.db")
     except Exception as e:
         logger.error("S3 backup failed (non-fatal): %s", e)
+
+
+# ── Dividend accrual ledger helpers (alpha-engine-config-I8188) ────────────
+
+def record_dividend_accrual(
+    conn: sqlite3.Connection,
+    *,
+    ticker: str,
+    ex_date: str,
+    pay_date: str | None,
+    per_share: float,
+    shares: float,
+    amount_usd: float,
+) -> bool:
+    """Record one ex-date dividend accrual. Returns True when newly inserted.
+
+    Idempotent on ``ticker|ex_date`` so re-reconciling a session (the canonical
+    correction path) cannot accrue the same distribution twice.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO dividend_accruals "
+        "(accrual_id, ticker, ex_date, pay_date, per_share, shares, "
+        " amount_usd, settled_date, created_at) "
+        "VALUES (?,?,?,?,?,?,?,NULL,?)",
+        (f"{ticker}|{ex_date}", ticker, ex_date, pay_date, per_share, shares,
+         amount_usd, datetime.now(UTC).isoformat()),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# A distribution whose feed record carries no pay date still settles into cash;
+# releasing it never would leave the receivable growing forever and the
+# residual permanently short by that amount. US equity pay dates run roughly
+# 2-4 weeks after the ex-date, so 30 calendar days releases late rather than
+# early -- and the day it lands is named in the log either way.
+DIVIDEND_PAY_DATE_FALLBACK_DAYS = 30
+
+
+def settle_due_dividend_accruals(
+    conn: sqlite3.Connection, run_date: str
+) -> tuple[float, list[dict]]:
+    """Release every accrual whose pay date has arrived. Returns (usd, rows).
+
+    Called once per reconcile. An accrual with a NULL pay date is released
+    ``DIVIDEND_PAY_DATE_FALLBACK_DAYS`` after its ex-date rather than being
+    stranded in the receivable forever.
+    """
+    from datetime import date as _date
+    from datetime import timedelta as _timedelta
+
+    rows = conn.execute(
+        "SELECT accrual_id, ticker, ex_date, pay_date, amount_usd "
+        "FROM dividend_accruals WHERE settled_date IS NULL"
+    ).fetchall()
+    due: list[dict] = []
+    for accrual_id, ticker, ex_date, pay_date, amount_usd in rows:
+        effective = pay_date
+        if not effective:
+            try:
+                effective = str(
+                    _date.fromisoformat(ex_date)
+                    + _timedelta(days=DIVIDEND_PAY_DATE_FALLBACK_DAYS)
+                )
+            except (TypeError, ValueError):
+                continue
+        if effective > run_date:
+            continue
+        due.append({
+            "accrual_id": accrual_id, "ticker": ticker, "ex_date": ex_date,
+            "pay_date": pay_date, "effective_pay_date": effective,
+            "amount_usd": float(amount_usd or 0.0),
+        })
+    for row in due:
+        conn.execute(
+            "UPDATE dividend_accruals SET settled_date = ? WHERE accrual_id = ?",
+            (run_date, row["accrual_id"]),
+        )
+    if due:
+        conn.commit()
+    return sum(r["amount_usd"] for r in due), due
+
+
+def dividend_receivable_usd(conn: sqlite3.Connection) -> float:
+    """Total accrued-but-not-yet-paid dividend currently outstanding."""
+    value = conn.execute(
+        "SELECT COALESCE(SUM(amount_usd), 0.0) FROM dividend_accruals "
+        "WHERE settled_date IS NULL"
+    ).fetchone()[0]
+    return float(value or 0.0)

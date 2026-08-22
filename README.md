@@ -23,7 +23,7 @@ Risk-gated trade executor. Reads research signals + predictor verdicts from S3, 
 
 ## Phase 2 measurement contribution
 
-Every fill, sizing decision, and risk-guard override is logged to SQLite + backed up to S3. Daily P&L is attributed in `eod_pnl.csv` with breakdowns for portfolio return, SPY benchmark, alpha, total cash, accrued interest, and unrealized vs realized P&L. The sizing path captures the input ladder (sector rating × conviction × upside × drawdown tier) at decision time so any position can be replayed against a different parameter set.
+Every fill, sizing decision, and risk-guard override is logged to SQLite + backed up to S3. Daily P&L is attributed in `eod_pnl.csv` with breakdowns for portfolio return, SPY benchmark (**total return**, distributions included), alpha, total cash, accrued interest, unrealized vs realized P&L, explicit transaction costs (commission and implementation shortfall, with the gross-of-cost and net-of-cost returns reported separately), and the attribution sleeves the residual decomposes into. The residual is bounded per-session and cumulatively and a breach fails the run. The sizing path captures the input ladder (sector rating × conviction × upside × drawdown tier) at decision time so any position can be replayed against a different parameter set.
 
 ## Architecture
 
