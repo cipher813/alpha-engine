@@ -8,7 +8,15 @@ pyyaml~=6.0
 setuptools>=83.0.0
 yfinance~=1.6.0
 numpy<3
-pandas~=3.0
+# pandas is CEILINGED BELOW 3 BY arcticdb, not by choice: arcticdb 6.23 (the
+# floor below) requires pandas<3, and arcticdb is the data store — there is no
+# build of this repo that keeps both `pandas~=3.0` and a working ArcticDB.
+# Dependabot#428 raised this to ~=3.0 in the majors group on 2026-08-07 and CI
+# went green, because nothing recompiles requirements.txt and the parity job
+# only installs the (unchanged) lock. The trading box has run pandas 2.3.3 the
+# whole time. Reverted to the ceiling that actually holds, and the lock is now
+# checked against this file (alpha-engine-config-I8309).
+pandas~=2.3
 pyarrow~=25.0
 # arcticdb: reads atr_14_pct from the universe library at morning planner time.
 # Single source of truth for ATR across the executor — pullback trigger scaling,
