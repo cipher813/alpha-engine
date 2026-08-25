@@ -33,7 +33,9 @@ from executor.dividends import (
 )
 from executor.eod_emailer import send_eod_email
 from executor.eod_report import build_eod_report, write_eod_report
+from executor.pnl_backfill import backfill_residual_sleeves
 from executor.pnl_integrity import (
+    RESIDUAL_CUMULATIVE_WINDOW_SESSIONS,
     check_custodian_marks,
     check_residual_bounds,
     gross_net_returns,
@@ -1415,6 +1417,14 @@ def run(
             commission_usd=costs["commission_usd"],
             slippage_usd=costs["slippage_usd"],
         )
+        if costs.get("n_fills_unclassified_action"):
+            data_warnings.append(
+                f"Slippage incomplete for {run_date}: "
+                f"{costs['n_fills_unclassified_action']} fill(s) carried a trade "
+                "action the cost vocabulary does not classify, so their "
+                "implementation shortfall is missing while their notional still "
+                "counts — slippage_bps is understated, not absent."
+            )
         if costs["n_fills"] and not costs["commission_available"]:
             data_warnings.append(
                 f"Commission unknown for {run_date}: {costs['n_fills']} fill(s) "
@@ -1647,26 +1657,71 @@ def run(
     # legitimately moves with turnover.
     residual_bounded = nav_reconciliation.get("unattributed_true_usd")
     residual_basis = "unattributed_true_usd"
+    basis_is_true_residual = True
     if residual_bounded is None:
         residual_bounded = unattributed_for_log
         residual_basis = "unattributed_usd (raw plug — sleeves unavailable)"
+        basis_is_true_residual = False
+        data_warnings.append(
+            f"Cumulative P&L residual gate NOT EVALUATED for {run_date}: the "
+            "attribution sleeves could not be computed, so today's residual is "
+            "the raw plug and summing it into a true-residual window would "
+            "compare two different quantities. The per-session bound still "
+            "applied."
+        )
+    # Heal the window before reading it. The three sleeve columns were added
+    # as bare ALTER TABLEs with no backfill, so every row written before that
+    # migration carries NULL — reconstruct them from what IS persisted rather
+    # than letting the window fall back to a different quantity.
+    backfill_result = backfill_residual_sleeves(conn)
+    for skipped_date, why in backfill_result["skipped"]:
+        logger.warning(
+            "Residual sleeves unreconstructible for %s (%s) — that session is "
+            "EXCLUDED from the cumulative residual window, not substituted.",
+            skipped_date, why,
+        )
+
+    # ONE basis, or none. The trailing window must hold the same quantity the
+    # bound was derived for (unattributed_true_usd, measured at +$522 over 74
+    # sessions). Coalescing onto the raw plug — which carries realized rotation
+    # P&L and sums to -$20,293 over that same window BY CONSTRUCTION — mixes
+    # two different numbers into one sum and breaches on the first run and
+    # every run after it. That is what failed eod-2026-08-24-1787601606:
+    # 62 raw-plug rows plus one true residual, judged against a true-residual
+    # bound. A short window is the honest outcome when history is missing; a
+    # window silently filled with a different quantity is not.
     trailing_residuals = [
         float(r[0])
         for r in conn.execute(
-            "SELECT COALESCE(unattributed_true_usd, unattributed_usd) FROM eod_pnl "
-            "WHERE date < ? AND COALESCE(unattributed_true_usd, unattributed_usd) "
-            "IS NOT NULL ORDER BY date DESC LIMIT ?",
-            (run_date, 200),
+            "SELECT unattributed_true_usd FROM eod_pnl "
+            "WHERE date < ? AND unattributed_true_usd IS NOT NULL "
+            "ORDER BY date DESC LIMIT ?",
+            (run_date, RESIDUAL_CUMULATIVE_WINDOW_SESSIONS - 1),
         ).fetchall()
     ][::-1]
+    residual_window_sessions = len(trailing_residuals) + 1
+    if residual_window_sessions < RESIDUAL_CUMULATIVE_WINDOW_SESSIONS:
+        # Measurability: a gate running on a partial window is not the same
+        # fact as a gate running on a full one, and "no data" is never green.
+        # The bound is an absolute dollar bound, so a partial window still
+        # fires legitimately — it is only less able to miss.
+        logger.warning(
+            "Cumulative residual window is %d/%d session(s) deep on the "
+            "true-residual basis — the gate is live but shallower than its "
+            "derivation assumes.",
+            residual_window_sessions, RESIDUAL_CUMULATIVE_WINDOW_SESSIONS,
+        )
     residual_breaches = check_residual_bounds(
         unattributed_true_usd=residual_bounded,
         nav=nav,
         trailing_residuals_usd=trailing_residuals,
         run_date=run_date,
+        basis_is_true_residual=basis_is_true_residual,
     )
     for breach in residual_breaches:
         breach["basis"] = residual_basis
+        breach["window_sessions"] = residual_window_sessions
+        breach["window_sessions_expected"] = RESIDUAL_CUMULATIVE_WINDOW_SESSIONS
         logger.error("P&L INTEGRITY BREACH: %s", breach["message"])
         data_warnings.append(breach["message"])
     integrity_breaches.extend(residual_breaches)

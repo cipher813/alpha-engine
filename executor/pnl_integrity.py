@@ -112,6 +112,7 @@ def check_residual_bounds(
     nav: float | None,
     trailing_residuals_usd: Sequence[float] | None = None,
     run_date: str = "",
+    basis_is_true_residual: bool = True,
 ) -> list[dict[str, Any]]:
     """Bound the P&L residual per-session AND cumulatively.
 
@@ -122,7 +123,17 @@ def check_residual_bounds(
 
     ``trailing_residuals_usd`` is the persisted history of the same quantity,
     OLDEST-first and EXCLUDING today; today's value is appended here so the
-    cumulative check always includes the session being written.
+    cumulative check always includes the session being written. The window and
+    today's value MUST be the same quantity: the raw plug carries realized
+    rotation P&L and sums to −$20,293 over the measurement window by
+    construction, so one plug inside a true-residual sum breaches a bound
+    derived for a quantity measured at +$522.
+
+    ``basis_is_true_residual`` is False when the caller had to fall back to the
+    raw plug for TODAY. The per-session bound still applies — loudly, and
+    labelled — but the cumulative check is SKIPPED rather than run on a mixed
+    window, and the caller records the skip. A gate that cannot be evaluated on
+    one basis reports that it was not evaluated; it does not report a pass.
 
     Returns a list of breach dicts (empty when both bounds hold). Each breach
     carries ``kind`` (``"per_session"`` / ``"cumulative"``), the measured
@@ -156,6 +167,9 @@ def check_residual_bounds(
             ),
         })
 
+    if not basis_is_true_residual:
+        return breaches
+
     window = list(trailing_residuals_usd or [])[-(RESIDUAL_CUMULATIVE_WINDOW_SESSIONS - 1):]
     window.append(float(unattributed_true_usd))
     cumulative = sum(window)
@@ -186,8 +200,22 @@ def check_residual_bounds(
 # 2. Transaction costs — commission and implementation shortfall
 # ─────────────────────────────────────────────────────────────────────────────
 
+# The trade-action vocabulary, classified by what the fill does to the POSITION
+# (COVER increases it — buying stock back to close a short — which is why it is
+# buy-side here even though eod_report prices it on the exit leg).
+#
+# These must cover every action the executor actually emits. They did not:
+# LIQUIDATION_SELL and EMERGENCY_SELL are real actions in eod_report's own
+# vocabulary and were absent here, so a forced exit fell through the side
+# classification and its implementation shortfall was dropped from the
+# slippage line while its notional still counted — diluting slippage_bps on
+# exactly the days most likely to have the worst of it. TRIM/ADD are the
+# reverse case: named here, emitted nowhere. Unclassified fills are now
+# COUNTED and surfaced rather than skipped in silence.
 _BUY_ACTIONS = {"BUY", "ENTER", "ADD", "COVER"}
-_SELL_ACTIONS = {"SELL", "EXIT", "REDUCE", "TRIM"}
+_SELL_ACTIONS = {
+    "SELL", "EXIT", "REDUCE", "TRIM", "LIQUIDATION_SELL", "EMERGENCY_SELL",
+}
 
 
 def session_costs(trades_today: Iterable[Mapping[str, Any]] | None) -> dict[str, Any]:
@@ -221,6 +249,8 @@ def session_costs(trades_today: Iterable[Mapping[str, Any]] | None) -> dict[str,
     """
     n_fills = 0
     n_with_commission = 0
+    n_unclassified = 0
+    n_no_arrival = 0
     commission = 0.0
     slippage = 0.0
     notional = 0.0
@@ -251,7 +281,11 @@ def session_costs(trades_today: Iterable[Mapping[str, Any]] | None) -> dict[str,
 
         arrival = t.get("price_at_order")
         action = str(t.get("action") or "").upper()
-        if arrival in (None, "") or action not in (_BUY_ACTIONS | _SELL_ACTIONS):
+        if action not in (_BUY_ACTIONS | _SELL_ACTIONS):
+            n_unclassified += 1
+            continue
+        if arrival in (None, ""):
+            n_no_arrival += 1
             continue
         try:
             arrival = float(arrival)
@@ -268,6 +302,11 @@ def session_costs(trades_today: Iterable[Mapping[str, Any]] | None) -> dict[str,
         "traded_notional_usd": notional,
         "n_fills": n_fills,
         "n_fills_with_commission": n_with_commission,
+        # Fills excluded from the slippage leg, by reason. A dropped fill still
+        # sits in traded_notional_usd, so a silent drop understates slippage_bps
+        # rather than leaving it absent — the caller surfaces these.
+        "n_fills_unclassified_action": n_unclassified,
+        "n_fills_without_arrival_price": n_no_arrival,
         "commission_available": n_fills == 0 or n_with_commission > 0,
         "slippage_bps": (slippage / notional * 10_000.0) if notional else None,
     }
