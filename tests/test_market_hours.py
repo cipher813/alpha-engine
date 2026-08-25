@@ -19,12 +19,12 @@ silent drift.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import re
 from datetime import date, datetime, time
 
 import krepis.trading_calendar as krepis_calendar
-import pytest
 import pytz
 
 from executor import market_hours
@@ -113,25 +113,42 @@ class TestCloseOverride:
             importlib.reload(market_hours)
 
 
-class TestCollapseTrigger:
-    """Self-clearing reminder, wired to the condition rather than a date.
+class TestDelegatesToKrepis:
+    """Replaces ``TestCollapseTrigger``, which fired and was deleted.
 
-    ``is_market_hours`` is the one piece of logic still duplicated between
-    this module and ``krepis.trading_calendar`` (krepis >= 0.55.0). It stays
-    here only because this repo's uv lockfile pins ``krepis==0.16.2`` and
-    re-resolving that lockfile is a trading-daemon-wide change unrelated to
-    the boundary alpha-engine-config-I7111 ships.
-
-    This test fails the moment the pin catches up, so the collapse lands in
-    the same PR as the bump instead of waiting to be remembered.
+    The trigger's job was to make the duplicate impossible to forget. These
+    two make it impossible to reintroduce: one asserts the session predicate
+    is krepis's, the other asserts the one thing this module still owns — the
+    close override — actually reaches it. A reimplementation that happened to
+    agree with krepis today would pass neither.
     """
 
-    def test_local_copy_is_deleted_once_krepis_provides_it(self):
-        if hasattr(krepis_calendar, "is_market_hours"):
-            pytest.fail(
-                "krepis.trading_calendar.is_market_hours is now available at the "
-                "pinned krepis version. Delete executor.market_hours.is_market_hours "
-                "and re-export krepis's (passing open_et/close_et for the "
-                "MARKET_CLOSE_HOUR/MINUTE override), then delete this test. "
-                "Tracked: alpha-engine-config-I7149."
-            )
+    def test_session_predicate_is_krepis_not_a_local_reimplementation(self, monkeypatch):
+        calls = []
+
+        def fake(now=None, *, open_et=None, close_et=None):
+            calls.append({"now": now, "open_et": open_et, "close_et": close_et})
+            return True
+
+        monkeypatch.setattr(market_hours, "_krepis_is_market_hours", fake)
+        assert market_hours.is_market_hours(datetime(2026, 8, 24, 11, 0)) is True
+        assert len(calls) == 1, "is_market_hours did not go through krepis"
+
+    def test_the_close_override_reaches_krepis(self, monkeypatch):
+        """MARKET_CLOSE_HOUR/MINUTE is the ONE thing krepis cannot know."""
+        monkeypatch.setenv("MARKET_CLOSE_HOUR", "15")
+        monkeypatch.setenv("MARKET_CLOSE_MINUTE", "30")
+        reloaded = importlib.reload(market_hours)
+        try:
+            calls = []
+
+            def fake(now=None, *, open_et=None, close_et=None):
+                calls.append(close_et)
+                return False
+
+            monkeypatch.setattr(reloaded, "_krepis_is_market_hours", fake)
+            reloaded.is_market_hours(datetime(2026, 8, 24, 15, 45))
+            assert calls == [time(15, 30)]
+        finally:
+            monkeypatch.undo()
+            importlib.reload(market_hours)
