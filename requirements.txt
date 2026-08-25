@@ -53,8 +53,20 @@ eventkit==1.0.3
     # via ib-insync
 exchange-calendars==4.13.2
     # via -r requirements.in
-flow-doctor==0.8.6
+flow-doctor==0.16.0
     # via krepis
+    # PINNED FORWARD BY HAND, not by a recompile (alpha-engine-config-I8298).
+    # Below 0.16.0 a notifier preflight raises a transport failure as a config
+    # error ON THE IMPORT PATH: TimeoutError is not a URLError, so an
+    # unreachable api.telegram.org killed alpha-engine-predictor-inference at
+    # import and degraded two postclose safety gates on 2026-08-24.
+    # `uv pip compile requirements.in` cannot regenerate this file today —
+    # requirements.in floors pandas>=3.0 while arcticdb>=6.23 requires
+    # pandas<3, so the resolve is unsatisfiable (alpha-engine-config-I8309).
+    # `anthropic` below is now orphaned: krepis 0.54.0 requests
+    # flow-doctor[diagnosis], an extra 0.15.0 removed. It stays pinned rather
+    # than hand-pruned, because hand-pruning a lock's transitive closure is
+    # how a lock stops describing what installs.
 h11==0.16.0
     # via httpcore
 highspy==1.15.1
