@@ -119,3 +119,73 @@ def test_boot_pull_deploy_gate_uses_import_smoke_test():
     assert "ast.parse" not in src, (
         "obsolete ast.parse syntax-only check must be removed (config#2353)."
     )
+
+
+def test_boot_pull_deploy_gate_runs_after_dependency_install():
+    """alpha-engine-config-I8682: the import smoke test must run AFTER the pip
+    install, never before it.
+
+    Ordered the other way, the gate tests the NEW commit's code against the
+    PREVIOUS commit's installed dependency set, so any commit that bumps a pin
+    and uses the new API fails by construction — rolls back, reinstalls the
+    rolled-back manifest, and repeats identically at the next boot. Measured on
+    the trading box 2026-08-25/26: crucible-executor #493 (krepis
+    0.54.0 -> 0.59.33 plus `from krepis.trading_calendar import
+    is_market_hours`) was rolled back on every boot for three days, and the
+    2026-08-26 preopen failed at CodeFreshnessGate's CODE-STALE-AFTER-HEAL.
+    """
+    src = _BOOT_PULL.read_text()
+
+    gate = src.index("import executor.main, executor.daemon, executor.eod_reconcile")
+    pip_install = src.index('.venv/bin/pip install --quiet -r "$REQUIREMENTS_FILE"')
+
+    assert pip_install < gate, (
+        "the deploy gate's import smoke test runs BEFORE the pip install — it "
+        "would test new code against the previous commit's dependencies, which "
+        "makes every dependency-bumping commit permanently un-deployable."
+    )
+
+
+def test_boot_pull_deploy_gate_rollback_is_counted_as_a_failure():
+    """alpha-engine-config-I8682: a rollback must increment PULL_FAILURES.
+
+    The rollback is the one path that knowingly leaves the trading box on stale
+    code for a live session, and it was the only path in this script that
+    emitted no signal — no counter, no alert, exit 0. On 2026-08-25 the preopen
+    went green and the session traded #492 while origin/main was #493, with
+    nothing said anywhere.
+    """
+    src = _BOOT_PULL.read_text()
+
+    rollback = src.index('log "ROLLBACK $repo')
+    tail = src[rollback : rollback + 400]
+
+    assert "PULL_FAILURES=$((PULL_FAILURES + 1))" in tail, (
+        "the deploy-gate rollback does not increment PULL_FAILURES, so "
+        "boot-pull exits 0 and its krepis.alerts publish never fires."
+    )
+    assert "deploy-gate rollback" in tail, (
+        "the rollback must name itself in FAILED_REPOS — the alert body is "
+        "built from that list, and 'alpha-engine (git)' would misreport a "
+        "successful sync that was deliberately reverted."
+    )
+
+
+def test_boot_pull_deploy_gate_rollback_runs_under_shared_flock():
+    """alpha-engine-config-I8682: the rollback's `git reset --hard` must take
+    the same advisory lock as every other git writer on the box.
+
+    Unlocked, it can land between the weekday CodeFreshnessGate's self-heal and
+    that gate's re-check — which is exactly what decided the 2026-08-26 preopen
+    failure and the 2026-08-25 silent stale-code session. The two are opposed
+    writers; serialising them makes the outcome deterministic instead of a race.
+    """
+    src = _BOOT_PULL.read_text()
+
+    rollback_block = src[src.index('log "FAIL $repo — import smoke test failed') :]
+    rollback_block = rollback_block[: rollback_block.index('log "ROLLBACK $repo')]
+
+    assert '"$GIT_SYNC_LOCK"' in rollback_block, (
+        "the rollback reset runs outside the shared git flock and can race the "
+        "weekday CodeFreshnessGate's heal."
+    )
