@@ -288,26 +288,15 @@ for repo in "${REPOS[@]}"; do
     # and it judges success on the post-condition rather than on git's exit code.
     # The ownership reclaim above runs OUTSIDE the lock deliberately (it is not a
     # git-index op; a test pins that the reclaim still precedes the sync).
+    # The deploy gate that used to live here now runs AFTER the pip install
+    # below — see the block at the end of this loop body for why the ordering
+    # is the fix and not an incidental tidy-up.
     if sync_repo_to_main "$repo"; then
+        SYNC_OK=1
         NEW_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none")
-
-        # Deploy gate: import smoke test (catches syntax + transitive
-        # ImportErrors; no IB Gateway connection needed). Imports pull the full
-        # transitive module graph, so a broken dependency in any executor module
-        # surfaces here pre-planner, not at runtime.
-        if [ "$repo" = "/home/ec2-user/alpha-engine" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
-            if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
-                log "GATE $repo — running import smoke test..."
-                if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
-                    log "OK   $repo — import smoke test passed"
-                else
-                    log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
-                    git reset --hard "$PREV_SHA" >> "$LOG" 2>&1
-                    log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
-                fi
-            fi
-        fi
     else
+        SYNC_OK=0
+        NEW_SHA="$PREV_SHA"
         PULL_FAILURES=$((PULL_FAILURES + 1))
         FAILED_REPOS+=("$repo (git)")
     fi
@@ -348,6 +337,60 @@ for repo in "${REPOS[@]}"; do
             log "FAIL $repo — pip install failed (from $REQUIREMENTS_FILE)"
             PULL_FAILURES=$((PULL_FAILURES + 1))
             FAILED_REPOS+=("$repo (pip)")
+        fi
+    fi
+
+    # ── Deploy gate: import smoke test ────────────────────────────────────
+    # Catches syntax errors and transitive ImportErrors; no IB Gateway
+    # connection needed. Imports pull the full transitive module graph, so a
+    # broken dependency in any executor module surfaces here pre-planner
+    # rather than at runtime.
+    #
+    # It runs AFTER the pip install above, and that ordering IS the fix
+    # (alpha-engine-config-I8682). It used to sit inside the sync branch, so it
+    # tested the NEW commit's code against the PREVIOUS commit's installed
+    # dependency set. Any commit that bumps a pin and uses the new API failed
+    # this gate by construction, was rolled back, and then had the rolled-back
+    # commit's requirements.txt reinstalled over it — a stable loop with no
+    # exit, re-run identically at every boot. Measured 2026-08-25/26 on the
+    # trading box: #493 (krepis 0.54.0 -> 0.59.33, plus `from
+    # krepis.trading_calendar import is_market_hours` in executor/market_hours.py)
+    # rolled back on every boot with `ImportError: cannot import name
+    # 'is_market_hours'`, and the 2026-08-26 preopen died at
+    # CodeFreshnessGate's CODE-STALE-AFTER-HEAL because that gate heals forward
+    # to origin/main while this rollback pushes back — the two are opposed
+    # writers and the outcome was decided by which finished last.
+    #
+    # A rollback is a FAILURE and is counted as one. It previously neither
+    # incremented PULL_FAILURES nor alerted, which made the one path that
+    # knowingly leaves the trading box on stale code the only path in this
+    # script with no signal at all: on 2026-08-25 the preopen went green and
+    # the session traded #492 while origin/main was #493, silently.
+    if [ "$SYNC_OK" -eq 1 ] && [ "$repo" = "/home/ec2-user/alpha-engine" ] \
+            && [ "$PREV_SHA" != "$NEW_SHA" ]; then
+        if [ -f ".venv/bin/python" ] && [ -f "executor/main.py" ]; then
+            log "GATE $repo — running import smoke test (post-deps)..."
+            if .venv/bin/python -c "import executor.main, executor.daemon, executor.eod_reconcile" >> "$LOG" 2>&1; then
+                log "OK   $repo — import smoke test passed"
+            else
+                log "FAIL $repo — import smoke test failed, rolling back to $PREV_SHA"
+                # Under the SAME advisory lock every other git writer on this
+                # box takes (config#1944), so a rollback cannot land between the
+                # weekday CodeFreshnessGate's heal and its re-check.
+                flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" \
+                    git -C "$repo" reset --hard "$PREV_SHA" >> "$LOG" 2>&1 \
+                    || log "WARN $repo — rollback reset failed; tree left at $NEW_SHA"
+                # Deps were just installed from $NEW_SHA's manifest. Restore the
+                # set the reverted code was actually tested against, or the box
+                # is left on a code/dependency combination nothing has ever run.
+                if [ -f ".venv/bin/pip" ] && [ -f "$REQUIREMENTS_FILE" ]; then
+                    .venv/bin/pip install --quiet -r "$REQUIREMENTS_FILE" >> "$LOG" 2>&1 \
+                        || log "WARN $repo — post-rollback pip install failed; venv may not match $PREV_SHA"
+                fi
+                log "ROLLBACK $repo — reverted to $(git log --oneline -1)"
+                PULL_FAILURES=$((PULL_FAILURES + 1))
+                FAILED_REPOS+=("$repo (deploy-gate rollback)")
+            fi
         fi
     fi
 done
