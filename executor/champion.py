@@ -55,6 +55,8 @@ from executor.alpha_contract import (
     ANCHOR_FIELD,
     ANCHOR_SOURCE_FIELD,
     OPTIMIZER_ALPHA_ANCHOR,
+    AlphaAnchorError,
+    _numeric_alpha,
     center_to_market_relative,
 )
 
@@ -71,32 +73,53 @@ CHALLENGER_SELECTION_LATEST_KEY = "thinktank/challenger_selection/latest.json"
 VALID_CHAMPIONS = (
     "agentic",
     "scanner_predictor_direct",
-    "scanner_predictor_top20",
+    "scanner_top20_predictor",
     "thinktank_coverage",
 )
 
-# alpha-engine-config-I8755 — the entry-selection slot's second arm.
+# alpha-engine-config-I8755 — the entry-selection arm the pipeline was already
+# shaped for.
 #
-# Brian's ruling 2026-08-27: "lets run the top 20 is the entry for predictor
-# rather than the top 60 in a champion/challenger setup so we can see which
-# performs better and promote the winner."
+# Brian, 2026-08-27: "Im saying top 20 attractiveness from scanner, which is
+# evaluated weekly, gets passed to the predictor as an arm to research's
+# champion/challenger" — and, on the predictor's output: "the predictor's live
+# daily output is downstream of what the scanner provides, correct? The scanner
+# should be providing the top 20 to predictor, weekly."
 #
-# `scanner_predictor_top20` is `scanner_predictor_direct` with ONE thing
-# changed: the pool it may select from. Both arms read the same research-free
-# parquet, the same `predicted_alpha` per (ticker, prediction_date), the same
-# centering, the same N. The champion selects from the whole scored cohort (the
-# scanner-passing pool, 60 names on 2026-08-21); this arm selects only from the
-# cut the predictor itself resolves from.
+# It is, and that settles what this arm reads. The live chain is:
 #
-# The pool is therefore the ONLY treatment, which is what makes the comparison
-# answer "which pool selects better" rather than "which alpha is better"
-# (champion-challenger-policy.md §4 — hold everything constant except the thing
-# under test).
+#   Scanner (weekly) -> universe_membership/{date}/membership.json
+#                       predictor_universe_cut: attractiveness_top_20
+#                                  |
+#   Predictor (daily) -> predictor/predictions/{date}.json
+#                        canonical/predicted_alpha per name, already stamped
+#                        alpha_anchor = market_relative_21d_log
+#                                  |
+#   Executor          -> this arm
 #
-# Count-matching (§4) is at the OUTPUT, N=10 for both arms, NOT at pool size.
-# Differing pool widths are the treatment, not an unmatched comparison — a
-# future reader will otherwise see 60-vs-20 and read it as the confound §4
-# forbids. Stated here so that reading is not available.
+# `scanner_top20_predictor` selects the top N by the PREDICTOR'S OWN alpha,
+# restricted to the weekly cut the predictor resolves from. There is no second
+# ranking to choose between: the predictor's output IS the scanner's top-20,
+# scored.
+#
+# It therefore reads NOTHING that `_apply_scanner_predictor_direct` reads. That
+# arm consumes `predictor/research_free_backfill/...parquet`, a parallel weekly
+# feed of the meta-model with the four research features zeroed, whose cohort is
+# the scanner's 60 and which never touches the predictor's cut. Measured
+# 2026-08-27 on the live artifacts: the research-free parquet covered 8 of the
+# 20 cut members, the predictor's live output covered 20 of 20, and the two
+# alphas ranked their 12 overlapping names at Spearman 0.587. They are two
+# different rules, which is why both run as arms.
+#
+# Count-matching (champion-challenger-policy.md §4) is at the OUTPUT: every arm
+# in this slot emits `champion_top_n_default` = 10 entries. The differing input
+# widths are the treatment under test, not an unmatched comparison.
+#
+# Nothing is injected into `predictions_by_ticker`. The other two arms must
+# synthesize prediction records because their picks come from outside the
+# predictor's output; this arm's picks ARE that output, already on the declared
+# anchor, so `assert_predictions_cover_buy_candidates` passes by construction
+# rather than by fabrication.
 _MEMBERSHIP_LATEST_KEY = "universe_membership/latest.json"
 _MEMBERSHIP_MAX_AGE_DAYS = 10
 
@@ -579,11 +602,8 @@ def apply_champion_selection(
             pointer=pointer,
         )
 
-    if champion == "scanner_predictor_top20":
-        pool, cut_name = _resolve_predictor_cut_pool(
-            bucket, run_date, s3_client=s3_client or boto3.client("s3"),
-        )
-        return _apply_scanner_predictor_direct(
+    if champion == "scanner_top20_predictor":
+        return _apply_scanner_top20_predictor(
             signals_raw,
             predictions_by_ticker,
             bucket=bucket,
@@ -592,9 +612,6 @@ def apply_champion_selection(
             sector_map=sector_map,
             s3_client=s3_client,
             pointer=pointer,
-            pool=pool,
-            arm_name="scanner_predictor_top20",
-            pool_cut_name=cut_name,
         )
 
     if champion == "thinktank_coverage":
@@ -691,7 +708,7 @@ def _resolve_predictor_cut_pool(
 
     if fresh is None:
         raise ChampionPointerError(
-            "scanner_predictor_top20 champion selected but no universe "
+            "scanner_top20_predictor champion selected but no universe "
             f"membership artifact resolved within {_MEMBERSHIP_MAX_AGE_DAYS} "
             f"days of {run_date} (looked at {_MEMBERSHIP_LATEST_KEY} and dated "
             "keys). Refusing to select from an unknown pool — falling back to "
@@ -707,10 +724,10 @@ def _resolve_predictor_cut_pool(
         raise ChampionPointerError(
             f"universe membership {doc.get('run_date')} (s3://{bucket}/{key}) "
             f"names predictor_universe_cut={cut_name!r} but that cut is empty "
-            "or absent — scanner_predictor_top20 has no pool to select from."
+            "or absent — scanner_top20_predictor has no pool to select from."
         )
     logger.info(
-        "[champion] scanner_predictor_top20 pool: cut=%s %d name(s) from %s "
+        "[champion] scanner_top20_predictor pool: cut=%s %d name(s) from %s "
         "(membership run_date=%s)",
         cut_name, len(tickers), key, doc.get("run_date"),
     )
@@ -727,21 +744,17 @@ def _apply_scanner_predictor_direct(
     sector_map: dict[str, str] | None,
     s3_client,
     pointer: dict,
-    pool: set[str] | None = None,
-    arm_name: str = "scanner_predictor_direct",
-    pool_cut_name: str | None = None,
 ) -> tuple[dict, dict]:
     """``scanner_predictor_direct`` arm — see ``apply_champion_selection``
     docstring for the full contract. Extracted verbatim (config-I2518) so
     ``apply_champion_selection`` can dispatch across multiple arms without a
     single function growing without bound.
 
-    ``pool`` (alpha-engine-config-I8755) restricts which cohort members this arm
-    may select from; ``None`` means the whole scored cohort, which is the
-    champion's behaviour and is bit-identical to before. ``scanner_predictor_top20``
-    passes the predictor's own cut. Everything else — the parquet, the alpha per
-    name, the centering, N — is shared, so the pool is the only treatment
-    (champion-challenger-policy.md §4).
+    This arm's pool is the research-free parquet's whole scored cohort — the
+    scanner-passing set, 60 names on 2026-08-21. It reads nothing the predictor
+    produced. The arm that goes through the predictor is
+    ``_apply_scanner_top20_predictor``; the two are separate functions on
+    purpose, because they share no input.
     """
     max_days = int(config.get("champion_freshness_max_days", 8))
     cohort = _load_research_free_cohort(bucket, s3_client=s3_client)
@@ -796,55 +809,10 @@ def _apply_scanner_predictor_direct(
     centered, xsec_mean_removed = center_to_market_relative(cohort_sorted["predicted_alpha"].tolist())
     cohort_sorted["predicted_alpha_market_relative"] = centered
 
-    # Centering happens over the FULL scored cohort for every arm, BEFORE the
-    # pool filter, on purpose. A pool is a high-alpha subset by construction, so
-    # centering over it would subtract a SELECTED mean and systematically
-    # understate the arm's alphas against the solve's SPY=0 anchor. Centering
-    # over the full cross-section keeps each name's injected alpha identical
-    # whichever arm picked it — which is the property that makes the pool the
-    # only treatment. Centering is a constant shift, so it never changes the
-    # ordering or the selected set either way; what it changes is SIZING, and
-    # sizing is exactly where a per-pool mean would leak the treatment.
-    scored_cohort_size = len(cohort_sorted)
-    n_pool_missing_from_cohort = 0
-    if pool is not None:
-        pool_upper = {str(t).upper() for t in pool}
-        n_pool_missing_from_cohort = len(
-            pool_upper - {str(t).upper() for t in cohort_sorted["ticker"]}
-        )
-        if n_pool_missing_from_cohort:
-            # Not fatal — the arm still selects from what it has — but never
-            # silent: a short pool is indistinguishable from an arm that chose
-            # badly. The producer-side union (crucible-backtester,
-            # alpha-engine-config-I8755) is what keeps this at zero.
-            logger.warning(
-                "[champion] %s: %d of %d pool member(s) have no row in the "
-                "research-free cohort for %s — this arm is selecting from a "
-                "SHORT pool and its score reflects that, not its rule",
-                arm_name, n_pool_missing_from_cohort, len(pool_upper), latest_date,
-            )
-        cohort_sorted = (
-            cohort_sorted[cohort_sorted["ticker"].str.upper().isin(pool_upper)]
-            .reset_index(drop=True)
-        )
-        if cohort_sorted.empty:
-            raise ChampionPointerError(
-                f"{arm_name}: no member of pool {pool_cut_name or 'declared pool'} "
-                f"({len(pool_upper)} name(s)) has a row in the research-free "
-                f"cohort for {latest_date} — refusing to synthesize zero "
-                "candidates while reporting a healthy arm."
-            )
-
     top_n = cohort_sorted.head(n)
 
     score_floor = float(config.get("champion_score_floor", 60))
     score_ceiling = float(config.get("champion_score_ceiling", 95))
-    # Rank fraction is computed within THIS ARM'S pool, not the full scored
-    # cohort. The score band feeds `min_score`, so ranking a 20-name arm's picks
-    # against a 60-name cross-section would push most of them under the gate and
-    # silently gut the arm — it would look like it selected nothing rather than
-    # like it selected differently. For the champion, pool == cohort, so this is
-    # unchanged.
     cohort_size = len(cohort_sorted)
     sector_map = sector_map or {}
 
@@ -873,7 +841,7 @@ def _apply_scanner_predictor_direct(
             "price_target_upside": None,
             "catalyst_date": None,
             "thesis_summary": "research-free predictor champion (config#2364)",
-            "champion_arm": arm_name,
+            "champion_arm": "scanner_predictor_direct",
         }
         synthesized.append(entry)
 
@@ -897,21 +865,15 @@ def _apply_scanner_predictor_direct(
         }
 
     logger.info(
-        "[champion] %s selected %d/%d candidate(s) from cohort=%s age=%dd "
-        "(n_buy_candidates=%d, pool_size=%d, scored_cohort_size=%d)",
-        arm_name,
-        len(synthesized),
-        n,
-        latest_date,
-        staleness["age_days"],
-        n_buy_candidates,
-        cohort_size,
-        scored_cohort_size,
+        "[champion] scanner_predictor_direct selected %d/%d candidate(s) from "
+        "cohort=%s age=%dd (n_buy_candidates=%d, cohort_size=%d)",
+        len(synthesized), n, latest_date, staleness["age_days"],
+        n_buy_candidates, cohort_size,
     )
 
     new_signals_raw = dict(signals_raw)
     new_signals_raw["buy_candidates"] = synthesized
-    new_signals_raw["champion"] = arm_name
+    new_signals_raw["champion"] = "scanner_predictor_direct"
     new_signals_raw["promotion_source"] = pointer.get("promotion_source")
     # alpha-engine-config-I7216: carried on the artifact, not just logged, so a
     # consumer can render it and a stale feed is machine-visible. Emitted on
@@ -920,16 +882,11 @@ def _apply_scanner_predictor_direct(
         **staleness,
         "cohort_size": cohort_size,
         "n_selected": len(synthesized),
-        # alpha-engine-config-I8755: which pool this arm actually drew from,
-        # carried on the artifact rather than inferred from the arm's name.
-        # `scored_cohort_size` is the full cross-section the alphas were
-        # centered over; `cohort_size` is the pool the pick came from. For the
-        # champion the two are equal — emitted on every run either way, because
-        # an absent field is unmeasured, not fine.
-        "pool_cut": pool_cut_name,
+        # alpha-engine-config-I8755: the pool this arm drew from, named on the
+        # artifact rather than inferred from the arm's name — every arm in the
+        # slot emits this block, so a reader compares like with like.
+        "pool_source": "research_free_parquet",
         "pool_size": cohort_size,
-        "scored_cohort_size": scored_cohort_size,
-        "n_pool_missing_from_cohort": n_pool_missing_from_cohort,
         # alpha-engine-config-I7337: the common-mode level this adapter removed
         # to put its alphas on the optimizer's anchor. Carried on the artifact
         # and emitted on every run — a large or drifting value is the health
@@ -943,6 +900,164 @@ def _apply_scanner_predictor_direct(
     new_predictions_by_ticker.update(injected_predictions)
 
     return new_signals_raw, new_predictions_by_ticker
+
+
+def _apply_scanner_top20_predictor(
+    signals_raw: dict,
+    predictions_by_ticker: dict,
+    *,
+    bucket: str,
+    run_date: str,
+    config: dict,
+    sector_map: dict[str, str] | None,
+    s3_client,
+    pointer: dict,
+) -> tuple[dict, dict]:
+    """``scanner_top20_predictor`` arm — the scanner's weekly cut, scored by the
+    predictor (alpha-engine-config-I8755).
+
+    Brian, 2026-08-27: *"The scanner should be providing the top 20 to
+    predictor, weekly."* It does, and the predictor's daily output is that cut
+    scored — so this arm's ranking is simply the predictor's own
+    ``predicted_alpha`` over the members of ``predictor_universe_cut``.
+
+    What makes this arm SHORTER than the other two, rather than a variation on
+    them: its picks come from ``predictions_by_ticker``, which already exists,
+    is already on the declared ``market_relative_21d_log`` anchor, and is
+    already the vector ``optimizer_shadow._build_alpha_hat`` will solve over.
+    So there is nothing to synthesize, nothing to centre, and no anchor to
+    declare on this arm's behalf. ``scanner_predictor_direct`` and
+    ``thinktank_coverage`` must inject prediction records because their picks
+    come from outside the predictor's output; this arm's picks ARE that output.
+    ``assert_predictions_cover_buy_candidates`` therefore passes by
+    construction rather than by fabrication.
+
+    Two refusals, both deliberate:
+
+    * an unresolvable cut RAISES (in ``_resolve_predictor_cut_pool``) rather
+      than falling back to a wider set — a silent widening would make this arm
+      a duplicate of one it is measured against, which is a vacuous comparison
+      presented as a real one (champion-challenger-policy.md §4);
+    * a cut whose members carry no usable prediction RAISES rather than
+      synthesizing zero candidates under a healthy-looking arm.
+
+    A PARTIAL cut is reported, not refused: the arm still selects from what it
+    has, and ``champion_cohort`` carries how short the pool was, because an arm
+    scored on a short pool must not read as an arm that chose badly.
+    """
+    pool, cut_name = _resolve_predictor_cut_pool(
+        bucket, run_date, s3_client=s3_client or boto3.client("s3"),
+    )
+
+    # The predictor's cut ∩ the names it actually scored today. A held name
+    # outside the cut is deliberately NOT a candidate here: the predictor
+    # unions holdings into its scoring universe so exits can be decided, and
+    # this arm proposes ENTRIES.
+    scored: list[tuple[str, float, dict]] = []
+    for ticker in sorted(pool):
+        pred = predictions_by_ticker.get(ticker)
+        if not pred:
+            continue
+        alpha = _numeric_alpha(pred)
+        if alpha is None:
+            continue
+        declared = pred.get(ANCHOR_FIELD)
+        if declared is not None and declared != OPTIMIZER_ALPHA_ANCHOR:
+            # Ranking one anchor against another orders names by where their
+            # level was measured from, not by their alpha. Fatal for the same
+            # reason `assert_optimizer_anchor` is fatal downstream.
+            raise AlphaAnchorError(
+                f"scanner_top20_predictor: {ticker} declares "
+                f"{ANCHOR_FIELD}={declared!r}, not {OPTIMIZER_ALPHA_ANCHOR!r}. "
+                "Refusing to rank a mixed-anchor batch."
+            )
+        scored.append((ticker, alpha, pred))
+
+    n_pool = len(pool)
+    n_unscored = n_pool - len(scored)
+    if not scored:
+        raise ChampionPointerError(
+            f"scanner_top20_predictor: none of the {n_pool} name(s) in cut "
+            f"{cut_name!r} carries a usable predicted_alpha in this run's "
+            f"predictions ({len(predictions_by_ticker)} record(s)) — refusing "
+            "to synthesize zero candidates while reporting a healthy arm."
+        )
+    if n_unscored:
+        logger.warning(
+            "[champion] scanner_top20_predictor: %d of %d cut member(s) carry "
+            "no usable predicted_alpha — selecting from a SHORT pool, and the "
+            "arm's score reflects that rather than its rule",
+            n_unscored, n_pool,
+        )
+
+    scored.sort(key=lambda row: row[1], reverse=True)
+
+    n_buy_candidates = len(signals_raw.get("buy_candidates") or [])
+    n = n_buy_candidates if n_buy_candidates > 0 else int(
+        config.get("champion_top_n_default", 10)
+    )
+    top_n = scored[:n]
+
+    score_floor = float(config.get("champion_score_floor", 60))
+    score_ceiling = float(config.get("champion_score_ceiling", 95))
+    # Rank fraction is over the arm's OWN scored pool. The band feeds
+    # `min_score`, so ranking a 20-name arm against a wider cross-section would
+    # push most of its picks under the gate — the arm would look like it
+    # selected nothing rather than like it selected differently.
+    pool_size = len(scored)
+    sector_map = sector_map or {}
+
+    synthesized: list[dict] = []
+    for rank, (ticker, alpha, pred) in enumerate(top_n):
+        rank_fraction = rank / max(pool_size - 1, 1)
+        synthesized.append({
+            "signal": "ENTER",
+            "ticker": ticker,
+            "date": run_date,
+            "sector": sector_map.get(ticker, "Unknown"),
+            "score": _rank_to_score(rank_fraction, score_floor, score_ceiling),
+            "conviction": "medium",
+            # The predictor emits a stance per name; carry it rather than
+            # dropping it to None. It is what sizes the position downstream
+            # (max_position_pct x stance_multiplier), so discarding it would
+            # silently move every pick to the default cap.
+            "stance": pred.get("stance"),
+            "price_target_upside": None,
+            "catalyst_date": pred.get("catalyst_date"),
+            "thesis_summary": (
+                "scanner attractiveness top-20 (weekly), ranked by the "
+                "predictor's own alpha (alpha-engine-config-I8755)"
+            ),
+            "champion_arm": "scanner_top20_predictor",
+            "predicted_alpha": alpha,
+        })
+
+    logger.info(
+        "[champion] scanner_top20_predictor selected %d/%d from cut=%s "
+        "(pool=%d scored, %d unscored, n_buy_candidates=%d)",
+        len(synthesized), n, cut_name, pool_size, n_unscored, n_buy_candidates,
+    )
+
+    new_signals_raw = dict(signals_raw)
+    new_signals_raw["buy_candidates"] = synthesized
+    new_signals_raw["champion"] = "scanner_top20_predictor"
+    new_signals_raw["promotion_source"] = pointer.get("promotion_source")
+    new_signals_raw["champion_cohort"] = {
+        # No staleness block: this arm reads no separate feed. Its freshness IS
+        # the predictions file the rest of the run is already built on, and the
+        # cut's own age is gated in `_resolve_predictor_cut_pool`.
+        "pool_source": "predictor_predictions",
+        "pool_cut": cut_name,
+        "pool_declared_size": n_pool,
+        "pool_size": pool_size,
+        "n_cut_members_unscored": n_unscored,
+        "n_selected": len(synthesized),
+        "alpha_anchor": OPTIMIZER_ALPHA_ANCHOR,
+    }
+
+    # predictions_by_ticker is returned UNCHANGED and that is the point — see
+    # the docstring. Nothing is injected because nothing needs to be.
+    return new_signals_raw, predictions_by_ticker
 
 
 def _apply_thinktank_coverage(
