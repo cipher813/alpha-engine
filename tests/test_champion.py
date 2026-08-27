@@ -23,6 +23,7 @@ import pandas as pd
 import pytest
 from botocore.exceptions import ClientError
 
+from executor.alpha_contract import AlphaAnchorError
 from executor.champion import (
     CHALLENGER_SELECTION_LATEST_KEY,
     CHAMPION_POINTER_KEY,
@@ -1364,15 +1365,21 @@ class TestCohortStaleness:
         assert COHORT_FRESH_MAX_DAYS < 8
 
 
-# ── scanner_predictor_top20 (alpha-engine-config-I8755) ──────────────────────
+# ── scanner_top20_predictor (alpha-engine-config-I8755) ──────────────────────
 #
-# Brian's ruling 2026-08-27: run the predictor's top-20 as the entry pool
-# against the scanner-60 pool, champion/challenger, promote the winner.
+# Brian, 2026-08-27: "Im saying top 20 attractiveness from scanner, which is
+# evaluated weekly, gets passed to the predictor as an arm to research's
+# champion/challenger" — and "the predictor's live daily output is downstream
+# of what the scanner provides, correct? The scanner should be providing the
+# top 20 to predictor, weekly."
 #
-# The arm is `scanner_predictor_direct` with ONE thing changed — the pool. Every
-# test below is RED without the change: `scanner_predictor_top20` is not in
-# VALID_CHAMPIONS, so `load_champion_pointer` raises on the pointer value before
-# any of this is reachable.
+# So the arm ranks by the PREDICTOR'S OWN alpha over the weekly cut. It reads
+# nothing `_apply_scanner_predictor_direct` reads: that arm consumes the
+# research-free parquet, whose cohort is the scanner's 60 and which never
+# touches the predictor's cut. Measured 2026-08-27 on live artifacts — the
+# parquet covered 8 of the 20 cut members, the predictor's output covered
+# 20 of 20, and the two alphas ranked their 12 overlapping names at Spearman
+# 0.587.
 
 _MEMBERSHIP_LATEST = "universe_membership/latest.json"
 
@@ -1388,34 +1395,40 @@ def _membership_bytes(
             "run_date": run_date,
             "predictor_universe_cut": cut_name,
             "cuts": {
-                cut_name: {"tickers": tickers if tickers is not None else ["TKR003", "TKR004"]},
+                cut_name: {"tickers": tickers if tickers is not None else ["CUT0", "CUT1", "CUT2"]},
                 "scanner_champion_60": {"tickers": [f"TKR{i:03d}" for i in range(5)]},
             },
         }
     ).encode()
 
 
-class TestScannerPredictorTop20:
-    def _s3(self, *, cohort_date="2026-07-10", n=5, membership: bytes | None = None,
-            extra: dict | None = None):
-        objects = {
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_top20"),
-            RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows(cohort_date, n)),
+def _predictions(alphas: dict[str, float], *, anchor="market_relative_21d_log",
+                 stance="momentum") -> dict:
+    """predictions_by_ticker as the executor already holds it — records the
+    PREDICTOR wrote, already on the declared anchor."""
+    return {
+        t: {
+            "ticker": t,
+            "predicted_alpha": a,
+            "alpha_anchor": anchor,
+            "stance": stance,
+            "prediction_confidence": 0.1,
         }
+        for t, a in alphas.items()
+    }
+
+
+class TestScannerTop20Predictor:
+    def _s3(self, membership: bytes | None = None):
+        objects = {CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_top20_predictor")}
         if membership is not None:
             objects[_MEMBERSHIP_LATEST] = membership
-        objects.update(extra or {})
         return _FakeS3(objects)
 
-    def _run(self, s3, *, config=None, n_buy=0):
-        signals_raw = {
-            "date": "2026-07-13",
-            "buy_candidates": [],
-            "universe": [],
-        }
+    def _run(self, s3, preds, *, config=None):
         return apply_champion_selection(
-            signals_raw,
-            {},
+            {"date": "2026-07-13", "buy_candidates": [], "universe": []},
+            preds,
             bucket="test-bucket",
             run_date="2026-07-13",
             config=config or _CONFIG,
@@ -1423,188 +1436,137 @@ class TestScannerPredictorTop20:
             s3_client=s3,
         )
 
-    def test_selects_only_from_the_predictor_cut(self):
-        """The whole point: TKR000-002 have the HIGHEST alpha and are excluded,
-        because the pool is TKR003/TKR004."""
-        s3 = self._s3(membership=_membership_bytes(tickers=["TKR003", "TKR004"]))
+    def test_ranks_the_cut_by_the_predictors_own_alpha(self):
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1", "CUT2"]))
+        preds = _predictions({"CUT0": 0.01, "CUT1": 0.05, "CUT2": 0.03})
 
-        out_signals, out_preds = self._run(s3)
+        out, _ = self._run(s3, preds, config=dict(_CONFIG, champion_top_n_default=2))
 
-        entered = {c["ticker"] for c in out_signals["buy_candidates"]}
-        assert entered == {"TKR003", "TKR004"}, entered
-        assert out_signals["champion"] == "scanner_predictor_top20"
-        for c in out_signals["buy_candidates"]:
-            assert c["champion_arm"] == "scanner_predictor_top20"
+        assert [c["ticker"] for c in out["buy_candidates"]] == ["CUT1", "CUT2"]
+        assert out["champion"] == "scanner_top20_predictor"
 
-    def test_the_two_arms_disagree_on_the_same_cohort(self):
-        """The vacuity property, asserted rather than assumed
-        (champion-challenger-policy.md §4): the same parquet, the same alphas,
-        the same N — and a DIFFERENT picked set."""
-        cohort = _cohort_rows("2026-07-10", 5)
-        common = {RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(cohort)}
-        config = dict(_CONFIG, champion_top_n_default=2)
+    def test_reads_no_research_free_parquet_at_all(self):
+        """The arm shares no input with `scanner_predictor_direct`. The fake S3
+        has no parquet object, so a read would raise NoSuchKey."""
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1"]))
+        assert RESEARCH_FREE_PARQUET_KEY not in s3.objects
 
-        champ_s3 = _FakeS3({CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"), **common})
-        top20_s3 = _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_top20"),
-            _MEMBERSHIP_LATEST: _membership_bytes(tickers=["TKR003", "TKR004"]),
-            **common,
-        })
+        out, _ = self._run(s3, _predictions({"CUT0": 0.02, "CUT1": 0.01}))
 
-        champ_out, _ = self._run(champ_s3, config=config)
-        top20_out, _ = self._run(top20_s3, config=config)
+        assert len(out["buy_candidates"]) == 2
 
-        champ_picks = {c["ticker"] for c in champ_out["buy_candidates"]}
-        top20_picks = {c["ticker"] for c in top20_out["buy_candidates"]}
-        assert champ_picks == {"TKR000", "TKR001"}
-        assert top20_picks == {"TKR003", "TKR004"}
-        assert not (champ_picks & top20_picks), "arms must actually differ"
+    def test_predictions_are_returned_UNCHANGED(self):
+        """Nothing is injected. The picks ARE the predictor's output, already on
+        the declared anchor — the other arms must fabricate records because
+        their picks come from outside it."""
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1"]))
+        preds = _predictions({"CUT0": 0.02, "CUT1": 0.01})
+        before = json.loads(json.dumps(preds))
 
-    def test_alpha_is_identical_across_arms_for_a_name_both_could_pick(self):
-        """Centering happens over the FULL cohort before the pool filter, so a
-        name's injected alpha does not depend on which arm picked it. If it did,
-        the pool would no longer be the only treatment."""
-        cohort = _cohort_rows("2026-07-10", 5)
-        common = {RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(cohort)}
-        config = dict(_CONFIG, champion_top_n_default=5)
+        out, after = self._run(s3, preds)
 
-        champ_s3 = _FakeS3({CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"), **common})
-        top20_s3 = _FakeS3({
-            CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_top20"),
-            # A pool that is a strict subset, so TKR003 is pickable by both.
-            _MEMBERSHIP_LATEST: _membership_bytes(tickers=["TKR003", "TKR004"]),
-            **common,
-        })
+        assert after == before
+        assert_predictions_cover_buy_candidates(out, after)
 
-        _, champ_preds = self._run(champ_s3, config=config)
-        _, top20_preds = self._run(top20_s3, config=config)
+    def test_a_name_outside_the_cut_is_never_entered(self):
+        """The predictor unions HELD names into its scoring universe so exits
+        can be decided. This arm proposes ENTRIES, so a held name outside the
+        cut is not a candidate however high its alpha."""
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1"]))
+        preds = _predictions({"CUT0": 0.01, "CUT1": 0.005, "HELDX": 0.99})
 
-        assert champ_preds["TKR003"]["predicted_alpha"] == pytest.approx(
-            top20_preds["TKR003"]["predicted_alpha"]
-        )
-        assert champ_preds["TKR003"]["alpha_xsec_mean_removed"] == pytest.approx(
-            top20_preds["TKR003"]["alpha_xsec_mean_removed"]
-        )
+        out, _ = self._run(s3, preds)
 
-    def test_score_band_is_ranked_within_the_pool_not_the_full_cohort(self):
-        """TKR003 is 4th of 5 in the cohort but BEST in its 2-name pool, so it
-        must score at the ceiling. Ranking it against the full cross-section
-        would push it under `min_score` and silently gut the arm."""
-        s3 = self._s3(membership=_membership_bytes(tickers=["TKR003", "TKR004"]))
+        assert "HELDX" not in {c["ticker"] for c in out["buy_candidates"]}
 
-        out_signals, _ = self._run(s3)
+    def test_the_predictors_stance_is_carried_not_dropped(self):
+        """Stance sizes the position downstream (max_position_pct x
+        stance_multiplier); dropping it to None moves every pick to the default
+        cap silently."""
+        s3 = self._s3(_membership_bytes(tickers=["CUT0"]))
+        preds = _predictions({"CUT0": 0.02}, stance="quality")
 
-        by_ticker = {c["ticker"]: c for c in out_signals["buy_candidates"]}
-        assert by_ticker["TKR003"]["score"] == pytest.approx(_CONFIG["champion_score_ceiling"])
+        out, _ = self._run(s3, preds)
 
-    def test_cohort_block_records_the_pool_it_drew_from(self):
-        s3 = self._s3(membership=_membership_bytes(tickers=["TKR003", "TKR004"]))
+        assert out["buy_candidates"][0]["stance"] == "quality"
 
-        out_signals, _ = self._run(s3)
+    def test_a_mixed_anchor_batch_raises(self):
+        """Ranking one anchor against another orders names by where their level
+        was measured from, not by their alpha."""
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1"]))
+        preds = _predictions({"CUT0": 0.02, "CUT1": 0.01})
+        preds["CUT1"]["alpha_anchor"] = "raw_21d_log"
 
-        block = out_signals["champion_cohort"]
-        assert block["pool_cut"] == "attractiveness_top_20"
+        with pytest.raises(AlphaAnchorError, match="mixed-anchor"):
+            self._run(s3, preds)
+
+    def test_a_partially_scored_cut_is_REPORTED_not_refused(self):
+        """The arm still selects from what it has — but an arm scored on a
+        short pool must not read as an arm that chose badly."""
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1", "CUT2", "CUT3"]))
+        preds = _predictions({"CUT0": 0.02, "CUT1": 0.01})
+
+        out, _ = self._run(s3, preds)
+
+        block = out["champion_cohort"]
+        assert block["pool_declared_size"] == 4
         assert block["pool_size"] == 2
-        assert block["scored_cohort_size"] == 5
-        assert block["n_pool_missing_from_cohort"] == 0
+        assert block["n_cut_members_unscored"] == 2
+        assert block["pool_cut"] == "attractiveness_top_20"
+        assert block["pool_source"] == "predictor_predictions"
 
-    def test_pool_member_absent_from_the_cohort_is_counted(self):
-        """The producer-side union keeps this at zero; when it is not zero the
-        arm is selecting from a SHORT pool and the artifact says so."""
-        s3 = self._s3(membership=_membership_bytes(tickers=["TKR003", "NOTINCOHORT"]))
+    def test_a_wholly_unscored_cut_raises(self):
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1"]))
 
-        out_signals, _ = self._run(s3)
+        with pytest.raises(ChampionPointerError, match="usable predicted_alpha"):
+            self._run(s3, _predictions({"OTHER": 0.02}))
 
-        block = out_signals["champion_cohort"]
-        assert block["n_pool_missing_from_cohort"] == 1
-        assert block["pool_size"] == 1
-
-    def test_missing_membership_raises_rather_than_falling_back(self):
-        """A silent fallback to the full cohort would make this arm a duplicate
-        of the arm it is measured against — a vacuous comparison presented as a
-        real one."""
-        s3 = self._s3(membership=None)
-
+    def test_missing_membership_raises_rather_than_widening(self):
+        """A silent widening would make this arm a duplicate of one it is
+        measured against — a vacuous comparison presented as a real one."""
         with pytest.raises(ChampionPointerError, match="no universe membership"):
-            self._run(s3)
-
-    def test_membership_naming_an_absent_cut_raises(self):
-        s3 = self._s3(
-            membership=json.dumps(
-                {
-                    "run_date": "2026-07-13",
-                    "predictor_universe_cut": "attractiveness_top_20",
-                    "cuts": {"something_else": {"tickers": ["TKR003"]}},
-                }
-            ).encode()
-        )
-
-        with pytest.raises(ChampionPointerError, match="empty or absent"):
-            self._run(s3)
-
-    def test_stale_membership_beyond_the_age_limit_raises(self):
-        """Freshness is judged on the artifact's OWN run_date, never on S3
-        LastModified — a re-upload of a dead cycle must not read as fresh."""
-        s3 = self._s3(membership=_membership_bytes(run_date="2026-06-01"))
-
-        with pytest.raises(ChampionPointerError, match="no universe membership"):
-            self._run(s3)
-
-    def test_pool_disjoint_from_the_cohort_raises(self):
-        """Refusing beats synthesizing zero candidates while reporting a healthy
-        arm — a record asserting an action that never happened."""
-        s3 = self._s3(membership=_membership_bytes(tickers=["NOPE0", "NOPE1"]))
-
-        with pytest.raises(ChampionPointerError, match="no member of pool"):
-            self._run(s3)
+            self._run(self._s3(None), _predictions({"CUT0": 0.02}))
 
     def test_the_cut_name_comes_from_the_artifact_not_a_literal(self):
-        """champion-challenger-policy.md §7.5. The artifact points at a
-        differently-named cut; the arm must follow the pointer."""
-        s3 = self._s3(
-            membership=_membership_bytes(
-                cut_name="attractiveness_top_25", tickers=["TKR001"]
-            )
-        )
+        s3 = self._s3(_membership_bytes(cut_name="attractiveness_top_25", tickers=["CUT9"]))
 
-        out_signals, _ = self._run(s3)
+        out, _ = self._run(s3, _predictions({"CUT9": 0.02}))
 
-        assert {c["ticker"] for c in out_signals["buy_candidates"]} == {"TKR001"}
-        assert out_signals["champion_cohort"]["pool_cut"] == "attractiveness_top_25"
+        assert out["champion_cohort"]["pool_cut"] == "attractiveness_top_25"
+
+    def test_the_best_name_scores_at_the_ceiling(self):
+        """The band is ranked within the arm's OWN pool. Ranking against a
+        wider cross-section would push its picks under `min_score` and make the
+        arm look like it selected nothing."""
+        s3 = self._s3(_membership_bytes(tickers=["CUT0", "CUT1", "CUT2"]))
+
+        out, _ = self._run(s3, _predictions({"CUT0": 0.01, "CUT1": 0.05, "CUT2": 0.03}))
+
+        assert out["buy_candidates"][0]["ticker"] == "CUT1"
+        assert out["buy_candidates"][0]["score"] == pytest.approx(_CONFIG["champion_score_ceiling"])
 
 
-class TestScannerPredictorDirectUnchangedByThePoolParameter:
-    """The champion path must be bit-identical: pool defaults to None."""
+class TestScannerPredictorDirectIsUntouched:
+    """The incumbent stays a challenger and must be bit-identical."""
 
-    def test_champion_still_selects_from_the_whole_cohort(self):
-        s3 = _FakeS3(
-            {
-                CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
-                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-07-10", 5)),
-            }
-        )
+    def test_it_still_selects_from_the_whole_research_free_cohort(self):
+        s3 = _FakeS3({
+            CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
+            RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-07-10", 5)),
+        })
 
-        out_signals, _ = apply_champion_selection(
+        out, _ = apply_champion_selection(
             {"date": "2026-07-13", "buy_candidates": [], "universe": []},
-            {},
-            bucket="test-bucket",
-            run_date="2026-07-13",
-            config=_CONFIG,
-            sector_map={},
-            s3_client=s3,
+            {}, bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={}, s3_client=s3,
         )
 
-        assert {c["ticker"] for c in out_signals["buy_candidates"]} == {
-            f"TKR{i:03d}" for i in range(5)
-        }
-        block = out_signals["champion_cohort"]
-        assert block["pool_cut"] is None
-        assert block["pool_size"] == block["scored_cohort_size"] == 5
-        assert block["n_pool_missing_from_cohort"] == 0
+        assert {c["ticker"] for c in out["buy_candidates"]} == {f"TKR{i:03d}" for i in range(5)}
+        assert out["champion_cohort"]["pool_source"] == "research_free_parquet"
+        for c in out["buy_candidates"]:
+            assert c["champion_arm"] == "scanner_predictor_direct"
 
-    def test_champion_never_reads_the_membership_artifact(self):
-        """No extra S3 round-trip on the champion path."""
-
+    def test_it_never_reads_the_membership_artifact(self):
         class _Recording(_FakeS3):
             def __init__(self, objects):
                 super().__init__(objects)
@@ -1614,21 +1576,15 @@ class TestScannerPredictorDirectUnchangedByThePoolParameter:
                 self.reads.append(Key)
                 return super().get_object(Bucket=Bucket, Key=Key)
 
-        s3 = _Recording(
-            {
-                CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
-                RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-07-10", 5)),
-            }
-        )
+        s3 = _Recording({
+            CHAMPION_POINTER_KEY: _pointer_bytes(champion="scanner_predictor_direct"),
+            RESEARCH_FREE_PARQUET_KEY: _parquet_bytes(_cohort_rows("2026-07-10", 5)),
+        })
 
         apply_champion_selection(
             {"date": "2026-07-13", "buy_candidates": [], "universe": []},
-            {},
-            bucket="test-bucket",
-            run_date="2026-07-13",
-            config=_CONFIG,
-            sector_map={},
-            s3_client=s3,
+            {}, bucket="test-bucket", run_date="2026-07-13",
+            config=_CONFIG, sector_map={}, s3_client=s3,
         )
 
         assert not any(k.startswith("universe_membership/") for k in s3.reads), s3.reads
