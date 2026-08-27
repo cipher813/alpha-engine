@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from executor.trade_logger import (
+    StaleAuditBackupError,
     backup_to_s3,
     get_entry_dates,
     get_entry_stance_and_catalyst,
@@ -405,3 +406,133 @@ def test_backup_to_s3_swallows_failures(tmp_path, monkeypatch, caplog):
     with caplog.at_level("ERROR"):
         backup_to_s3(str(db_path), "2026-04-15", "bucket-x")
     assert any("S3 backup failed" in r.message for r in caplog.records)
+
+
+# ── backup_to_s3: WAL durability + audit-freshness guard (config#8735) ───────
+
+
+def _eod(date="2026-04-15"):
+    return {"date": date, "portfolio_nav": 1_000_000.0, "daily_return_pct": 0.1}
+
+
+def test_backup_ships_a_row_still_sitting_in_the_wal(tmp_path, monkeypatch):
+    """The regression this whole change exists for.
+
+    `init_db` opens the database in WAL mode, so a committed row lives in the
+    `-wal` sidecar until a checkpoint. Copying the main file alone — which is
+    what `s3.upload_file(db_path, ...)` did — publishes the last CHECKPOINTED
+    state, not the last committed one. Here nothing checkpoints between the
+    insert and the backup, and the connection is deliberately left OPEN so
+    close-time checkpointing cannot rescue it: the pre-fix code uploads a
+    database whose newest eod_pnl row is the PREVIOUS day's.
+    """
+    db_path = tmp_path / "trades.db"
+    conn = init_db(str(db_path))
+    log_eod(conn, _eod("2026-04-14"))
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # 04-14 lands in the main file
+    log_eod(conn, _eod("2026-04-15"))                # 04-15 stays in the -wal
+
+    # Precondition: the raw main file really is a day stale.
+    raw = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+    assert raw.execute("SELECT MAX(date) FROM eod_pnl").fetchone()[0] == "2026-04-14"
+    raw.close()
+
+    uploaded: list[bytes] = []
+    fake_s3 = MagicMock()
+    fake_s3.upload_file.side_effect = (
+        lambda src, bucket, key: uploaded.append(open(src, "rb").read())
+    )
+    monkeypatch.setattr("executor.trade_logger.boto3.client", MagicMock(return_value=fake_s3))
+
+    backup_to_s3(str(db_path), "2026-04-15", "bucket-x", require_eod_row=True)
+    conn.close()
+
+    assert uploaded, "nothing was uploaded"
+    published = tmp_path / "published.db"
+    published.write_bytes(uploaded[0])
+    snap = sqlite3.connect(f"file:{published}?mode=ro", uri=True)
+    assert snap.execute(
+        "SELECT COUNT(*) FROM eod_pnl WHERE date = '2026-04-15'"
+    ).fetchone()[0] == 1
+    snap.close()
+
+
+def test_backup_uploads_a_sidecar_free_snapshot(tmp_path, monkeypatch):
+    """The uploaded artifact must be self-contained — a consumer downloading
+    one key gets no `-wal`/`-shm` and must still read the newest row."""
+    db_path = tmp_path / "trades.db"
+    conn = init_db(str(db_path))
+    log_eod(conn, _eod("2026-04-15"))
+
+    captured: dict[str, bytes] = {}
+    fake_s3 = MagicMock()
+    fake_s3.upload_file.side_effect = (
+        lambda src, bucket, key: captured.setdefault(key, open(src, "rb").read())
+    )
+    monkeypatch.setattr("executor.trade_logger.boto3.client", MagicMock(return_value=fake_s3))
+    backup_to_s3(str(db_path), "2026-04-15", "bucket-x", require_eod_row=True)
+    conn.close()
+
+    assert set(captured) == {
+        "trades/trades_2026-04-15.db", "trades/trades_latest.db",
+    }
+    lone = tmp_path / "downloaded.db"
+    lone.write_bytes(captured["trades/trades_latest.db"])
+    down = sqlite3.connect(f"file:{lone}?mode=ro", uri=True)
+    assert down.execute("SELECT MAX(date) FROM eod_pnl").fetchone()[0] == "2026-04-15"
+    down.close()
+
+
+def test_backup_raises_rather_than_shipping_a_stale_audit_copy(tmp_path, monkeypatch):
+    db_path = tmp_path / "trades.db"
+    conn = init_db(str(db_path))
+    log_eod(conn, _eod("2026-04-14"))
+    conn.close()
+
+    fake_s3 = MagicMock()
+    monkeypatch.setattr("executor.trade_logger.boto3.client", MagicMock(return_value=fake_s3))
+
+    with pytest.raises(StaleAuditBackupError) as exc:
+        backup_to_s3(str(db_path), "2026-04-15", "bucket-x", require_eod_row=True)
+    assert "2026-04-15" in str(exc.value)
+    # Nothing reached S3 — trades_latest.db is never overwritten with a stale copy.
+    assert fake_s3.upload_file.call_count == 0
+
+
+def test_backup_without_require_eod_row_still_publishes(tmp_path, monkeypatch):
+    """The intraday/midday/emergency callers run before any eod_pnl row for
+    the day exists and must keep working."""
+    db_path = tmp_path / "trades.db"
+    init_db(str(db_path)).close()
+    fake_s3 = MagicMock()
+    monkeypatch.setattr("executor.trade_logger.boto3.client", MagicMock(return_value=fake_s3))
+    backup_to_s3(str(db_path), "2026-04-15", "bucket-x")
+    assert fake_s3.upload_file.call_count == 2
+
+
+def test_backup_fail_loud_reraises_upload_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "trades.db"
+    conn = init_db(str(db_path))
+    log_eod(conn, _eod("2026-04-15"))
+    conn.close()
+    fake_s3 = MagicMock()
+    fake_s3.upload_file.side_effect = RuntimeError("S3 down")
+    monkeypatch.setattr("executor.trade_logger.boto3.client", MagicMock(return_value=fake_s3))
+    with pytest.raises(RuntimeError, match="S3 down"):
+        backup_to_s3(
+            str(db_path), "2026-04-15", "bucket-x",
+            require_eod_row=True, fail_loud=True,
+        )
+
+
+def test_backup_leaves_no_temp_snapshot_behind(tmp_path, monkeypatch):
+    import glob
+    import tempfile as _tempfile
+
+    db_path = tmp_path / "trades.db"
+    init_db(str(db_path)).close()
+    fake_s3 = MagicMock()
+    monkeypatch.setattr("executor.trade_logger.boto3.client", MagicMock(return_value=fake_s3))
+    before = set(glob.glob(_tempfile.gettempdir() + "/trades_snapshot_*"))
+    backup_to_s3(str(db_path), "2026-04-15", "bucket-x")
+    assert not (set(glob.glob(_tempfile.gettempdir() + "/trades_snapshot_*")) - before)

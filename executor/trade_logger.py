@@ -7,7 +7,9 @@ Schema per design doc B.5.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import tempfile
 import uuid
 from datetime import UTC, datetime
 
@@ -793,17 +795,116 @@ def get_unmatched_entry(conn: sqlite3.Connection, ticker: str) -> dict | None:
     return None
 
 
-def backup_to_s3(db_path: str, run_date: str, s3_bucket: str) -> None:
-    """Upload trades.db to S3 under trades/trades_{date}.db and trades/trades_latest.db."""
+class StaleAuditBackupError(RuntimeError):
+    """The snapshot about to become the durable audit copy is missing the
+    run date's ``eod_pnl`` row. Raised rather than warned: ``backup_to_s3``
+    is a PRODUCER of the audit record, and a backup that silently ships the
+    previous day's state is indistinguishable from a healthy one.
+    """
+
+
+def _snapshot_db(db_path: str, dest_path: str) -> None:
+    """Write a transactionally consistent copy of ``db_path`` to ``dest_path``.
+
+    WHY THIS EXISTS (alpha-engine-config-I8735). ``init_db`` runs
+    ``PRAGMA journal_mode=WAL`` (added 2026-04-03, 77ad9d2). In WAL mode a
+    COMMIT appends to the ``-wal`` sidecar; the main database file only
+    absorbs those frames at a checkpoint. ``s3.upload_file(db_path, ...)``
+    copies the main file ALONE — never the ``-wal`` — so the uploaded audit
+    copy contains whatever the last checkpoint left behind, which on a day
+    where no auto-checkpoint happened to fire is the PREVIOUS session's
+    state. Measured: 59 of 100 WAL-era daily backups were missing their own
+    day's ``eod_pnl`` row; 0 of 22 pre-WAL ones were.
+
+    ``Connection.backup`` is SQLite's online-backup API: it reads through
+    the WAL and produces a single self-contained file with no sidecars, so
+    the artifact is correct regardless of journal mode, checkpoint timing or
+    a concurrent writer. It replaces the raw file copy rather than papering
+    over it with a checkpoint call, because a checkpoint can be blocked by
+    any concurrent reader and would leave the same silent staleness behind.
+    """
+    src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        s3 = boto3.client("s3")
-        key = f"trades/trades_{run_date}.db"
-        s3.upload_file(db_path, s3_bucket, key)
-        logger.info(f"trades.db backed up to s3://{s3_bucket}/{key}")
-        s3.upload_file(db_path, s3_bucket, "trades/trades_latest.db")
-        logger.info(f"trades.db backed up to s3://{s3_bucket}/trades/trades_latest.db")
-    except Exception as e:
-        logger.error("S3 backup failed (non-fatal): %s", e)
+        dest = sqlite3.connect(dest_path)
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        src.close()
+
+
+def _assert_snapshot_has_eod_row(snapshot_path: str, run_date: str) -> None:
+    """Raise unless the snapshot carries an ``eod_pnl`` row for ``run_date``."""
+    conn = sqlite3.connect(f"file:{snapshot_path}?mode=ro", uri=True)
+    try:
+        present = conn.execute(
+            "SELECT 1 FROM eod_pnl WHERE date = ? LIMIT 1", (run_date,)
+        ).fetchone()
+        newest = conn.execute("SELECT MAX(date) FROM eod_pnl").fetchone()[0]
+    finally:
+        conn.close()
+    if present:
+        return
+    raise StaleAuditBackupError(
+        f"Refusing to publish the trades audit backup for run_date={run_date}: "
+        f"the snapshot has no eod_pnl row for that date (newest row is "
+        f"{newest!r}). The durable audit copy would have been stale and "
+        "nothing downstream could have told."
+    )
+
+
+def backup_to_s3(
+    db_path: str,
+    run_date: str,
+    s3_bucket: str,
+    *,
+    require_eod_row: bool = False,
+    fail_loud: bool = False,
+) -> None:
+    """Publish a consistent snapshot of trades.db to
+    ``trades/trades_{run_date}.db`` and ``trades/trades_latest.db``.
+
+    ``require_eod_row`` — verify the snapshot contains the run date's
+    ``eod_pnl`` row before uploading anything, and raise
+    :class:`StaleAuditBackupError` if it does not. Set by the EOD reconcile,
+    the one caller for which this file IS the day's audit record. The
+    intraday/midday/emergency callers legitimately run before any
+    ``eod_pnl`` row exists for the day and leave it False.
+
+    ``fail_loud`` — re-raise upload failures instead of logging them. Set by
+    the EOD reconcile for the same reason. Left False for the intraday
+    callers, where (a) the failure mode swallowed is a transient S3 upload
+    error on a SECONDARY snapshot, (b) the primary deliverable — trading and
+    the EOD reconcile's own backup — is unaffected, and (c) the recording
+    surface is the ERROR log line below plus the next EOD backup, which is
+    strict. A verification failure is NEVER swallowed on either path.
+    """
+    fd, snapshot_path = tempfile.mkstemp(prefix="trades_snapshot_", suffix=".db")
+    os.close(fd)
+    try:
+        _snapshot_db(db_path, snapshot_path)
+        if require_eod_row:
+            # Raised before the first upload, so a stale snapshot never
+            # reaches either key — including trades_latest.db, which is what
+            # every downstream reader resolves.
+            _assert_snapshot_has_eod_row(snapshot_path, run_date)
+        try:
+            s3 = boto3.client("s3")
+            key = f"trades/trades_{run_date}.db"
+            s3.upload_file(snapshot_path, s3_bucket, key)
+            logger.info(f"trades.db backed up to s3://{s3_bucket}/{key}")
+            s3.upload_file(snapshot_path, s3_bucket, "trades/trades_latest.db")
+            logger.info(f"trades.db backed up to s3://{s3_bucket}/trades/trades_latest.db")
+        except Exception as e:
+            logger.error("S3 backup failed: %s", e)
+            if fail_loud:
+                raise
+    finally:
+        try:
+            os.unlink(snapshot_path)
+        except OSError:  # pragma: no cover — temp file already gone
+            pass
 
 
 # ── Dividend accrual ledger helpers (alpha-engine-config-I8188) ────────────
