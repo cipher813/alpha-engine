@@ -280,6 +280,7 @@ def solve_target_weights(
     # by the objective cannot do that: nothing is scaled after the fact.
     turnover_meta = _apply_turnover_constraint(
         cp, w, w_prev, constraints, effective_caps, cash_idx, cfg,
+        eligibility=eligibility,
     )
 
     problem = cp.Problem(objective, constraints)
@@ -928,6 +929,92 @@ def _mandatory_turnover_floor(
     return (forced_l1 + residual) / 2.0
 
 
+def _decompose_mandatory_turnover(
+    w_prev: np.ndarray,
+    effective_caps: np.ndarray,
+    eligibility: np.ndarray,
+    cash_idx: int,
+    cfg: dict,
+) -> dict:
+    """Which constraint forced each unit of the mandatory turnover floor.
+
+    alpha-engine-config-I8753. ``turnover_mandatory_floor`` has been emitted
+    since the turnover constraint shipped, and it answers "how much of today's
+    trading was forced" — but not BY WHAT, and the three causes have entirely
+    different fixes:
+
+    * ``cash_sleeve_pin``   — the sleeve is an equality pin; drift into or out
+      of it is mandated every session and is not a defect.
+    * ``ineligibility_pin`` — a held name went ineligible (research EXIT, GBM
+      veto, score gate) and is pinned to zero. A forced exit is the system
+      working.
+    * ``position_cap``      — a held name sits above its per-name cap
+      ``max_position_pct × stance_multiplier``. The stance is re-derived every
+      morning with no persistence, so a name whose stance flips
+      momentum→quality must be cut from 10% of NAV to 4% THAT MORNING,
+      regardless of its alpha, and rebuilt when the stance flips back.
+
+    Measured 2026-08-27 across the nine sessions since the v2 cutover
+    (``predictor/optimizer_shadow/{date}.json``, read-only): cap cuts on held
+    names mandated **0.278 of NAV in one-way selling**, ~3.1% per session,
+    entirely alpha-independent. On 2026-08-27 the floor was 0.105 against an
+    executed one-way turnover of 0.170 — 62% of the day's trading forced before
+    the objective was consulted.
+
+    That total was legible only by reading nine artifacts and diffing
+    ``stance_caps`` by hand, which is what this function removes. Whether the
+    right fix is hold-side stance hysteresis, a different cap schedule, or
+    nothing at all is NOT decided here — it is decided by watching this
+    decomposition accrue. Nine sessions gave only four cap flips with a full
+    three-session look-ahead (two reverted), which is too thin to set a
+    hysteresis default on.
+
+    Emitted on every solve, healthy included: a component emitting nothing is
+    not healthy, it is unobserved.
+
+    Returns per-cause one-way turnover plus ``total``, which reconciles to
+    ``_mandatory_turnover_floor`` to within floating-point tolerance. The
+    ``renormalization`` term is the residual the projection leaves behind —
+    the mass that must be absorbed by names with slack once every pin is
+    satisfied — and it belongs to no single name.
+    """
+    sleeve = float(cfg["cash_sleeve_pct"])
+    lower = np.zeros_like(w_prev)
+    upper = np.array(effective_caps, dtype=float)
+    lower[cash_idx] = sleeve
+    upper[cash_idx] = sleeve
+    projected = np.clip(w_prev, lower, upper)
+    per_name = np.abs(projected - w_prev)
+
+    idx = np.arange(len(w_prev))
+    is_cash = idx == cash_idx
+    # An ineligible name carries an effective cap of 0, so its whole holding is
+    # forced out. Attributing that to "position_cap" would read as a sizing
+    # artifact when it is a deliberate exit — the two have opposite responses.
+    is_ineligible = (~np.asarray(eligibility, dtype=bool)) & (~is_cash)
+
+    sleeve_l1 = float(per_name[is_cash].sum())
+    ineligible_l1 = float(per_name[is_ineligible].sum())
+    cap_l1 = float(per_name[~is_cash & ~is_ineligible].sum())
+    residual = abs(1.0 - float(projected.sum()))
+
+    names_at_cap = [
+        int(i) for i in idx
+        if not is_cash[i] and not is_ineligible[i] and per_name[i] > 1e-9
+    ]
+    names_pinned_out = [int(i) for i in idx if is_ineligible[i] and per_name[i] > 1e-9]
+
+    return {
+        "cash_sleeve_pin": sleeve_l1 / 2.0,
+        "ineligibility_pin": ineligible_l1 / 2.0,
+        "position_cap": cap_l1 / 2.0,
+        "renormalization": residual / 2.0,
+        "total": (sleeve_l1 + ineligible_l1 + cap_l1 + residual) / 2.0,
+        "n_names_over_cap": len(names_at_cap),
+        "n_names_pinned_out": len(names_pinned_out),
+    }
+
+
 def _apply_turnover_constraint(
     cp,
     w,
@@ -936,6 +1023,7 @@ def _apply_turnover_constraint(
     effective_caps: np.ndarray,
     cash_idx: int,
     cfg: dict,
+    eligibility: np.ndarray | None = None,
 ) -> dict:
     """Append the L1 daily-turnover budget to ``constraints``.
 
@@ -949,11 +1037,23 @@ def _apply_turnover_constraint(
         "turnover_constraint_applied": False,
         "turnover_constraint_cap": None,
         "turnover_mandatory_floor": None,
+        "turnover_mandatory_floor_by_cause": None,
         "turnover_constraint": None,
     }
     if cap is None or cap <= 0:
         return meta
     floor = _mandatory_turnover_floor(w_prev, effective_caps, cash_idx, cfg)
+    # alpha-engine-config-I8753 — WHICH constraint forced each unit of it.
+    # `eligibility` is optional so every existing caller keeps working; without
+    # it the ineligibility pin cannot be separated from the position cap, and
+    # the decomposition says so rather than guessing.
+    by_cause = (
+        _decompose_mandatory_turnover(
+            w_prev, effective_caps, eligibility, cash_idx, cfg,
+        )
+        if eligibility is not None
+        else None
+    )
     # A small slack above the floor: the floor is a bound on an attainable
     # point, and pinning the RHS exactly to it would leave a feasible set of
     # measure ~zero that an interior-point solver reports as infeasible.
@@ -964,6 +1064,7 @@ def _apply_turnover_constraint(
         "turnover_constraint_applied": True,
         "turnover_constraint_cap": float(effective_cap),
         "turnover_mandatory_floor": float(floor),
+        "turnover_mandatory_floor_by_cause": by_cause,
         "turnover_constraint": constraint,
     })
     if effective_cap > float(cap) + 1e-9:
@@ -1003,6 +1104,13 @@ def _turnover_diagnostics(
         ),
         "turnover_constraint_cap": cap,
         "turnover_mandatory_floor": turnover_meta.get("turnover_mandatory_floor"),
+        # alpha-engine-config-I8753 — the floor split by the constraint that
+        # forced it. Emitted on every solve, healthy included: "how much of
+        # today's trading was forced, and by what" was previously answerable
+        # only by reading nine artifacts and diffing stance_caps by hand.
+        "turnover_mandatory_floor_by_cause": turnover_meta.get(
+            "turnover_mandatory_floor_by_cause"
+        ),
         "turnover_constraint_binding": False,
         "turnover_constraint_shadow_price": None,
     }
