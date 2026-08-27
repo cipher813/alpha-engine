@@ -6,9 +6,16 @@ Saturday spots — pulling them on trading wastes disk and pip time.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 _BOOT_PULL = Path(__file__).parent.parent / "infrastructure" / "boot-pull.sh"
+_LAUNCHER = Path(__file__).parent.parent / "infrastructure" / "boot-pull-launcher.sh"
+_SERVICE_FILE = (
+    Path(__file__).parent.parent / "infrastructure" / "systemd" / "boot-pull.service"
+)
+_INSTALL_SCRIPT = Path(__file__).parent.parent / "infrastructure" / "install-boot-pull.sh"
+_SYNCED_REPO_PREFIX = "/home/ec2-user/alpha-engine"
 
 
 def test_boot_pull_excludes_dashboard_and_backtester():
@@ -188,4 +195,134 @@ def test_boot_pull_deploy_gate_rollback_runs_under_shared_flock():
     assert '"$GIT_SYNC_LOCK"' in rollback_block, (
         "the rollback reset runs outside the shared git flock and can race the "
         "weekday CodeFreshnessGate's heal."
+    )
+
+
+def _exec_start_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ExecStart="):
+            return stripped
+    raise AssertionError("no ExecStart= line found")
+
+
+def test_boot_pull_unit_execstart_is_outside_the_synced_repo():
+    """alpha-engine-config-I8734: boot-pull.service's ExecStart must not be a
+    path under the alpha-engine checkout that boot-pull.sh itself hard-resets.
+
+    boot-pull.sh's sync_repo_to_main() and its deploy-gate rollback both
+    `git reset --hard` the SAME tree ExecStart used to point into
+    (/home/ec2-user/alpha-engine/infrastructure/boot-pull.sh). Bash reads a
+    running script incrementally and resumes at a byte offset after each
+    command — a rewrite of the file underneath it silently resumes execution
+    in the REPLACED content. ExecStart must instead point at a launcher
+    installed outside the tree (infrastructure/install-boot-pull.sh installs
+    infrastructure/boot-pull-launcher.sh to /usr/local/sbin).
+    """
+    exec_start = _exec_start_line(_SERVICE_FILE.read_text())
+    path = exec_start.split("=", 1)[1].strip()
+    assert not path.startswith(_SYNCED_REPO_PREFIX), (
+        f"boot-pull.service ExecStart={path} is inside the synced alpha-engine "
+        "checkout — bash resumes a running script at a byte offset, so a "
+        "concurrent `git reset --hard` on this same file can silently swap "
+        "the bytes bash is executing mid-run."
+    )
+    assert path == "/usr/local/sbin/boot-pull-launcher.sh"
+
+
+def test_install_boot_pull_writes_the_same_execstart_as_the_committed_unit():
+    """install-boot-pull.sh's heredoc-written unit must not drift from
+    infrastructure/systemd/boot-pull.service — both hardcode ExecStart and
+    a silent divergence would mean the installed unit on a freshly
+    provisioned box differs from what's reviewed in this repo."""
+    installer_src = _INSTALL_SCRIPT.read_text()
+    heredoc_start = installer_src.index("cat > \"$SERVICE_FILE\"")
+    heredoc = installer_src[heredoc_start:]
+    installed_exec_start = _exec_start_line(heredoc)
+
+    committed_exec_start = _exec_start_line(_SERVICE_FILE.read_text())
+    assert installed_exec_start == committed_exec_start
+
+    path = installed_exec_start.split("=", 1)[1].strip()
+    assert not path.startswith(_SYNCED_REPO_PREFIX)
+
+
+def test_install_boot_pull_installs_the_launcher_outside_the_repo():
+    """install-boot-pull.sh must copy the launcher to /usr/local/sbin BEFORE
+    the unit that ExecStarts it is written — a fresh box with the unit
+    installed but no launcher copied would hard-fail every boot."""
+    src = _INSTALL_SCRIPT.read_text()
+    assert "/usr/local/sbin/boot-pull-launcher.sh" in src
+    install_pos = src.index("install ")
+    unit_write_pos = src.index("cat > \"$SERVICE_FILE\"")
+    assert install_pos < unit_write_pos, (
+        "the launcher must be installed to /usr/local/sbin BEFORE the "
+        "systemd unit (which ExecStarts it) is written"
+    )
+
+
+def test_boot_pull_launcher_never_execs_the_in_repo_path_directly():
+    """The launcher's whole purpose is to snapshot boot-pull.sh OUTSIDE the
+    synced tree before exec'ing it. If it ever `exec`d the in-repo path
+    directly, the byte-offset hazard this issue exists to close would still
+    be live."""
+    src = _LAUNCHER.read_text()
+    assert 'SNAPSHOT="/home/ec2-user/.boot-pull-snapshot.sh"' in src
+    assert 'exec "$SNAPSHOT"' in src
+    assert 'exec "$SRC"' not in src
+
+
+def test_boot_pull_launcher_snapshot_path_is_outside_the_synced_repo():
+    src = _LAUNCHER.read_text()
+    snapshot_line = next(
+        line for line in src.splitlines() if line.strip().startswith("SNAPSHOT=")
+    )
+    snapshot_path = snapshot_line.split("=", 1)[1].strip().strip('"')
+    assert not snapshot_path.startswith(_SYNCED_REPO_PREFIX), (
+        f"launcher snapshot path {snapshot_path} is inside the synced repo — "
+        "a concurrent git reset could still race the snapshot copy itself."
+    )
+
+
+def test_boot_pull_launcher_runs_and_execs_a_real_snapshot(tmp_path):
+    """End-to-end: point the launcher at a fake repo + a fake HOME and
+    confirm it copies boot-pull.sh to a snapshot outside the repo tree and
+    execs it, rather than the in-repo file."""
+    fake_repo = tmp_path / "alpha-engine" / "infrastructure"
+    fake_repo.mkdir(parents=True)
+    fake_boot_pull = fake_repo / "boot-pull.sh"
+    fake_boot_pull.write_text("#!/bin/bash\necho RAN_FROM_SNAPSHOT\n")
+    fake_boot_pull.chmod(0o755)
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    launcher_src = _LAUNCHER.read_text()
+    # Rebind the two hardcoded paths to the sandbox for this test only —
+    # the production script hardcodes /home/ec2-user paths deliberately, so
+    # the test substitutes tmp_path equivalents rather than parametrizing
+    # the script itself.
+    launcher_src = launcher_src.replace(
+        'SRC="/home/ec2-user/alpha-engine/infrastructure/boot-pull.sh"',
+        f'SRC="{fake_boot_pull}"',
+    ).replace(
+        'SNAPSHOT="/home/ec2-user/.boot-pull-snapshot.sh"',
+        f'SNAPSHOT="{fake_home}/.boot-pull-snapshot.sh"',
+    )
+    sandboxed_launcher = tmp_path / "boot-pull-launcher.sh"
+    sandboxed_launcher.write_text(launcher_src)
+    sandboxed_launcher.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(sandboxed_launcher)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "RAN_FROM_SNAPSHOT" in result.stdout
+    snapshot_path = fake_home / ".boot-pull-snapshot.sh"
+    assert snapshot_path.is_file(), "launcher did not create the snapshot"
+    assert not str(snapshot_path).startswith(str(fake_repo)), (
+        "snapshot must live outside the repo tree"
     )
