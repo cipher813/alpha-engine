@@ -6,7 +6,16 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=ec2-user
-ExecStart=/home/ec2-user/alpha-engine/infrastructure/boot-pull.sh
+# alpha-engine-config-I8734: ExecStart MUST point outside the synced
+# alpha-engine checkout. boot-pull.sh hard-resets that checkout in place
+# (including on rollback), and bash resumes reading a running script at a
+# byte offset after each command — a self-rewrite mid-execution silently
+# resumes in the replaced file's content. boot-pull-launcher.sh is
+# installed to /usr/local/sbin by install-boot-pull.sh specifically so it
+# is never itself inside a tree boot-pull.sh mutates; it snapshots the
+# in-repo boot-pull.sh to a private path outside the tree and execs that
+# snapshot.
+ExecStart=/usr/local/sbin/boot-pull-launcher.sh
 TimeoutStartSec=120
 RemainAfterExit=no
 
