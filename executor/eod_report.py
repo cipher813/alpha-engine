@@ -200,6 +200,53 @@ def _buy_entry_prices(trades_today: list[dict] | None) -> dict[str, float]:
     return {k: v[0] / v[1] for k, v in agg.items() if v[1] > 0}
 
 
+def compute_pricing_timing_by_ticker(
+    positions: dict,
+    prior_positions: dict | None,
+) -> tuple[dict[str, float], int]:
+    """Full-book per-ticker decomposition of the pricing & timing term.
+
+    Returns ``(by_ticker, uncovered)`` where ``by_ticker[tkr]`` is that
+    name's day-over-day mark basis
+    ``(ib_market_value - market_value)_t - (ib_market_value - market_value)_{t-1}``
+    and ``uncovered`` counts names skipped because one of the two days'
+    snapshots lacked ``ib_market_value``/``market_value``. Summed, the map is
+    the full-book mark-basis quantity ``pricing_timing_usd`` is built from —
+    see the module docstring's telescoping proof.
+
+    A name is included only when BOTH days carry the fields; otherwise its
+    dollars are left out entirely and fall through to the caller's residual,
+    never guessed. ``uncovered`` makes that omission visible to callers that
+    need to know the sum is a lower bound (alpha-engine-config-I8733).
+    """
+    by_ticker: dict[str, float] = {}
+    uncovered = 0
+    for tkr in set(positions or {}) | set((prior_positions or {}).keys()):
+        pos_t = (positions or {}).get(tkr)
+        pos_p = (prior_positions or {}).get(tkr)
+        if pos_t is None:
+            basis_today = 0.0
+        else:
+            ib_t, mv_t = pos_t.get("ib_market_value"), pos_t.get("market_value")
+            basis_today = (
+                (ib_t - mv_t) if (ib_t is not None and mv_t is not None) else None
+            )
+        if pos_p is None:
+            basis_prior = 0.0
+        else:
+            ib_p, mv_p = pos_p.get("ib_market_value"), pos_p.get("market_value")
+            basis_prior = (
+                (ib_p - mv_p) if (ib_p is not None and mv_p is not None) else None
+            )
+        if basis_today is None or basis_prior is None:
+            uncovered += 1
+            continue
+        delta = basis_today - basis_prior
+        if delta:
+            by_ticker[tkr] = delta
+    return by_ticker, uncovered
+
+
 def compute_rotation_realized(
     positions: dict,
     prior_positions: dict | None,
@@ -275,30 +322,11 @@ def compute_alpha_attribution(
     # dollars fall through to the ``reconciliation`` residual below — never
     # guessed.
     pt = float(pricing_timing_usd or 0.0) if pricing_timing_available else 0.0
-    pt_by_ticker: dict[str, float] = {}
-    if pricing_timing_available:
-        for tkr in set(positions) | set((prior_positions or {}).keys()):
-            pos_t = positions.get(tkr)
-            pos_p = (prior_positions or {}).get(tkr)
-            if pos_t is None:
-                basis_today = 0.0
-            else:
-                ib_t, mv_t = pos_t.get("ib_market_value"), pos_t.get("market_value")
-                basis_today = (
-                    (ib_t - mv_t) if (ib_t is not None and mv_t is not None) else None
-                )
-            if pos_p is None:
-                basis_prior = 0.0
-            else:
-                ib_p, mv_p = pos_p.get("ib_market_value"), pos_p.get("market_value")
-                basis_prior = (
-                    (ib_p - mv_p) if (ib_p is not None and mv_p is not None) else None
-                )
-            if basis_today is None or basis_prior is None:
-                continue
-            delta = basis_today - basis_prior
-            if delta:
-                pt_by_ticker[tkr] = delta
+    pt_by_ticker = (
+        compute_pricing_timing_by_ticker(positions, prior_positions)[0]
+        if pricing_timing_available
+        else {}
+    )
     pt_attributed_total = sum(pt_by_ticker.values())
 
     # ── Position sleeves (names held today) ───────────────────────────────────

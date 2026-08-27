@@ -194,22 +194,61 @@ def _detect_ib_mark_outside_range(
     return flags
 
 
-def _classify_nav_breach(pricing_timing_usd: float, mark_range_flags: list[dict]) -> dict:
-    """Reclassify a hard-gate breach fully explained by out-of-range IB
-    marks as a broker data-quality event rather than a NAV reconcile
-    defect (config#6349 deliverable 4) — a different remediation (chase
-    the broker feed) than a code defect (chase the reconcile math).
+def _classify_nav_breach(
+    pricing_timing_usd: float,
+    mark_range_flags: list[dict],
+    *,
+    full_book_mark_basis_usd: float | None = None,
+    full_book_uncovered_names: int = 0,
+) -> dict:
+    """Classify a hard-gate breach as a broker data-quality event rather
+    than a NAV reconcile defect (config#6349 deliverable 4) — a different
+    remediation (chase the broker feed) than a code defect (chase the
+    reconcile math).
 
-    "Fully explained" means what's left after subtracting every flagged
-    ticker's mark error wouldn't itself have warranted even the pre-
-    existing soft data_warnings entry.
+    The attribution basis is the FULL-BOOK mark-basis term
+    ``Σ_positions Δ(ib_market_value − market_value)`` — the same quantity
+    ``pricing_timing_usd`` is built from — not the out-of-range subset
+    (alpha-engine-config-I8733). Out-of-range is a strict LOWER BOUND on
+    mark divergence: a mark that is wrong but still inside the day's traded
+    ``[Low, High]`` moves ``pricing_timing_usd`` and is invisible to
+    ``_detect_ib_mark_outside_range``. Attributing on the flagged subset
+    alone therefore over-states the unexplained residual, and a book-wide
+    mark skew where only one or two names happen to cross a range boundary
+    is labelled ``reconcile_defect`` — sending a responder into attribution
+    math that is closing to ten dollars. Measured live on 2026-08-26:
+    breach $3,934, flagged subset explained $1,201, residual $2,733 →
+    ``reconcile_defect``, while the full book explained it to $0.01.
+
+    The test is on ``abs(residual)`` and so is SIGN-SYMMETRIC: the term is
+    a day-over-day difference and its recorded instances split 4 high / 4
+    low, so a one-sided guard would miss half the class (premise correction
+    on config#6819, 2026-08-26).
+
+    ``full_book_mark_basis_usd=None`` — no snapshot-2.1 ``ib_market_value``
+    on one of the two days — falls back to the flagged-subset test, which
+    is what shipped before this and never over-explains. ``uncovered``
+    names are reported but do not soften the test: an incomplete full-book
+    sum can only fail to explain a breach, never wrongly explain one.
     """
     total_mark_error_usd = sum(f["mark_error_usd"] for f in mark_range_flags)
-    residual_usd = pricing_timing_usd - total_mark_error_usd
-    fully_explained = bool(mark_range_flags) and abs(residual_usd) <= NAV_BREACH_RESIDUAL_FLOOR_USD
+    flagged_subset_residual_usd = pricing_timing_usd - total_mark_error_usd
+    if full_book_mark_basis_usd is None:
+        basis = "flagged_subset"
+        residual_usd = flagged_subset_residual_usd
+        explained = bool(mark_range_flags)
+    else:
+        basis = "full_book"
+        residual_usd = pricing_timing_usd - full_book_mark_basis_usd
+        explained = True
+    fully_explained = explained and abs(residual_usd) <= NAV_BREACH_RESIDUAL_FLOOR_USD
     return {
         "classification": "broker_data_quality" if fully_explained else "reconcile_defect",
+        "attribution_basis": basis,
         "total_mark_error_usd": total_mark_error_usd,
+        "flagged_subset_residual_usd": flagged_subset_residual_usd,
+        "full_book_mark_basis_usd": full_book_mark_basis_usd,
+        "full_book_uncovered_names": full_book_uncovered_names,
         "residual_usd": residual_usd,
     }
 
@@ -1510,14 +1549,35 @@ def run(
             # data-quality event, not a NAV reconcile code defect — a
             # different remediation, and named in the alert either way so
             # an operator isn't left tracing four positions by hand.
+            # Attribution basis is the FULL BOOK, not the out-of-range subset
+            # (alpha-engine-config-I8733) — same per-ticker decomposition
+            # `pricing_timing_unattributable_usd` is built from, so the
+            # classifier and the artifact can never disagree about how much of
+            # the breach the marks explain.
+            from executor.eod_report import compute_pricing_timing_by_ticker
+            _pt_by_ticker, _pt_uncovered = compute_pricing_timing_by_ticker(
+                positions, prior_positions if prior_snapshot_loaded else None,
+            )
             _breach_classification = _classify_nav_breach(
-                nav_hard_gate_breach["pricing_timing_usd"], ib_mark_range_flags,
+                nav_hard_gate_breach["pricing_timing_usd"],
+                ib_mark_range_flags,
+                full_book_mark_basis_usd=(
+                    sum(_pt_by_ticker.values()) if prior_snapshot_loaded else None
+                ),
+                full_book_uncovered_names=_pt_uncovered,
             )
             nav_hard_gate_breach.update(_breach_classification)
+            # Classification is always named — a book-wide mark skew can now
+            # classify broker_data_quality with ZERO tickers out of range, and
+            # the responder still has to be told which way to go.
+            nav_hard_gate_breach["message"] += (
+                f" Classification: {_breach_classification['classification']} "
+                f"(basis {_breach_classification['attribution_basis']}, "
+                f"residual ${_breach_classification['residual_usd']:+,.0f})."
+            )
             if ib_mark_range_flags:
                 nav_hard_gate_breach["message"] += (
-                    f" Classification: {_breach_classification['classification']}. "
-                    f"IB mark outside traded range — "
+                    " IB mark outside traded range — "
                     f"{_format_mark_range_detail(ib_mark_range_flags)}."
                 )
             logger.error(
@@ -1911,7 +1971,14 @@ def run(
     except Exception as e:  # noqa: BLE001 — best-effort secondary path; never fatal
         logger.warning("Reference-rate artifact publish failed (non-fatal): %s", e)
 
-    backup_to_s3(db_path, run_date, trades_bucket)
+    # The durable audit copy. Strict on BOTH counts (alpha-engine-config-I8735):
+    # the snapshot must carry today's eod_pnl row, and an upload failure must
+    # not be swallowed — this file is the audit record, and a stale or absent
+    # one is indistinguishable from a healthy one to every downstream reader.
+    backup_to_s3(
+        db_path, run_date, trades_bucket,
+        require_eod_row=True, fail_loud=True,
+    )
 
     # Backup daemon and executor logs to S3 (before EC2 shuts down at 1:30 PM)
     for log_file, s3_key in [
