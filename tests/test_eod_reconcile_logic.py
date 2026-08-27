@@ -358,6 +358,132 @@ class TestClassifyNavBreach:
         assert result["classification"] == "reconcile_defect"
 
 
+class TestClassifyNavBreachFullBook:
+    """config#8733 — out-of-range is a strict LOWER BOUND on mark divergence.
+
+    A mark that is wrong but still inside the day's traded range moves
+    `pricing_timing_usd` and is invisible to `_detect_ib_mark_outside_range`,
+    so attributing on the flagged subset alone over-states the unexplained
+    residual and mislabels a book-wide skew as a reconcile defect.
+    """
+
+    # Live figures, run_date=2026-08-26 (alpha-engine-config#8722/#8733).
+    PRICING_TIMING_USD = 3_933.92
+    # MU $+1,169 and SPY $+32 were the only two names outside their range.
+    FLAGGED = [
+        {"ticker": "MU", "mark_error_usd": 1_169.00},
+        {"ticker": "SPY", "mark_error_usd": 32.00},
+    ]
+    # `pricing_timing_unattributable_usd` that day was $0.01 — the full book
+    # explains the breach essentially exactly.
+    FULL_BOOK_USD = 3_933.91
+
+    def test_2026_08_26_book_wide_skew_classifies_broker_data_quality(self):
+        result = _classify_nav_breach(
+            self.PRICING_TIMING_USD,
+            self.FLAGGED,
+            full_book_mark_basis_usd=self.FULL_BOOK_USD,
+        )
+        assert result["classification"] == "broker_data_quality"
+        assert result["attribution_basis"] == "full_book"
+        assert result["residual_usd"] == pytest.approx(0.01)
+        # The flagged-subset residual — the number the shipped classifier used
+        # — is still reported, and is still $2,733 above the floor.
+        assert result["flagged_subset_residual_usd"] == pytest.approx(2_732.92)
+        assert abs(result["flagged_subset_residual_usd"]) > NAV_BREACH_RESIDUAL_FLOOR_USD
+
+    def test_full_book_residual_beyond_floor_stays_reconcile_defect(self):
+        """A genuine attribution defect — the full book does NOT explain it."""
+        result = _classify_nav_breach(
+            self.PRICING_TIMING_USD,
+            self.FLAGGED,
+            full_book_mark_basis_usd=1_200.00,
+        )
+        assert result["classification"] == "reconcile_defect"
+        assert result["attribution_basis"] == "full_book"
+        assert result["residual_usd"] == pytest.approx(2_733.92)
+
+    def test_book_wide_skew_with_no_ticker_out_of_range(self):
+        """The extreme of the class the shipped classifier could never reach:
+        every mark wrong, none far enough to cross a range boundary."""
+        result = _classify_nav_breach(
+            self.PRICING_TIMING_USD, [],
+            full_book_mark_basis_usd=self.PRICING_TIMING_USD,
+        )
+        assert result["classification"] == "broker_data_quality"
+
+    def test_classification_is_sign_symmetric(self):
+        """The term is a day-over-day difference and its recorded exceedances
+        split 4 high / 4 low (premise correction on config#6819), so the guard
+        must behave identically on a negative breach."""
+        hi = _classify_nav_breach(
+            self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=self.PRICING_TIMING_USD,
+        )
+        lo = _classify_nav_breach(
+            -self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=-self.PRICING_TIMING_USD,
+        )
+        assert hi["classification"] == lo["classification"] == "broker_data_quality"
+        hi_bad = _classify_nav_breach(
+            self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=0.0,
+        )
+        lo_bad = _classify_nav_breach(
+            -self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=0.0,
+        )
+        assert hi_bad["classification"] == lo_bad["classification"] == "reconcile_defect"
+
+    def test_missing_full_book_term_falls_back_to_flagged_subset(self):
+        """No schema-2.1 ib_market_value on one of the two days — the pre-#8733
+        behaviour, which never over-explains."""
+        result = _classify_nav_breach(
+            self.PRICING_TIMING_USD, self.FLAGGED, full_book_mark_basis_usd=None,
+        )
+        assert result["attribution_basis"] == "flagged_subset"
+        assert result["classification"] == "reconcile_defect"
+
+    def test_uncovered_names_are_reported_and_do_not_soften_the_test(self):
+        result = _classify_nav_breach(
+            self.PRICING_TIMING_USD, [],
+            full_book_mark_basis_usd=1_000.0,
+            full_book_uncovered_names=3,
+        )
+        assert result["full_book_uncovered_names"] == 3
+        assert result["classification"] == "reconcile_defect"
+
+
+class TestComputePricingTimingByTicker:
+    """The full-book decomposition is ONE implementation, shared by the
+    classifier and `pricing_timing_unattributable_usd` (config#8733)."""
+
+    def test_sums_day_over_day_mark_basis_across_the_whole_book(self):
+        from executor.eod_report import compute_pricing_timing_by_ticker
+
+        today = {
+            "MU": {"ib_market_value": 103_309.56, "market_value": 101_347.20},
+            "PBF": {"ib_market_value": 1_000.0, "market_value": 849.0},
+        }
+        prior = {
+            "MU": {"ib_market_value": 100_000.0, "market_value": 100_000.0},
+            "PBF": {"ib_market_value": 900.0, "market_value": 900.0},
+        }
+        by_ticker, uncovered = compute_pricing_timing_by_ticker(today, prior)
+        assert uncovered == 0
+        assert by_ticker["MU"] == pytest.approx(1_962.36)
+        assert by_ticker["PBF"] == pytest.approx(151.0)
+        assert sum(by_ticker.values()) == pytest.approx(2_113.36)
+
+    def test_a_name_missing_either_days_fields_is_counted_not_guessed(self):
+        from executor.eod_report import compute_pricing_timing_by_ticker
+
+        by_ticker, uncovered = compute_pricing_timing_by_ticker(
+            {"AAA": {"ib_market_value": 10.0, "market_value": 9.0},
+             "BBB": {"market_value": 5.0}},
+            {"AAA": {"ib_market_value": 8.0, "market_value": 8.0},
+             "BBB": {"ib_market_value": 5.0, "market_value": 5.0}},
+        )
+        assert uncovered == 1
+        assert set(by_ticker) == {"AAA"}
+
+
 class TestFormatMarkRangeDetail:
     def test_names_ticker_and_dollar_error_in_alert_text(self):
         flags = [{
