@@ -46,6 +46,32 @@ _DATED_KEY_RE = re.compile(r"optimizer_shadow/(\d{4}-\d{2}-\d{2})\.json$")
 # "should have been operator-reviewed" event the governor would have capped.
 _DAILY_BAND_GOVERNOR_OFF = 0.25
 
+# The `status` vocabulary this block reports (alpha-engine-config-I8752).
+# Named rather than inline so a console adapter can enumerate them instead of
+# string-matching, and so "which values are NOT ok" is answerable from the
+# module rather than by reading the branch that assigns them.
+STATUS_OK = "ok"
+STATUS_BREACH_DAILY = "breach_daily"
+STATUS_BREACH_ROLLING = "breach_rolling"
+STATUS_DISABLED = "disabled"
+STATUS_NO_METRIC = "no_turnover_metric"
+STATUS_ERROR = "error"
+
+TRIPWIRE_STATUSES = (
+    STATUS_OK,
+    STATUS_BREACH_DAILY,
+    STATUS_BREACH_ROLLING,
+    STATUS_DISABLED,
+    STATUS_NO_METRIC,
+    STATUS_ERROR,
+)
+
+#: Statuses that mean "the band was breached". A reader asking "is this
+#: component healthy?" tests membership here rather than `!= "ok"` — `disabled`
+#: and `no_turnover_metric` are not breaches, and lumping them in would page on
+#: a deliberately-off tripwire.
+TRIPWIRE_BREACH_STATUSES = frozenset({STATUS_BREACH_DAILY, STATUS_BREACH_ROLLING})
+
 
 def check_turnover_tripwire(
     diagnostics: dict,
@@ -58,7 +84,7 @@ def check_turnover_tripwire(
     the shadow artifact. Never raises (see module docstring posture)."""
     try:
         if not optimizer_cfg.get("turnover_tripwire_enabled", True):
-            return {"status": "disabled"}
+            return {"status": STATUS_DISABLED}
         today = (diagnostics or {}).get("turnover_one_way")
         if today is None or not math.isfinite(float(today)):
             # Upstream contract violation — the optimizer always writes this
@@ -69,7 +95,7 @@ def check_turnover_tripwire(
                 "turnover_one_way (run_date=%s) — tripwire DID NOT RUN",
                 run_date,
             )
-            return {"status": "no_turnover_metric"}
+            return {"status": STATUS_NO_METRIC}
         today = float(today)
 
         cap = optimizer_cfg.get("max_daily_turnover")
@@ -88,8 +114,32 @@ def check_turnover_tripwire(
 
         daily_breach = today > daily_band
         rolling_breach = rolling_sum > rolling_band
+        # alpha-engine-config-I8752: DERIVED, never a literal.
+        #
+        # This field was a hardcoded "ok" that nothing revised. The breach
+        # booleans were recorded beside it and drove `alerts.publish`, but
+        # `status` — the one field a console pane or a sweep reads as this
+        # component's verdict — stayed "ok" through a breach. Measured
+        # 2026-08-27 on the live shadow artifacts: eight CONSECUTIVE sessions
+        # (2026-08-18 through 2026-08-27) carried rolling_breach=true with
+        # rolling_sum 0.69..0.95 against a 0.60 band, and every one of them
+        # said status "ok". Brian discovered the churn himself, which is the
+        # signal that the WARN publish alone is not a sufficient surface.
+        #
+        # The module docstring's posture — "a dead tripwire is itself visible"
+        # via this block — was inverted here: a BREACHING tripwire was invisible
+        # on the same field.
+        #
+        # Daily outranks rolling: a daily breach means the governor was bypassed
+        # and pages at ERROR, which is strictly the more urgent finding.
+        if daily_breach:
+            status = STATUS_BREACH_DAILY
+        elif rolling_breach:
+            status = STATUS_BREACH_ROLLING
+        else:
+            status = STATUS_OK
         out = {
-            "status": "ok",
+            "status": status,
             "turnover_one_way": round(today, 6),
             "daily_band": round(daily_band, 6),
             "daily_breach": daily_breach,
@@ -146,7 +196,7 @@ def check_turnover_tripwire(
     except Exception as e:  # noqa: BLE001 — secondary observability: must not
         # block the planner; failure recorded in the shadow artifact + WARN.
         logger.warning("turnover tripwire failed (non-blocking): %s", e, exc_info=True)
-        return {"status": "error", "error": repr(e)}
+        return {"status": STATUS_ERROR, "error": repr(e)}
 
 
 def _read_prior_turnovers(
