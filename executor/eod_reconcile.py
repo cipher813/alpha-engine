@@ -36,9 +36,11 @@ from executor.eod_report import build_eod_report, write_eod_report
 from executor.pnl_backfill import backfill_residual_sleeves
 from executor.pnl_integrity import (
     RESIDUAL_CUMULATIVE_WINDOW_SESSIONS,
+    check_attribution_closure,
     check_custodian_marks,
     check_residual_bounds,
     gross_net_returns,
+    nav_basis_level_usd,
     plan_twr_self_heal,
     session_costs,
     verify_twr_closes,
@@ -1786,6 +1788,34 @@ def run(
         data_warnings.append(breach["message"])
     integrity_breaches.extend(residual_breaches)
 
+    # ── Attribution closure — the NAV mark-basis LEVEL (I8188 class sweep) ──
+    # Replaces the tautological `ties_to_headline` claim that eod_report
+    # published and this module logged on. `unattributed_usd` is the plug of
+    # the identity that check closed, so it could never fail. The check with
+    # power compares broker NetLiquidation against a settled NAV rebuilt from
+    # an independent source (broker cash + ArcticDB settled closes) — and it
+    # sees the CONSTANT basis error that cancels exactly in the day-over-day
+    # `_check_nav_three_way_hard_gate` above and is invisible to it.
+    basis_level = nav_basis_level_usd(
+        nav=nav,
+        total_cash=account.get("total_cash"),
+        accrued_interest=account.get("accrued_interest"),
+        positions=positions,
+    )
+    closure_breaches = check_attribution_closure(
+        nav_basis=basis_level,
+        nav=nav,
+        components=None,  # component arithmetic is checked at the report site
+        run_date=run_date,
+    )
+    for breach in closure_breaches:
+        if breach.get("severity") == "unevaluated":
+            logger.warning("P&L ATTRIBUTION CLOSURE NOT EVALUATED: %s", breach["message"])
+        else:
+            logger.error("P&L ATTRIBUTION CLOSURE BREACH: %s", breach["message"])
+        data_warnings.append(breach["message"])
+    integrity_breaches.extend(closure_breaches)
+
     # Custodian marks: promoted from flag to failure. The soft
     # ib_mark_outside_range flag is unchanged and still populates.
     mark_breaches = check_custodian_marks(
@@ -2112,12 +2142,21 @@ def run(
             spy_close_provisional=spy_close_provisional,
         )
         attribution = report.get("alpha_attribution")
-        if attribution is not None and not attribution.get("ties_to_headline"):
-            logger.warning(
-                "EOD alpha attribution did not tie to headline (residual=$%.2f) "
-                "on %s — investigate before trusting per-position contributions.",
-                attribution.get("residual_usd", 0.0), run_date,
-            )
+        # The old check here tested `ties_to_headline`, which is TRUE BY
+        # CONSTRUCTION (alpha-engine-config-I8188 class sweep) — it asserted
+        # "investigate before trusting per-position contributions" while being
+        # incapable of ever firing. What CAN fire is a non-finite component,
+        # which poisons every downstream sum silently. The gate with real power
+        # over these sleeves is the NAV mark-basis level check above.
+        if attribution is not None:
+            for breach in check_attribution_closure(
+                nav_basis={"available": False, "reason": "checked at reconcile site"},
+                nav=None,
+                components=attribution.get("components"),
+                run_date=run_date,
+            ):
+                logger.error("P&L ATTRIBUTION ARITHMETIC BREACH: %s", breach["message"])
+                data_warnings.append(breach["message"])
         write_eod_report(report, trades_bucket=trades_bucket, run_date=run_date)
     except Exception as e:
         logger.error("EOD report artifact build/write failed: %s", e)
