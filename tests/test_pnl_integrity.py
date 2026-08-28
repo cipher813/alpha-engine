@@ -16,11 +16,13 @@ from executor.pnl_integrity import (
     check_residual_bounds,
     gross_net_returns,
     mark_materiality_usd,
+    nav_change_implied_returns,
     nav_implied_returns,
     plan_twr_self_heal,
     residual_cumulative_tolerance_usd,
     residual_per_session_tolerance_usd,
     session_costs,
+    verify_nav_change_basis_closes,
     verify_twr_closes,
 )
 
@@ -305,6 +307,99 @@ class TestTwrSelfHeal:
         assert plan["corrections"] == []
         assert len(plan["refused"]) == 1
         assert "external flow" in plan["refused"][0]["reason"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b. TWR closure, nav_change_usd basis (alpha-engine-config-I9025)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _nc_series(navs, nav_change=None, stored=None, missing_nc_before=0):
+    """Like ``_series`` but also carries ``nav_change_usd``.
+
+    ``nav_change_usd`` defaults to the exact NAV delta (so the two bases agree
+    unless overridden). ``missing_nc_before`` sets ``nav_change_usd=None`` on
+    the first N rows — the I9025 day-set-mismatch shape.
+    """
+    rows = []
+    prior = None
+    for i, nav in enumerate(navs):
+        pct = None if prior is None else (nav / prior - 1) * 100
+        nc = None if prior is None else nav - prior
+        rows.append({
+            "date": f"2026-04-{i + 1:02d}",
+            "portfolio_nav": nav,
+            "daily_return_pct": pct if pct is not None else 0.0,
+            "nav_change_usd": nc,
+        })
+        prior = nav
+    if nav_change:
+        for idx, value in nav_change.items():
+            rows[idx]["nav_change_usd"] = value
+    if stored:
+        for idx, value in stored.items():
+            rows[idx]["daily_return_pct"] = value
+    for i in range(min(missing_nc_before, len(rows))):
+        rows[i]["nav_change_usd"] = None
+    return rows
+
+
+class TestNavChangeBasis:
+    def test_a_clean_series_closes_exactly(self):
+        result = verify_nav_change_basis_closes(
+            _nc_series([1_000_000, 1_005_000, 1_002_000, 1_010_000])
+        )
+        assert result["closes"] is True
+        assert abs(result["drift_bps"]) < 1e-6
+        assert result["coverage_gap_sessions"] == []
+
+    def test_the_measured_live_cause_is_day_set_coverage_not_drift(self):
+        """I9025: nav_change_usd is NULL on the early sessions (pre-PR490)
+        while daily_return_pct is populated throughout. Those rows must be
+        excluded from BOTH chains, not counted as drift — and the remaining
+        rows, which persist a matching nav_change_usd, close exactly."""
+        rows = _nc_series(
+            [1_000_000, 1_001_000, 1_003_000, 998_000, 1_004_000],
+            missing_nc_before=3,
+        )
+        result = verify_nav_change_basis_closes(rows)
+        assert result["coverage_gap_sessions"] == ["2026-04-02", "2026-04-03"]
+        assert result["n_sessions"] == 2
+        assert result["closes"] is True
+        assert result["offenders"] == []
+
+    def test_a_disagreeing_row_is_an_offender_not_a_coverage_gap(self):
+        rows = _nc_series([1_000_000, 1_005_000])
+        rows[1]["nav_change_usd"] = 5_000 - 200  # 2bp off from the true delta
+        result = verify_nav_change_basis_closes(rows)
+        assert result["closes"] is False
+        assert [o["date"] for o in result["offenders"]] == ["2026-04-02"]
+        assert result["coverage_gap_sessions"] == []
+
+    def test_one_bp_is_the_tolerance(self):
+        rows = _nc_series([1_000_000, 1_005_000])
+        rows[1]["nav_change_usd"] = 5_000 + 1_000_000 * 0.0002  # 2bp off
+        assert verify_nav_change_basis_closes(rows)["closes"] is False
+        rows[1]["nav_change_usd"] = 5_000 + 1_000_000 * 0.00005  # 0.5bp off
+        assert verify_nav_change_basis_closes(rows)["closes"] is True
+
+    def test_short_series_is_na_not_pass(self):
+        assert verify_nav_change_basis_closes([])["status"] == "n/a"
+        assert verify_nav_change_basis_closes(_nc_series([1_000_000]))["status"] == "n/a"
+
+    def test_all_rows_missing_nav_change_usd_is_na_not_pass(self):
+        """Every row a coverage gap (e.g. a book that has never persisted
+        nav_change_usd) must not read as a clean close on an empty chain."""
+        rows = _nc_series([1_000_000, 1_005_000, 1_002_000], missing_nc_before=3)
+        result = verify_nav_change_basis_closes(rows)
+        assert result["status"] == "n/a"
+        assert result["coverage_gap_sessions"] == ["2026-04-02", "2026-04-03"]
+
+    def test_nav_change_implied_returns_flags_coverage_gap_not_offender(self):
+        rows = _nc_series([1_000_000, 1_005_000], missing_nc_before=2)
+        detail = nav_change_implied_returns(rows)
+        assert detail[1]["coverage_gap"] is True
+        assert detail[1]["implied_pct"] is None
+        assert detail[1]["delta_pct"] is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
