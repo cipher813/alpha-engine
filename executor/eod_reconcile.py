@@ -43,6 +43,7 @@ from executor.pnl_integrity import (
     nav_basis_level_usd,
     plan_twr_self_heal,
     session_costs,
+    verify_nav_change_basis_closes,
     verify_twr_closes,
 )
 from executor.trade_logger import (
@@ -1942,6 +1943,43 @@ def run(
             "sessions (%+.2fbp drift, tolerance %.0fbp)",
             twr["chain_linked_pct"], twr["nav_ratio_pct"], twr["n_sessions"],
             twr["drift_bps"], twr["tolerance_bps"],
+        )
+
+    # ── TWR closure, nav_change_usd basis — third arm (alpha-engine-config-
+    # I9025) ───────────────────────────────────────────────────────────────
+    # A different pair than the NAV-ratio check above: chain-linked
+    # daily_return_pct against chain-linked nav_change_usd/prior_nav — the
+    # pair return_chain_basis_gap publishes. MEASURED CAUSE: a day-set
+    # mismatch (nav_change_usd is NULL on sessions before PR490), not a stale
+    # row — see pnl_integrity's module docstring. No self-heal: the fix is
+    # coverage (excluding a row missing nav_change_usd from BOTH chains),
+    # already built into verify_nav_change_basis_closes.
+    nc_rows = [
+        {"date": r[0], "portfolio_nav": r[1], "daily_return_pct": r[2],
+         "nav_change_usd": r[3]}
+        for r in conn.execute(
+            "SELECT date, portfolio_nav, daily_return_pct, nav_change_usd "
+            "FROM eod_pnl WHERE portfolio_nav IS NOT NULL ORDER BY date"
+        ).fetchall()
+    ]
+    nc_basis = verify_nav_change_basis_closes(nc_rows)
+    if nc_basis.get("status") == "ok" and not nc_basis["closes"]:
+        logger.error("TWR CLOSURE BREACH (nav_change_usd basis): %s", nc_basis["message"])
+        data_warnings.append(nc_basis["message"])
+        integrity_breaches.append({"kind": "twr_closure_nav_change_basis", **{
+            k: nc_basis[k] for k in
+            ("stored_return_chain_pct", "nav_change_basis_chain_pct",
+             "drift_bps", "tolerance_bps", "n_sessions", "message")
+        }})
+    elif nc_basis.get("status") == "ok":
+        logger.info(
+            "TWR closes (nav_change_usd basis): chain-linked %+.4f%% vs "
+            "nav_change_usd basis %+.4f%% over %d sessions (%+.2fbp drift, "
+            "tolerance %.0fbp; %d session(s) excluded for missing "
+            "nav_change_usd)",
+            nc_basis["stored_return_chain_pct"], nc_basis["nav_change_basis_chain_pct"],
+            nc_basis["n_sessions"], nc_basis["drift_bps"], nc_basis["tolerance_bps"],
+            len(nc_basis.get("coverage_gap_sessions") or []),
         )
     if integrity_breaches:
         conn.execute(
