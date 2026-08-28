@@ -132,11 +132,26 @@ if [ ! -x "$VENV_PY" ]; then
 fi
 
 # Independent read of origin/main's requirements.txt: fetch + `git show`,
-# never the locally checked-out file. Read-only — no checkout/reset, so this
-# cannot itself race boot-pull.sh's git-sync flock the way a mutating git op
-# would have to.
-if ! git -C "$REPO_ROOT" fetch origin main --quiet; then
-    echo "check_deps_match_manifest: git fetch origin main failed — cannot verify independently" >&2
+# never the locally checked-out file.
+#
+# The fetch still takes the shared git-sync flock (alpha-engine-config#1944),
+# even though this script does no checkout/reset. A previous version of this
+# comment argued a bare fetch is "read-only" and cannot race a mutating git
+# op — that reasoning does not hold: `git fetch` WRITES the remote-tracking
+# ref (refs/remotes/origin/main), and boot-pull.sh's own header documents
+# that ref update itself losing a compare-and-swap race against a concurrent
+# writer on this box (2026-07-28/07-30, "cannot lock ref
+# 'refs/remotes/origin/main'"). This script targets the same
+# /home/ec2-user/alpha-engine checkout boot-pull.sh and the weekday SF's
+# CodeFreshnessGate/ChronicGapSelfHeal already serialize behind
+# $GIT_SYNC_LOCK, so its fetch must take the same lock rather than assume
+# immunity from the class.
+#
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/lib/git-sync-lock.sh"
+
+if ! flock -w "$GIT_SYNC_LOCK_WAIT" "$GIT_SYNC_LOCK" git -C "$REPO_ROOT" fetch origin main --quiet; then
+    echo "check_deps_match_manifest: git-sync flock/fetch failed on $GIT_SYNC_LOCK after ${GIT_SYNC_LOCK_WAIT}s — cannot verify independently" >&2
     exit 2
 fi
 
