@@ -21,6 +21,33 @@ against ``s3://alpha-engine-research/trades/eod_pnl.csv`` (115 sessions,
    (10.5%) differed from the broker mark by more than 0.5% with nothing
    failing.
 
+A fifth defect, measured against the same file (alpha-engine-config-I9025),
+sits beside defect 2 rather than inside it: defect 2's TWR-closure gate
+compares the chain-linked ``daily_return_pct`` series against the NAV RATIO
+(``nav[-1]/nav[0] − 1``); it never touches the chain-linked
+``nav_change_usd / prior_nav`` series, which is a different pair. Reconstructed
+over the full 119-session history (2026-03-09 → 2026-08-27):
+
+    ``nav_change_usd`` is NULL on 41 of 119 sessions (2026-03-09 →
+    2026-05-05, before PR490 added the named P&L lines) while
+    ``daily_return_pct`` is populated on all 119. On every one of the 78
+    sessions carrying BOTH values, ``daily_return_pct`` and
+    ``nav_change_usd / prior_nav × 100`` agree to floating-point precision
+    (delta = 0.0 exactly, all 78) — including 2026-07-28, the one session
+    whose ``input_closure_usd`` is materially nonzero ($4,061.25, 40.4bp of
+    NAV; the evaluator's own 25bp ``INPUT_CLOSURE_NAV_BPS`` bound already
+    excludes that session from the attribution window it publishes).
+
+So the drift a naive whole-history chain shows is a **day-set mismatch**
+(cause (b) of I9025's three candidates), not a stale stored value (cause (a)
+— there is no disagreeing row to self-heal) and not an accumulating residual
+(cause (c) — the per-session delta is exactly zero whenever both legs exist).
+Per I9025 deliverable 3, the fix for cause (b) is to make the two series
+cover the same sessions BY CONSTRUCTION — ``verify_nav_change_basis_closes``
+below excludes a row missing ``nav_change_usd`` from BOTH chains rather than
+letting the ``daily_return_pct`` chain silently run ahead of it — not to widen
+the tolerance.
+
 The residual-bound derivation below rests on one measurement that the issue
 body did NOT have, and which changes what the bound is FOR. Reconstructing
 ``rotation_realized_usd`` (realized P&L on shares rotated out, which
@@ -529,6 +556,171 @@ def plan_twr_self_heal(
         else:
             corrections.append(entry)
     return {"corrections": corrections, "refused": refused}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b. TWR closure, second arm — the ``nav_change_usd`` basis (I9025)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A THIRD arm of the TWR-closure discipline (the first two are
+# ``verify_twr_closes`` above: chain-linked ``daily_return_pct`` vs the NAV
+# ratio). This compares the chain-linked ``daily_return_pct`` series against
+# the chain-linked ``nav_change_usd / prior_nav`` series — a pair
+# ``verify_twr_closes`` never touches, and the one ``return_chain_basis_gap``
+# publishes at ``s3://alpha-engine-research/evaluator/latest/attribution.json``
+# (alpha-engine-config-I9025).
+#
+# MEASURED CAUSE. Reconstructed over the full 119-session ``eod_pnl.csv``
+# history: ``nav_change_usd`` is NULL on 41 sessions (2026-03-09 →
+# 2026-05-05, before PR490 added the named P&L lines) while
+# ``daily_return_pct`` is populated throughout. On every one of the 78
+# sessions carrying BOTH values — 2026-07-28 (the sole session with a
+# material ``input_closure_usd``, $4,061.25 / 40.4bp) included — the two
+# figures agree to floating-point precision: delta = 0.0 exactly, all 78.
+# There is no disagreeing row to self-heal (cause (a), ruled out) and no
+# accumulating same-sign residual (cause (c), ruled out: the per-session
+# delta is exactly zero, not small-and-consistent). The cause is (b): the two
+# series cover DIFFERENT DAY SETS, purely because one column started later
+# than the other.
+#
+# So the fix is not a tolerance and not a self-heal — it is coverage. A row
+# missing ``nav_change_usd`` is excluded from BOTH chains here, never left in
+# one and dropped from the other; ``coverage_gap_sessions`` names those rows
+# for observability (a schema-coverage gap is itself worth seeing) without
+# counting them as drift. ``plan_twr_self_heal`` is NOT extended for this arm
+# — there is nothing to rewrite; a self-heal here would be inventing a NAV
+# change for a session that never persisted one.
+NAV_CHANGE_BASIS_TOLERANCE_BPS = TWR_CLOSURE_TOLERANCE_BPS
+
+
+def nav_change_implied_returns(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """For each row, the return its own ``nav_change_usd`` implies.
+
+    ``rows`` is the persisted eod_pnl series OLDEST-first, each carrying
+    ``date``, ``portfolio_nav``, ``daily_return_pct`` and ``nav_change_usd``.
+    A row missing ``nav_change_usd`` (or with no persisted prior NAV) gets
+    ``implied_pct=None`` and, when ``daily_return_pct`` IS present, is flagged
+    ``coverage_gap=True`` — the day-set mismatch that is I9025's measured
+    cause, surfaced rather than silently absorbed into one chain only.
+    """
+    out: list[dict[str, Any]] = []
+    prior_nav: float | None = None
+    for r in rows:
+        nav = r.get("portfolio_nav")
+        try:
+            nav = float(nav) if nav not in (None, "") else None
+        except (TypeError, ValueError):
+            nav = None
+        stored = r.get("daily_return_pct")
+        try:
+            stored = float(stored) if stored not in (None, "") else None
+        except (TypeError, ValueError):
+            stored = None
+        nav_change = r.get("nav_change_usd")
+        try:
+            nav_change = float(nav_change) if nav_change not in (None, "") else None
+        except (TypeError, ValueError):
+            nav_change = None
+        implied = None
+        if nav_change is not None and prior_nav:
+            implied = nav_change / prior_nav * 100.0
+        out.append({
+            "date": r.get("date"),
+            "portfolio_nav": nav,
+            "stored_pct": stored,
+            "nav_change_usd": nav_change,
+            "implied_pct": implied,
+            "coverage_gap": (
+                stored is not None and nav_change is None and prior_nav is not None
+            ),
+            "delta_pct": (
+                stored - implied
+                if (stored is not None and implied is not None)
+                else None
+            ),
+        })
+        if nav is not None:
+            prior_nav = nav
+    return out
+
+
+def verify_nav_change_basis_closes(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    tolerance_bps: float = NAV_CHANGE_BASIS_TOLERANCE_BPS,
+) -> dict[str, Any]:
+    """Assert chain-linked TWR equals the chain-linked ``nav_change_usd`` basis.
+
+    The third TWR-closure arm (alpha-engine-config-I9025) — see the module
+    docstring and the block comment above for the measured cause. Both chains
+    are built ONLY over rows carrying both ``daily_return_pct`` and
+    ``nav_change_usd``: a row missing either is excluded from both by
+    construction (never from just one), so the comparison can never register
+    day-set coverage as drift. Rows excluded for missing ``nav_change_usd``
+    while carrying ``daily_return_pct`` are named in
+    ``coverage_gap_sessions`` — a data-quality signal, not a closure failure.
+
+    ``status`` is ``"n/a"`` when there are fewer than two comparable rows.
+    """
+    detail = nav_change_implied_returns(rows)
+    coverage_gap_sessions = [d["date"] for d in detail if d["coverage_gap"]]
+    comparable = [
+        d for d in detail
+        if d["stored_pct"] is not None and d["implied_pct"] is not None
+    ]
+    if len(comparable) < 1:
+        return {
+            "status": "n/a",
+            "closes": None,
+            "offenders": [],
+            "coverage_gap_sessions": coverage_gap_sessions,
+        }
+
+    chain_stored = 1.0
+    chain_implied = 1.0
+    for d in comparable:
+        chain_stored *= 1.0 + d["stored_pct"] / 100.0
+        chain_implied *= 1.0 + d["implied_pct"] / 100.0
+    stored_chain_pct = (chain_stored - 1.0) * 100.0
+    implied_chain_pct = (chain_implied - 1.0) * 100.0
+    drift_bps = (stored_chain_pct - implied_chain_pct) * 100.0
+
+    offenders = [
+        d for d in comparable
+        if d["delta_pct"] is not None and abs(d["delta_pct"]) * 100.0 > tolerance_bps
+    ]
+
+    return {
+        "status": "ok",
+        "closes": abs(drift_bps) <= tolerance_bps,
+        "stored_return_chain_pct": stored_chain_pct,
+        "nav_change_basis_chain_pct": implied_chain_pct,
+        "drift_bps": drift_bps,
+        "tolerance_bps": tolerance_bps,
+        "n_sessions": len(comparable),
+        "offenders": offenders,
+        "coverage_gap_sessions": coverage_gap_sessions,
+        "message": (
+            f"TWR does not close against the nav_change_usd basis: "
+            f"chain-linked daily_return_pct = {stored_chain_pct:+.4f}% vs "
+            f"chain-linked nav_change_usd/prior_nav = {implied_chain_pct:+.4f}% "
+            f"over {len(comparable)} sessions — {drift_bps:+.1f}bp of drift "
+            f"against a {tolerance_bps:.0f}bp tolerance. Disagreeing row(s): "
+            + ", ".join(
+                f"{o['date']} stored {o['stored_pct']:+.6f}% vs nav_change-"
+                f"implied {o['implied_pct']:+.6f}%"
+                for o in offenders[:5]
+            )
+            + ("" if len(offenders) <= 5 else f" (+{len(offenders) - 5} more)")
+            + (
+                f". {len(coverage_gap_sessions)} session(s) excluded from both "
+                "chains for missing nav_change_usd."
+                if coverage_gap_sessions else ""
+            )
+        ),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
