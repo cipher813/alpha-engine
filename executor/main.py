@@ -743,6 +743,7 @@ def _write_order_book_summary(
     run_date: str,
     champion: str | None = None,
     promotion_source: str | None = None,
+    risk_flags_off: list[str] | None = None,
 ) -> None:
     """Write a public-safe order book summary to S3 for the dashboard.
 
@@ -756,6 +757,15 @@ def _write_order_book_summary(
     scanner_predictor_direct or thinktank_coverage paths; agentic runs
     leave both unset (None) here rather than hardcoding "agentic" — the
     pointer read result is the single source of truth for that label.
+
+    ``risk_flags_off`` (alpha-engine-config-I9021) — names, from
+    ``executor.risk_flag_audit.SAFETY_FLAGS_DEFAULT_OFF``, of feature-flagged
+    risk-config safety gates that are OFF this run (explicitly ``false`` or
+    absent from ``risk.yaml`` — behaviorally identical). Written every run,
+    including an empty list, so "all gates armed" and "not observed" are
+    never confused (principle 7: a component emitting nothing is
+    unobserved, not healthy). ``None`` only when the caller couldn't
+    compute it (defensive) — never silently omitted.
     """
     import boto3
 
@@ -763,6 +773,7 @@ def _write_order_book_summary(
         "date": run_date,
         "champion": champion,
         "promotion_source": promotion_source,
+        "risk_flags_off": risk_flags_off if risk_flags_off is not None else [],
         "entries_approved": [
             {"ticker": e["ticker"]} for e in ob.pending_entries()
         ],
@@ -1063,10 +1074,19 @@ def _write_stops_and_finalize(
 
     # Write public-safe summary for dashboard
     if signals_bucket:
+        from executor.risk_flag_audit import list_off_safety_flags
+
+        off_flags = list_off_safety_flags(config)
+        if off_flags:
+            logger.warning(
+                "Risk-config safety flags OFF this run (config#I9021): %s",
+                ", ".join(off_flags),
+            )
         _write_order_book_summary(
             ob, blocked_entries, signals_bucket, run_date,
             champion=(signals_raw or {}).get("champion"),
             promotion_source=(signals_raw or {}).get("promotion_source"),
+            risk_flags_off=off_flags,
         )
 
     # Consecutive zero-entries floor alarm (config#5713) — general-case

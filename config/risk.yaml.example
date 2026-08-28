@@ -39,16 +39,48 @@ min_score_to_enter: 30           # backstop only — predictor veto is primary g
 
 # Tighten min_score_to_enter when the predictor batch's mean prediction_confidence
 # is broadly low (degenerate-predictor backstop, per 2026-05-07 audit Phase 1).
-# Today's incident: 16 of 27 tickers clamped to p_up=0.458 (mean batch conf ~0.60),
-# 5 saturated at conf=0.99 — the per-ticker signal looked fine but the batch
-# distribution was degenerate. Default off; opt in only after shadow validation.
+# Original incident: 16 of 27 tickers clamped to p_up=0.458 (mean batch conf
+# ~0.60), 5 saturated at conf=0.99 — the per-ticker signal looked fine but the
+# batch distribution was degenerate.
+#
+# REVIEWED 2026-08-28 (alpha-engine-config-I9021): shipped default-off
+# 2026-05-07 and never turned on — the live risk.yaml carried no
+# batch_confidence_* key at all, so this backstop silently never fired for
+# the entire time it existed. STILL LEFT OFF here, deliberately: measuring
+# the book's actual confidence distribution over 35 trading sessions
+# (predictor/predictions/{date}.json daily means) found
+#   0.052, 0.052, 0.185, 0.177, 0.188, 0.184, 0.182, 0.194, 0.191, 0.194,
+#   0.178, 0.187, 0.299, 0.232, 0.243, 0.176, 0.166, 0.204, 0.257, 0.185,
+#   0.189, 0.188, 0.188, 0.138, 0.112, 0.191, 0.200, 0.220, 0.305, 0.281,
+#   0.110, 0.097, 0.098, 0.092, 0.094
+# — range 0.052-0.305, median ~0.188. The 0.30 threshold below sits at the
+# TOP of that range and would fire on ~34 of 35 sessions (~97%), which
+# would raise min_score_to_enter on nearly every trading day rather than
+# selectively on genuinely degenerate ones — a standing entry-suppression
+# dressed up as an exception path, not the backstop this was designed to
+# be. Root cause: 0.30 is a bare mechanical unit rescale (predictor PR #143
+# changed confidence semantics to |p_up-0.5|*2; the old 0.65
+# winner-probability threshold was rescaled via new=(old-0.5)*2) that was
+# never re-checked against the resulting distribution.
+#
+# Tracked: alpha-engine-config-I9034 replaces this absolute constant with a
+# threshold relative to the book's own trailing confidence distribution
+# (fraction of trailing median/percentile), to be shadow-validated per the
+# existing "opt in only after shadow validation" contract below before this
+# flag is ever flipped true in a live risk.yaml.
 batch_confidence_tightening_enabled: false
 # Confidence semantics post-2026-05-12: |p_up - 0.5| * 2 ∈ [0, 1] (predictor PR #143).
 # Threshold rescaled from 0.65 (old winner-prob units) to 0.30 (new units) via
-# new = (old - 0.5) * 2.
+# new = (old - 0.5) * 2. MISCALIBRATED against the measured distribution
+# above (fires ~97% of sessions) — do not enable batch_confidence_tightening
+# at this value; see alpha-engine-config-I9034.
 batch_confidence_threshold: 0.30    # if mean batch confidence < this, tighten
 batch_confidence_min_score_bump: 10 # bump min_score_to_enter by this when triggered
-momentum_gate_enabled: false      # disabled — predictor mean-reversion conflicts with this
+momentum_gate_enabled: false      # STALE — redeclared `true` below (DE-STANCED 2026-06-07); YAML
+                                   # last-key-wins makes this line inert. Flagged in the I9021 sweep
+                                   # comment as a doc defect, not a real off-by-default gate; left in
+                                   # place rather than deleted so the doc history stays legible — the
+                                   # live value is the second declaration.
 min_conviction_to_enter:         # only these conviction levels allow new entries
   - rising
   - stable
