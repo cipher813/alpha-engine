@@ -95,10 +95,9 @@ See ``tests/test_eod_report.py``.
 
 from __future__ import annotations
 
-import math
-
 import json
 import logging
+import math
 import sqlite3
 
 import boto3

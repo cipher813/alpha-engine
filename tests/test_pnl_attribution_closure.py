@@ -28,29 +28,29 @@ from executor.pnl_integrity import (
 
 
 def _attr(**over):
-    kwargs = dict(
-        prior_nav=1_000_000.0,
-        spy_return=0.5,
-        positions={
+    kwargs = {
+        "prior_nav": 1_000_000.0,
+        "spy_return": 0.5,
+        "positions": {
             "AAA": {
                 "shares": 100, "daily_return_usd": 500.0,
                 "closing_price": 110.0, "market_value": 11_000.0,
                 "ib_market_value": 11_000.0,
             },
         },
-        prior_positions={
+        "prior_positions": {
             "AAA": {
                 "shares": 100, "closing_price": 105.0,
                 "market_value": 10_500.0, "ib_market_value": 10_500.0,
             },
         },
-        interest_usd=10.0,
-        unattributed_usd=-250.0,
-        nav_change_usd=260.0,
-        trades_today=[],
-        pricing_timing_usd=0.0,
-        pricing_timing_available=True,
-    )
+        "interest_usd": 10.0,
+        "unattributed_usd": -250.0,
+        "nav_change_usd": 260.0,
+        "trades_today": [],
+        "pricing_timing_usd": 0.0,
+        "pricing_timing_available": True,
+    }
     kwargs.update(over)
     return compute_alpha_attribution(**kwargs)
 
