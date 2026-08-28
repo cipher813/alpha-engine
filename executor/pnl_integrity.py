@@ -639,3 +639,241 @@ def check_custodian_marks(
             ),
         })
     return breaches
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Attribution closure — the NAV mark-basis LEVEL
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY (alpha-engine-config-I8188, class sweep). ``eod_report`` published a field
+# named ``ties_to_headline``, computed as ``abs(dollar_alpha − Σ components) <
+# $1``, and ``eod_reconcile`` logged "investigate before trusting per-position
+# contributions" when it was False. Expanding the algebra, every constructed
+# term cancels — the rotation sleeve against itself, the pricing&timing sleeve
+# against itself, and the per-position SPY bases telescoping to ``prior_nav``
+# through the DEFINITION ``idle_cash := prior_nav − Σ held base − Σ rotated
+# base``. What is left is exactly
+#
+#     residual = nav_change_usd − position_pnl_usd − interest_usd
+#                              − unattributed_usd
+#
+# which is ``eod_reconcile``'s own defining equation for ``unattributed_usd``.
+# It is zero by construction. The check could never fail no matter what the
+# attribution did, and it asserted validation power it did not have — the same
+# class as I8188 defect 1 and I8307, one layer up.
+#
+# There is no non-tautological identity available here: any equation containing
+# the plug is satisfied by the plug's definition. The escape is to check a
+# quantity measured from a SECOND, independent source. That quantity is the
+# NAV mark basis:
+#
+#     nav_basis_level = nav_ib − (cash + accrued + Σ shares·settled_close)
+#
+# ``nav_ib`` is IB's NetLiquidation; the right-hand side is rebuilt from the
+# broker cash balance and ArcticDB settled closes. They are independent
+# measurements of the same book, so their difference CAN be non-zero, and a
+# non-zero value means a share count, a settled close, or the broker NAV is
+# wrong — precisely the condition under which the per-position contributions
+# should not be trusted.
+#
+# DETECTION BLINDNESS THIS CLOSES. ``_check_nav_three_way_hard_gate`` already
+# gates ``pricing_timing_usd = nav_basis_level(t) − nav_basis_level(t−1)``.
+# A basis error that is CONSTANT across two sessions — a persistently wrong
+# settled close, a share count wrong on both days, an unmodelled cash line —
+# cancels exactly in that difference and is invisible to it. The level gate
+# below is what sees it.
+#
+# CALIBRATION (measured over the 92 of 119 live sessions whose snapshot carries
+# closing_price + shares for every name, NAV ≈ $1.03M):
+#   |nav_basis_level| p50 $477 (4.6bp) · p90 $1,974 (19.9bp) ·
+#   p95 $2,723 (27.1bp) · p99/max $8,125 (78.4bp, 2026-08-04 — the AMD stale
+#   mark already known from the residual work).
+# HARD = max($5,000, 50bp of NAV) fires on 1 of 92 sessions (1.1%): the one
+# session that was genuinely broken. SOFT = max($1,000, 20bp) sits at ~p90 and
+# is email-only, matching the two-band shape used by the residual and
+# three-way gates.
+ATTRIBUTION_BASIS_HARD_USD_FLOOR = 5_000.0
+ATTRIBUTION_BASIS_HARD_NAV_BPS = 50.0
+ATTRIBUTION_BASIS_SOFT_USD_FLOOR = 1_000.0
+ATTRIBUTION_BASIS_SOFT_NAV_BPS = 20.0
+
+
+def attribution_basis_tolerance_usd(nav: float, *, hard: bool = True) -> float:
+    """Dollar bound on the NAV mark-basis LEVEL at this NAV."""
+    if hard:
+        return max(
+            ATTRIBUTION_BASIS_HARD_USD_FLOOR,
+            ATTRIBUTION_BASIS_HARD_NAV_BPS / 10_000.0 * nav,
+        )
+    return max(
+        ATTRIBUTION_BASIS_SOFT_USD_FLOOR,
+        ATTRIBUTION_BASIS_SOFT_NAV_BPS / 10_000.0 * nav,
+    )
+
+
+def nav_basis_level_usd(
+    *,
+    nav: float | None,
+    total_cash: float | None,
+    accrued_interest: float | None,
+    positions: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """Rebuild NAV from cash + settled marks and return the gap to broker NAV.
+
+    Returns ``{"available": bool, "nav_basis_usd": float | None,
+    "settled_mv_usd": float | None, "n_positions": int,
+    "n_positions_unpriced": int, "reason": str | None}``.
+
+    ``available`` is False — and the level is None, never a silent 0 — when the
+    broker NAV or cash is missing, or when ANY held name lacks a settled close
+    or a share count. A partial sum would understate the settled MV and
+    manufacture a basis gap out of missing data, which is the failure mode this
+    gate exists to distinguish from a real one.
+    """
+    n_positions = 0
+    n_unpriced = 0
+    settled_mv = 0.0
+    for _tkr, pos in (positions or {}).items():
+        n_positions += 1
+        close = pos.get("closing_price")
+        shares = pos.get("shares")
+        if close in (None, "") or shares in (None, ""):
+            n_unpriced += 1
+            continue
+        try:
+            settled_mv += float(close) * float(shares)
+        except (TypeError, ValueError):
+            n_unpriced += 1
+    if nav is None or total_cash is None:
+        reason = (
+            "broker NAV or cash balance absent — the settled-NAV rebuild has no "
+            "left-hand side to compare against"
+        )
+        return {
+            "available": False, "nav_basis_usd": None, "settled_mv_usd": None,
+            "n_positions": n_positions, "n_positions_unpriced": n_unpriced,
+            "reason": reason,
+        }
+    if n_unpriced:
+        reason = (
+            f"{n_unpriced} of {n_positions} held name(s) carry no settled close "
+            "or share count — the settled-MV leg would be understated, so the "
+            "basis level is NOT EVALUATED rather than reported wrong"
+        )
+        return {
+            "available": False, "nav_basis_usd": None, "settled_mv_usd": None,
+            "n_positions": n_positions, "n_positions_unpriced": n_unpriced,
+            "reason": reason,
+        }
+    basis = float(nav) - (float(total_cash) + float(accrued_interest or 0.0) + settled_mv)
+    return {
+        "available": True,
+        "nav_basis_usd": basis,
+        "settled_mv_usd": settled_mv,
+        "n_positions": n_positions,
+        "n_positions_unpriced": 0,
+        "reason": None,
+    }
+
+
+def check_attribution_closure(
+    *,
+    nav_basis: Mapping[str, Any],
+    nav: float | None,
+    components: Sequence[Mapping[str, Any]] | None = None,
+    run_date: str = "",
+) -> list[dict[str, Any]]:
+    """Non-tautological closure checks for the daily alpha attribution.
+
+    Two independent failure modes, both of which CAN fire:
+
+    ``attribution_arithmetic``
+        A component's ``contrib_usd`` is absent or non-finite. A NaN silently
+        poisons every downstream sum; this names the component.
+
+    ``attribution_basis_level``
+        The NAV mark-basis LEVEL exceeds :func:`attribution_basis_tolerance_usd`
+        — broker NAV and the settled rebuild disagree by more than the
+        settlement/mark noise band, so the per-position sleeves rest on marks
+        that do not add up to the book. See this section's header for why the
+        existing day-over-day gate cannot see this.
+
+    Returns a list of breach dicts (empty = clean), same shape as the residual
+    and custodian-mark gates so the caller dispatches all three identically.
+    """
+    breaches: list[dict[str, Any]] = []
+
+    for idx, comp in enumerate(components or []):
+        value = comp.get("contrib_usd")
+        finite = False
+        try:
+            finite = math.isfinite(float(value))
+        except (TypeError, ValueError):
+            finite = False
+        if finite:
+            continue
+        label = comp.get("label", f"#{idx}")
+        breaches.append({
+            "kind": "attribution_arithmetic",
+            "run_date": run_date,
+            "label": label,
+            "kind_of_component": comp.get("kind"),
+            "contrib_usd": value,
+            "message": (
+                f"Alpha attribution component {label!r} ({comp.get('kind')}) on "
+                f"{run_date} carries a non-finite contribution ({value!r}). Every "
+                "sleeve total, the per-name table and the sector rollup are "
+                "computed on top of it."
+            ),
+        })
+
+    if not nav:
+        return breaches
+    if not nav_basis.get("available"):
+        # Fail loud as NOT EVALUATED — an unmeasurable gate is not a passing
+        # gate. Recorded as a breach-shaped record with severity 'unevaluated'
+        # so the caller surfaces it rather than reading silence as health.
+        breaches.append({
+            "kind": "attribution_basis_level",
+            "severity": "unevaluated",
+            "run_date": run_date,
+            "nav_basis_usd": None,
+            "tolerance_usd": attribution_basis_tolerance_usd(nav),
+            "nav": nav,
+            "message": (
+                f"NAV mark-basis level NOT EVALUATED on {run_date}: "
+                f"{nav_basis.get('reason')}. The per-position attribution is "
+                "unverified for this session — this is an absent measurement, "
+                "not a clean one."
+            ),
+        })
+        return breaches
+
+    basis = float(nav_basis["nav_basis_usd"])
+    tolerance = attribution_basis_tolerance_usd(nav)
+    if abs(basis) <= tolerance:
+        return breaches
+    breaches.append({
+        "kind": "attribution_basis_level",
+        "severity": "breach",
+        "run_date": run_date,
+        "nav_basis_usd": basis,
+        "settled_mv_usd": nav_basis.get("settled_mv_usd"),
+        "n_positions": nav_basis.get("n_positions"),
+        "tolerance_usd": tolerance,
+        "tolerance_bps": ATTRIBUTION_BASIS_HARD_NAV_BPS,
+        "nav": nav,
+        "pct_of_nav": basis / nav * 100.0,
+        "message": (
+            f"NAV mark-basis level breach on {run_date}: broker NetLiquidation "
+            f"exceeds the settled rebuild (cash + accrued + Σ shares·settled "
+            f"close) by ${basis:+,.0f} ({basis / nav * 100:+.3f}% of NAV), past "
+            f"the ${tolerance:,.0f} bound "
+            f"({ATTRIBUTION_BASIS_HARD_NAV_BPS:.0f}bps of NAV). Two independent "
+            "measurements of the same book disagree, so a share count, a settled "
+            "close, or the broker NAV is wrong — the per-position alpha sleeves "
+            "rest on those marks. A CONSTANT basis error cancels in the "
+            "day-over-day three-way gate and is invisible to it."
+        ),
+    })
+    return breaches

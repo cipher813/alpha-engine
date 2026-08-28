@@ -439,8 +439,8 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_4(self):
-        assert SCHEMA_VERSION == "2.4"
+    def test_schema_version_is_2_5(self):
+        assert SCHEMA_VERSION == "2.5"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -492,7 +492,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.4"
+        assert report["schema_version"] == "2.5"
         # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
         # and the integrity-gate verdict reach the artifact. Before this the
         # only cost figure anywhere in the P&L path was the portfolio

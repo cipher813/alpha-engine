@@ -95,6 +95,8 @@ See ``tests/test_eod_report.py``.
 
 from __future__ import annotations
 
+import math
+
 import json
 import logging
 import sqlite3
@@ -103,7 +105,14 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.4"
+SCHEMA_VERSION = "2.5"
+# 2.5 (alpha-engine-config-I8188, class sweep): additive only. The
+# ``alpha_attribution`` block gains ``identity_is_tautological``,
+# ``identity_residual_note``, ``components_finite`` and ``component_sum_usd``.
+# ``residual_usd`` and ``ties_to_headline`` are RETAINED unchanged — they are
+# zero/True by construction and are now labelled as such rather than removed,
+# so a consumer reading them still parses while a consumer TRUSTING them can
+# see, in the artifact itself, that they validate nothing.
 # 2.4 (alpha-engine-config-I8188): adds the ``transaction_costs`` block
 # (named commission/slippage lines plus the gross-of-cost vs net-of-cost
 # split) and the ``integrity`` block (residual-bound / custodian-mark /
@@ -278,6 +287,14 @@ def compute_rotation_realized(
     return realized
 
 
+def _is_finite(value) -> bool:
+    """True only for a real, finite number — None/str/NaN/inf are all False."""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def compute_alpha_attribution(
     *,
     prior_nav: float | None,
@@ -413,7 +430,22 @@ def compute_alpha_attribution(
     })
 
     summed = sum(c["contrib_usd"] for c in components)
+    # ``residual`` is IDENTICALLY ZERO — it is not a check (I8188 class sweep).
+    # Expanding the algebra, the rotation sleeve cancels against itself, the
+    # pricing&timing sleeve cancels against itself, and the per-position SPY
+    # bases telescope to ``prior_nav`` through the DEFINITION of ``idle_cash``
+    # just above. What survives is
+    #     nav_change_usd − position_pnl_usd − interest_usd − unattributed_usd
+    # which is ``eod_reconcile``'s defining equation for ``unattributed_usd``.
+    # Both fields are RETAINED (S3 schema rule: add, never remove) but are now
+    # labelled for what they are; the check with actual power over these
+    # sleeves is ``pnl_integrity.check_attribution_closure``, dispatched by
+    # ``eod_reconcile``, which compares the broker NAV against an independently
+    # rebuilt settled NAV.
     residual = dollar_alpha - summed
+    components_finite = all(
+        _is_finite(c.get("contrib_usd")) for c in components
+    )
 
     return {
         "basis": "prior_nav",
@@ -431,6 +463,21 @@ def compute_alpha_attribution(
         "idle_cash": idle_cash,
         "residual_usd": residual,
         "ties_to_headline": abs(residual) < 1.0,
+        # ── Honesty fields (alpha-engine-config-I8188 class sweep) ──────────
+        # ``ties_to_headline`` is TRUE BY CONSTRUCTION and validates nothing;
+        # a consumer must not read it as evidence the attribution is sound.
+        "identity_is_tautological": True,
+        "identity_residual_note": (
+            "residual_usd is zero by construction — unattributed_usd is the "
+            "plug of the very identity it closes. Read attribution_closure "
+            "in the integrity breaches instead."
+        ),
+        # This one CAN be False: a NaN/inf/absent contribution poisons every
+        # downstream sum and is not visible in residual_usd (NaN propagates
+        # into `summed`, and abs(NaN) < 1.0 is False only by accident of
+        # ordering, never by design).
+        "components_finite": components_finite,
+        "component_sum_usd": summed,
     }
 
 
