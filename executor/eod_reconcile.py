@@ -157,6 +157,154 @@ def _check_nav_three_way_hard_gate(
 # by-hand trace.
 NAV_BREACH_RESIDUAL_FLOOR_USD = 500.0  # matches the pre-existing soft data_warnings floor (config#1276)
 
+# ── Mark-basis divergence attribution (alpha-engine-config-I9085) ──────────
+# `_detect_ib_mark_outside_range` is a POINT test on today's book, but
+# `pricing_timing_usd` is a day-over-day DIFFERENCE of the mark basis. Every
+# bad mark therefore produces TWO hard-gate breaches — one on the day it
+# lands, and an equal-and-opposite one on the day it reverts — and the
+# point detector is structurally blind to the second. Measured pairs:
+# AMD 2026-08-04 (−$9,560) / 2026-08-05 (+$8,906); MU 2026-08-26 (+$1,980,
+# FLAGGED out of range) / 2026-08-27 (−$3,293, ZERO tickers flagged).
+#
+# The reversion day is the one an operator gets no help on: the alert named
+# tickers only out of `ib_mark_range_flags`, so the 2026-08-27 page carried a
+# portfolio total and not one name, which is the exact operator failure
+# config#6349 deliverable 2 was filed to end.
+#
+# The independent, non-tautological test for "IB's mark is not the close" is
+# the per-name distance between the IB mark and that day's SETTLED CLOSE —
+# a property of the DATA, not of our arithmetic. `[Low, High]` is a strict
+# subset of it: a mark can sit inside the day's traded range and still be
+# stale by a full percent (MU 2026-08-27: mark $923.07 vs settled close
+# $935.39, −1.32%, inside the range, −$1,331 of basis on 108 shares).
+IB_MARK_OFF_CLOSE_PCT_FLOOR = 0.10  # 10bp — beyond this the mark is not the close
+MARK_BASIS_TOP_CONTRIBUTORS = 5     # names carried into the alert text
+
+
+def _mark_basis_usd(pos: dict | None) -> float | None:
+    """Day's mark basis for one position: ``ib_market_value - market_value``.
+
+    ``None`` when either side is absent (pre-schema-2.1 snapshot) — never
+    guessed as zero, which would silently under-state the divergence.
+    """
+    if pos is None:
+        return 0.0
+    ib_mv, mv = pos.get("ib_market_value"), pos.get("market_value")
+    if ib_mv is None or mv is None:
+        return None
+    return float(ib_mv) - float(mv)
+
+
+def _off_close_pct(pos: dict | None) -> float | None:
+    """|IB mark − settled close| as a percent of the settled close."""
+    if not pos:
+        return None
+    shares = pos.get("shares") or 0
+    ib_mv, mv = pos.get("ib_market_value"), pos.get("market_value")
+    if not shares or ib_mv is None or mv is None or not mv:
+        return None
+    return abs((float(ib_mv) - float(mv)) / float(mv)) * 100.0
+
+
+def _attribute_mark_basis_divergence(
+    *,
+    positions: dict,
+    prior_positions: dict | None,
+    top_n: int = MARK_BASIS_TOP_CONTRIBUTORS,
+) -> dict:
+    """Per-name attribution of the day-over-day mark-basis term.
+
+    Returns ``{"contributors": [...], "explained_usd": float | None,
+    "covered_usd": float, "uncovered_names": int}``.
+
+    ``contributors`` is every held-or-previously-held name with a non-zero
+    basis delta, ranked by ``abs(delta)``, each carrying today's and the
+    prior day's basis and off-close percentage plus a ``reversion`` flag
+    (the two days' bases are materially opposite in sign — the signature of
+    a bad mark unwinding, which is what makes the second breach unnameable
+    by the point detector).
+
+    ``explained_usd`` sums the deltas of names whose IB mark demonstrably
+    is not the settled close on EITHER day — off-close beyond
+    ``IB_MARK_OFF_CLOSE_PCT_FLOOR``. This is the term the classifier tests
+    against, and unlike the full-book sum it is a FILTERED subset: it can
+    genuinely fail to explain the breach, which is the whole point. It is
+    ``None`` when no name on either day carries schema-2.1
+    ``ib_market_value`` (nothing to test against; the caller falls back).
+    """
+    contributors: list[dict] = []
+    explained_usd = 0.0
+    covered_usd = 0.0
+    uncovered = 0
+    any_basis = False
+    for tkr in sorted(set(positions or {}) | set((prior_positions or {}).keys())):
+        pos_t = (positions or {}).get(tkr)
+        pos_p = (prior_positions or {}).get(tkr)
+        basis_t = _mark_basis_usd(pos_t)
+        basis_p = _mark_basis_usd(pos_p)
+        if basis_t is None or basis_p is None:
+            uncovered += 1
+            continue
+        any_basis = True
+        delta = basis_t - basis_p
+        if not delta:
+            continue
+        covered_usd += delta
+        off_t = _off_close_pct(pos_t)
+        off_p = _off_close_pct(pos_p)
+        off_close = max(
+            (v for v in (off_t, off_p) if v is not None), default=None,
+        )
+        mark_is_not_close = (
+            off_close is not None and off_close >= IB_MARK_OFF_CLOSE_PCT_FLOOR
+        )
+        if mark_is_not_close:
+            explained_usd += delta
+        contributors.append({
+            "ticker": tkr,
+            "contrib_usd": delta,
+            "basis_today_usd": basis_t,
+            "basis_prior_usd": basis_p,
+            "off_close_pct_today": off_t,
+            "off_close_pct_prior": off_p,
+            "mark_is_not_close": mark_is_not_close,
+            # A bad mark unwinding: materially non-zero on both days and
+            # opposite in sign. Names the PRIOR day's mark as today's cause.
+            "reversion": (
+                basis_t * basis_p < 0
+                and min(abs(basis_t), abs(basis_p)) >= NAV_BREACH_RESIDUAL_FLOOR_USD / 10
+            ),
+        })
+    contributors.sort(key=lambda c: -abs(c["contrib_usd"]))
+    return {
+        "contributors": contributors[:top_n],
+        "explained_usd": explained_usd if any_basis else None,
+        "covered_usd": covered_usd,
+        "uncovered_names": uncovered,
+    }
+
+
+def _format_mark_basis_contributors(contributors: list[dict]) -> str:
+    """Always-present ticker detail for the hard-gate alert.
+
+    Unlike `_format_mark_range_detail` this does not depend on any name
+    crossing a traded-range boundary, so a reversion-day breach names its
+    culprits too.
+    """
+    parts = []
+    for c in contributors:
+        off_t = c["off_close_pct_today"]
+        off_p = c["off_close_pct_prior"]
+        pct_p = "n/a" if off_p is None else f"{off_p:.2f}%"
+        pct_t = "n/a" if off_t is None else f"{off_t:.2f}%"
+        parts.append(
+            f"{c['ticker']} ${c['contrib_usd']:+,.0f} "
+            f"(mark-basis ${c['basis_prior_usd']:+,.0f}→${c['basis_today_usd']:+,.0f}, "
+            f"off-close {pct_p}→{pct_t}"
+            f"{', REVERSION of prior-day mark' if c['reversion'] else ''})"
+        )
+    return "; ".join(parts)
+
 
 def _detect_ib_mark_outside_range(
     *,
@@ -203,55 +351,94 @@ def _classify_nav_breach(
     *,
     full_book_mark_basis_usd: float | None = None,
     full_book_uncovered_names: int = 0,
+    mark_divergence_explained_usd: float | None = None,
 ) -> dict:
     """Classify a hard-gate breach as a broker data-quality event rather
     than a NAV reconcile defect (config#6349 deliverable 4) — a different
     remediation (chase the broker feed) than a code defect (chase the
     reconcile math).
 
-    The attribution basis is the FULL-BOOK mark-basis term
-    ``Σ_positions Δ(ib_market_value − market_value)`` — the same quantity
-    ``pricing_timing_usd`` is built from — not the out-of-range subset
-    (alpha-engine-config-I8733). Out-of-range is a strict LOWER BOUND on
-    mark divergence: a mark that is wrong but still inside the day's traded
-    ``[Low, High]`` moves ``pricing_timing_usd`` and is invisible to
-    ``_detect_ib_mark_outside_range``. Attributing on the flagged subset
-    alone therefore over-states the unexplained residual, and a book-wide
-    mark skew where only one or two names happen to cross a range boundary
-    is labelled ``reconcile_defect`` — sending a responder into attribution
-    math that is closing to ten dollars. Measured live on 2026-08-26:
-    breach $3,934, flagged subset explained $1,201, residual $2,733 →
-    ``reconcile_defect``, while the full book explained it to $0.01.
+    **Two independent tests, both of which must pass to earn the softer
+    `broker_data_quality` label** (alpha-engine-config-I9085):
+
+    1. **Explanation.** ``mark_divergence_explained_usd`` is the mark-basis
+       delta summed over ONLY those names whose IB mark demonstrably is not
+       that day's settled close — off-close beyond
+       ``IB_MARK_OFF_CLOSE_PCT_FLOOR`` on either day (see
+       ``_attribute_mark_basis_divergence``). Its residual against the
+       breach is the unexplained dollars.
+
+    2. **NAV identity tie-out.** ``full_book_mark_basis_usd`` is
+       ``Σ_positions Δ(ib_market_value − market_value)``. Differenced
+       against ``pricing_timing_usd`` — which is
+       ``Δ(nav_ib − cash − accrued − Σ market_value)`` — cash, accrued and
+       the settled leg all cancel, leaving
+       ``Δ(nav_ib − cash − accrued − Σ ib_market_value)``: whether IB's own
+       reported NetLiquidation equals the sum of its own components. That
+       is a real control (it catches an IB sleeve we do not model), and it
+       is reported as ``nav_identity_residual_usd``.
+
+    **Why the shape changed.** Shipped as of I8733, test 2 WAS the
+    explanation test — ``explained`` was set True unconditionally on the
+    full-book basis and the residual was the identity above. But that
+    residual is ~0 by construction on any ordinary equities book. Measured
+    over all 48 sessions with an artifact (2026-06-22 → 2026-08-28):
+    ``|pricing_timing_unattributable_usd| <= $63.54`` on every single day
+    and ``<= $10`` on 45 of 48, against a $500 floor. The
+    ``reconcile_defect`` branch was therefore UNREACHABLE from the call
+    site, and a genuine reconcile defect would have paged at severity
+    ``warning`` under a "chase the broker feed" label. The unit tests could
+    not catch it because they hand-fed ``full_book_mark_basis_usd`` values
+    the call site cannot produce. Same failure class as the tautological
+    attribution tie-out replaced by alpha-engine-config-I8188.
+
+    Test 1 is non-tautological precisely because it is a FILTERED subset
+    keyed on a property of the data rather than of our arithmetic: a breach
+    moved by something other than a stale broker mark lands in its residual
+    and classifies ``reconcile_defect``.
+
+    ``mark_divergence_explained_usd=None`` — no schema-2.1
+    ``ib_market_value`` on either day — falls back to the flagged
+    out-of-range subset, the pre-#8733 behaviour, which never over-explains.
 
     The test is on ``abs(residual)`` and so is SIGN-SYMMETRIC: the term is
-    a day-over-day difference and its recorded instances split 4 high / 4
-    low, so a one-sided guard would miss half the class (premise correction
-    on config#6819, 2026-08-26).
-
-    ``full_book_mark_basis_usd=None`` — no snapshot-2.1 ``ib_market_value``
-    on one of the two days — falls back to the flagged-subset test, which
-    is what shipped before this and never over-explains. ``uncovered``
-    names are reported but do not soften the test: an incomplete full-book
-    sum can only fail to explain a breach, never wrongly explain one.
+    a day-over-day difference and its recorded instances split roughly even
+    high/low, so a one-sided guard would miss half the class (premise
+    correction on config#6819, 2026-08-26).
     """
     total_mark_error_usd = sum(f["mark_error_usd"] for f in mark_range_flags)
     flagged_subset_residual_usd = pricing_timing_usd - total_mark_error_usd
-    if full_book_mark_basis_usd is None:
+    nav_identity_residual_usd = (
+        None if full_book_mark_basis_usd is None
+        else pricing_timing_usd - full_book_mark_basis_usd
+    )
+    if mark_divergence_explained_usd is None:
         basis = "flagged_subset"
         residual_usd = flagged_subset_residual_usd
         explained = bool(mark_range_flags)
     else:
-        basis = "full_book"
-        residual_usd = pricing_timing_usd - full_book_mark_basis_usd
+        basis = "off_close_marks"
+        residual_usd = pricing_timing_usd - mark_divergence_explained_usd
         explained = True
     fully_explained = explained and abs(residual_usd) <= NAV_BREACH_RESIDUAL_FLOOR_USD
+    identity_holds = (
+        nav_identity_residual_usd is None
+        or abs(nav_identity_residual_usd) <= NAV_BREACH_RESIDUAL_FLOOR_USD
+    )
     return {
-        "classification": "broker_data_quality" if fully_explained else "reconcile_defect",
+        "classification": (
+            "broker_data_quality"
+            if (fully_explained and identity_holds)
+            else "reconcile_defect"
+        ),
         "attribution_basis": basis,
         "total_mark_error_usd": total_mark_error_usd,
         "flagged_subset_residual_usd": flagged_subset_residual_usd,
         "full_book_mark_basis_usd": full_book_mark_basis_usd,
         "full_book_uncovered_names": full_book_uncovered_names,
+        "mark_divergence_explained_usd": mark_divergence_explained_usd,
+        "nav_identity_residual_usd": nav_identity_residual_usd,
+        "nav_identity_holds": identity_holds,
         "residual_usd": residual_usd,
     }
 
@@ -1294,6 +1481,21 @@ def run(
             ),
         )
 
+    # Per-position mark-basis diagnostics (alpha-engine-config-I9085). The
+    # `[Low, High]` flag is a strict SUBSET of "the IB mark is not the close":
+    # a mark can sit inside the day's traded range and still be off the close
+    # by a full percent, and it still moves `pricing_timing_usd` dollar for
+    # dollar. Persisting the basis and the off-close percentage on every
+    # position makes eod_report.json self-diagnosing for the whole class,
+    # not just for the boundary-crossing subset (generalizes config#6349
+    # deliverable 3).
+    for _tkr, _pos in positions.items():
+        _basis = _mark_basis_usd(_pos)
+        if _basis is None:
+            continue
+        _pos["mark_basis_usd"] = _basis
+        _pos["ib_mark_off_close_pct"] = _off_close_pct(_pos)
+
     # ── Explicit ex-date dividend accrual (alpha-engine-config-I8188) ───────
     # dividend_usd summed to exactly $0.00 across all 115 live sessions while
     # the book held LMT (34 sessions), CTAS (27), MA, COST, AXP, BRO and FAST
@@ -1561,6 +1763,14 @@ def run(
             _pt_by_ticker, _pt_uncovered = compute_pricing_timing_by_ticker(
                 positions, prior_positions if prior_snapshot_loaded else None,
             )
+            # Per-name attribution of the DIFFERENCED mark-basis term
+            # (alpha-engine-config-I9085). Supplies both the explanation
+            # term the classifier tests against and the ticker detail the
+            # alert carries unconditionally.
+            _mb = _attribute_mark_basis_divergence(
+                positions=positions,
+                prior_positions=prior_positions if prior_snapshot_loaded else None,
+            )
             _breach_classification = _classify_nav_breach(
                 nav_hard_gate_breach["pricing_timing_usd"],
                 ib_mark_range_flags,
@@ -1568,16 +1778,37 @@ def run(
                     sum(_pt_by_ticker.values()) if prior_snapshot_loaded else None
                 ),
                 full_book_uncovered_names=_pt_uncovered,
+                mark_divergence_explained_usd=(
+                    _mb["explained_usd"] if prior_snapshot_loaded else None
+                ),
             )
             nav_hard_gate_breach.update(_breach_classification)
+            nav_hard_gate_breach["mark_basis_contributors"] = _mb["contributors"]
             # Classification is always named — a book-wide mark skew can now
             # classify broker_data_quality with ZERO tickers out of range, and
             # the responder still has to be told which way to go.
             nav_hard_gate_breach["message"] += (
                 f" Classification: {_breach_classification['classification']} "
                 f"(basis {_breach_classification['attribution_basis']}, "
-                f"residual ${_breach_classification['residual_usd']:+,.0f})."
+                f"residual ${_breach_classification['residual_usd']:+,.0f}"
+                + (
+                    ""
+                    if _breach_classification["nav_identity_residual_usd"] is None
+                    else f", NAV-identity residual "
+                         f"${_breach_classification['nav_identity_residual_usd']:+,.0f}"
+                )
+                + ")."
             )
+            # ALWAYS name the culprits, not only when a mark crossed a traded
+            # range boundary (alpha-engine-config-I9085). On the 2026-08-27
+            # breach zero tickers were out of range while MU alone carried
+            # 75% of the −$4,393 — the operator got a portfolio total and no
+            # name, which is what config#6349 deliverable 2 existed to end.
+            if _mb["contributors"]:
+                nav_hard_gate_breach["message"] += (
+                    " Top mark-basis contributors — "
+                    f"{_format_mark_basis_contributors(_mb['contributors'])}."
+                )
             if ib_mark_range_flags:
                 nav_hard_gate_breach["message"] += (
                     " IB mark outside traded range — "
@@ -1617,6 +1848,17 @@ def run(
                         "classification": nav_hard_gate_breach["classification"],
                         "ib_mark_outside_range_tickers": [
                             f["ticker"] for f in ib_mark_range_flags
+                        ],
+                        "nav_identity_residual_usd": nav_hard_gate_breach[
+                            "nav_identity_residual_usd"
+                        ],
+                        "mark_basis_top_contributors": [
+                            {
+                                "ticker": c["ticker"],
+                                "contrib_usd": round(c["contrib_usd"], 2),
+                                "reversion": c["reversion"],
+                            }
+                            for c in _mb["contributors"]
                         ],
                     },
                 )
