@@ -11,12 +11,12 @@ attrs==26.1.0
     #   referencing
 beautifulsoup4==4.15.0
     # via yfinance
-boto3==1.43.53
+boto3==1.43.82
     # via
     #   -r requirements.in
     #   krepis
     #   nousergon-lib
-botocore==1.43.53
+botocore==1.43.82
     # via
     #   boto3
     #   s3transfer
@@ -84,7 +84,7 @@ narwhals==2.24.0
     # via scikit-learn
 nest-asyncio==1.6.0
     # via ib-insync
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@6206f33e37867063927d3efe632c9469491d3b09
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@008969bdc43f9e418ae6ec98a9c46784fc490d9b
     # via -r requirements.in
 numpy==2.4.6
     # via
