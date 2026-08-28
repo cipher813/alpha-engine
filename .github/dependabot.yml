@@ -21,6 +21,16 @@ updates:
       majors:
         update-types:
           - major
+    ignore:
+      # pandas major 3.x is unreachable while arcticdb (latest 6.23.0, measured
+      # 2026-08-28 via `curl -s https://pypi.org/pypi/arcticdb/json`) pins
+      # `pandas<3` — requirements.in documents the same ceiling. Every proposal
+      # burns a CI run on a ResolutionImpossible that no change here can fix
+      # (alpha-engine-config-I6956, I8309, I7141). Un-ignore once arcticdb's
+      # requires_dist admits pandas 3.
+      - dependency-name: "pandas"
+        update-types:
+          - "version-update:semver-major"
 
   # NOTE: no cooldown here — Dependabot rejects cooldown.semver-major-days for
   # the github-actions ecosystem (semver cooldown keys are per-ecosystem; pip
