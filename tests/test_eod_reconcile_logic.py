@@ -8,15 +8,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from executor.eod_reconcile import (
+    IB_MARK_OFF_CLOSE_PCT_FLOOR,
     NAV_BREACH_RESIDUAL_FLOOR_USD,
     NAV_HARD_GATE_TOLERANCE_NAV_BPS,
     NAV_HARD_GATE_TOLERANCE_USD_FLOOR,
     _apply_dividend_delta,
+    _attribute_mark_basis_divergence,
     _check_nav_three_way_hard_gate,
     _classify_nav_breach,
     _compute_daily_return,
     _compute_unattributed_residual_pct,
     _detect_ib_mark_outside_range,
+    _format_mark_basis_contributors,
     _format_mark_range_detail,
     _load_constituents_sector_map,
     _nav_hard_gate_tolerance_usd,
@@ -358,84 +361,114 @@ class TestClassifyNavBreach:
         assert result["classification"] == "reconcile_defect"
 
 
-class TestClassifyNavBreachFullBook:
-    """config#8733 — out-of-range is a strict LOWER BOUND on mark divergence.
+class TestClassifyNavBreachTieOut:
+    """alpha-engine-config-I9085 — the full-book term is the NAV IDENTITY
+    tie-out, not an explanation of the breach.
 
-    A mark that is wrong but still inside the day's traded range moves
-    `pricing_timing_usd` and is invisible to `_detect_ib_mark_outside_range`,
-    so attributing on the flagged subset alone over-states the unexplained
-    residual and mislabels a book-wide skew as a reconcile defect.
+    `full_book_mark_basis_usd` is `Σ Δ(ib_market_value − market_value)`;
+    `pricing_timing_usd` is `Δ(nav_ib − cash − accrued − Σ market_value)`.
+    Differenced, cash/accrued/settled all cancel and what is left is whether
+    IB's own NetLiquidation equals the sum of IB's own components — ~$0 on
+    any ordinary equities book. Measured over all 48 sessions carrying an
+    artifact (2026-06-22 → 2026-08-28): |residual| <= $63.54 every day and
+    <= $10 on 45 of 48, against a $500 floor. Shipped as of I8733 that term
+    WAS the explanation test, which made `reconcile_defect` unreachable from
+    the call site — the same tautological-tie-out class as I8188.
     """
 
     # Live figures, run_date=2026-08-26 (alpha-engine-config#8722/#8733).
     PRICING_TIMING_USD = 3_933.92
-    # MU $+1,169 and SPY $+32 were the only two names outside their range.
     FLAGGED = [
         {"ticker": "MU", "mark_error_usd": 1_169.00},
         {"ticker": "SPY", "mark_error_usd": 32.00},
     ]
-    # `pricing_timing_unattributable_usd` that day was $0.01 — the full book
-    # explains the breach essentially exactly.
     FULL_BOOK_USD = 3_933.91
 
-    def test_2026_08_26_book_wide_skew_classifies_broker_data_quality(self):
+    def test_perfect_identity_tie_out_alone_does_not_earn_data_quality(self):
+        """THE REGRESSION GUARD. The full book tying out exactly is the
+        normal, always-true state; on its own it must no longer explain
+        anything. With no name measurably off its settled close, the honest
+        answer is `reconcile_defect`."""
+        result = _classify_nav_breach(
+            self.PRICING_TIMING_USD,
+            [],
+            full_book_mark_basis_usd=self.PRICING_TIMING_USD,
+            mark_divergence_explained_usd=0.0,
+        )
+        assert result["classification"] == "reconcile_defect"
+        assert result["nav_identity_residual_usd"] == pytest.approx(0.0)
+        assert result["nav_identity_holds"] is True
+        assert result["residual_usd"] == pytest.approx(self.PRICING_TIMING_USD)
+
+    def test_off_close_marks_explaining_the_breach_classify_data_quality(self):
         result = _classify_nav_breach(
             self.PRICING_TIMING_USD,
             self.FLAGGED,
             full_book_mark_basis_usd=self.FULL_BOOK_USD,
+            mark_divergence_explained_usd=self.PRICING_TIMING_USD - 30.0,
         )
         assert result["classification"] == "broker_data_quality"
-        assert result["attribution_basis"] == "full_book"
-        assert result["residual_usd"] == pytest.approx(0.01)
-        # The flagged-subset residual — the number the shipped classifier used
-        # — is still reported, and is still $2,733 above the floor.
-        assert result["flagged_subset_residual_usd"] == pytest.approx(2_732.92)
-        assert abs(result["flagged_subset_residual_usd"]) > NAV_BREACH_RESIDUAL_FLOOR_USD
+        assert result["attribution_basis"] == "off_close_marks"
+        assert result["residual_usd"] == pytest.approx(30.0)
 
-    def test_full_book_residual_beyond_floor_stays_reconcile_defect(self):
-        """A genuine attribution defect — the full book does NOT explain it."""
+    def test_partially_explained_by_off_close_marks_stays_reconcile_defect(self):
         result = _classify_nav_breach(
             self.PRICING_TIMING_USD,
             self.FLAGGED,
-            full_book_mark_basis_usd=1_200.00,
+            full_book_mark_basis_usd=self.FULL_BOOK_USD,
+            mark_divergence_explained_usd=1_200.00,
         )
         assert result["classification"] == "reconcile_defect"
-        assert result["attribution_basis"] == "full_book"
         assert result["residual_usd"] == pytest.approx(2_733.92)
 
-    def test_book_wide_skew_with_no_ticker_out_of_range(self):
-        """The extreme of the class the shipped classifier could never reach:
-        every mark wrong, none far enough to cross a range boundary."""
+    def test_broken_nav_identity_forces_reconcile_defect(self):
+        """IB's NetLiquidation not equalling the sum of its own components is
+        a real control — an unmodelled sleeve. It overrides a clean
+        off-close explanation."""
         result = _classify_nav_breach(
-            self.PRICING_TIMING_USD, [],
-            full_book_mark_basis_usd=self.PRICING_TIMING_USD,
+            self.PRICING_TIMING_USD,
+            self.FLAGGED,
+            full_book_mark_basis_usd=self.PRICING_TIMING_USD - 5_000.0,
+            mark_divergence_explained_usd=self.PRICING_TIMING_USD,
         )
-        assert result["classification"] == "broker_data_quality"
+        assert result["classification"] == "reconcile_defect"
+        assert result["nav_identity_holds"] is False
+        assert result["nav_identity_residual_usd"] == pytest.approx(5_000.0)
 
     def test_classification_is_sign_symmetric(self):
         """The term is a day-over-day difference and its recorded exceedances
-        split 4 high / 4 low (premise correction on config#6819), so the guard
-        must behave identically on a negative breach."""
+        split roughly even high/low (premise correction on config#6819), so
+        the guard must behave identically on a negative breach."""
         hi = _classify_nav_breach(
-            self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=self.PRICING_TIMING_USD,
+            self.PRICING_TIMING_USD, [],
+            full_book_mark_basis_usd=self.PRICING_TIMING_USD,
+            mark_divergence_explained_usd=self.PRICING_TIMING_USD,
         )
         lo = _classify_nav_breach(
-            -self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=-self.PRICING_TIMING_USD,
+            -self.PRICING_TIMING_USD, [],
+            full_book_mark_basis_usd=-self.PRICING_TIMING_USD,
+            mark_divergence_explained_usd=-self.PRICING_TIMING_USD,
         )
         assert hi["classification"] == lo["classification"] == "broker_data_quality"
         hi_bad = _classify_nav_breach(
-            self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=0.0,
+            self.PRICING_TIMING_USD, [],
+            full_book_mark_basis_usd=self.PRICING_TIMING_USD,
+            mark_divergence_explained_usd=0.0,
         )
         lo_bad = _classify_nav_breach(
-            -self.PRICING_TIMING_USD, [], full_book_mark_basis_usd=0.0,
+            -self.PRICING_TIMING_USD, [],
+            full_book_mark_basis_usd=-self.PRICING_TIMING_USD,
+            mark_divergence_explained_usd=0.0,
         )
         assert hi_bad["classification"] == lo_bad["classification"] == "reconcile_defect"
 
-    def test_missing_full_book_term_falls_back_to_flagged_subset(self):
-        """No schema-2.1 ib_market_value on one of the two days — the pre-#8733
+    def test_missing_explanation_term_falls_back_to_flagged_subset(self):
+        """No schema-2.1 ib_market_value on either day — the pre-#8733
         behaviour, which never over-explains."""
         result = _classify_nav_breach(
-            self.PRICING_TIMING_USD, self.FLAGGED, full_book_mark_basis_usd=None,
+            self.PRICING_TIMING_USD, self.FLAGGED,
+            full_book_mark_basis_usd=None,
+            mark_divergence_explained_usd=None,
         )
         assert result["attribution_basis"] == "flagged_subset"
         assert result["classification"] == "reconcile_defect"
@@ -443,45 +476,126 @@ class TestClassifyNavBreachFullBook:
     def test_uncovered_names_are_reported_and_do_not_soften_the_test(self):
         result = _classify_nav_breach(
             self.PRICING_TIMING_USD, [],
-            full_book_mark_basis_usd=1_000.0,
+            full_book_mark_basis_usd=self.PRICING_TIMING_USD,
             full_book_uncovered_names=3,
+            mark_divergence_explained_usd=1_000.0,
         )
         assert result["full_book_uncovered_names"] == 3
         assert result["classification"] == "reconcile_defect"
 
 
-class TestComputePricingTimingByTicker:
-    """The full-book decomposition is ONE implementation, shared by the
-    classifier and `pricing_timing_unattributable_usd` (config#8733)."""
+def _pos(shares, ib_mark, close):
+    return {
+        "shares": shares,
+        "ib_market_value": shares * ib_mark,
+        "market_value": shares * close,
+    }
 
-    def test_sums_day_over_day_mark_basis_across_the_whole_book(self):
-        from executor.eod_report import compute_pricing_timing_by_ticker
 
-        today = {
-            "MU": {"ib_market_value": 103_309.56, "market_value": 101_347.20},
-            "PBF": {"ib_market_value": 1_000.0, "market_value": 849.0},
-        }
-        prior = {
-            "MU": {"ib_market_value": 100_000.0, "market_value": 100_000.0},
-            "PBF": {"ib_market_value": 900.0, "market_value": 900.0},
-        }
-        by_ticker, uncovered = compute_pricing_timing_by_ticker(today, prior)
-        assert uncovered == 0
-        assert by_ticker["MU"] == pytest.approx(1_962.36)
-        assert by_ticker["PBF"] == pytest.approx(151.0)
-        assert sum(by_ticker.values()) == pytest.approx(2_113.36)
+class TestAttributeMarkBasisDivergence:
+    """alpha-engine-config-I9085 — `pricing_timing_usd` is a day-over-day
+    DIFFERENCE of the mark basis, but `_detect_ib_mark_outside_range` is a
+    POINT test on today's book. Every bad mark therefore produces TWO
+    breaches — the day it lands and the day it reverts — and the point
+    detector is structurally blind to the second.
 
-    def test_a_name_missing_either_days_fields_is_counted_not_guessed(self):
-        from executor.eod_report import compute_pricing_timing_by_ticker
+    Reference instance, run_date=2026-08-27 (the third occurrence of this
+    alert class): MU 108 shares, IB mark $923.07 vs settled close $935.39
+    (−1.32%, INSIDE the day's traded range so nothing flagged), prior-day
+    basis +$1,962.36 from a mark that WAS out of range on 08-26. The
+    resulting −$3,292.92 is 75% of a −$4,393 breach on which the alert named
+    not one ticker.
+    """
 
-        by_ticker, uncovered = compute_pricing_timing_by_ticker(
-            {"AAA": {"ib_market_value": 10.0, "market_value": 9.0},
-             "BBB": {"market_value": 5.0}},
-            {"AAA": {"ib_market_value": 8.0, "market_value": 8.0},
-             "BBB": {"ib_market_value": 5.0, "market_value": 5.0}},
+    # 2026-08-26 → 2026-08-27, live figures.
+    PRIOR = {"MU": _pos(108, 956.57, 938.40), "CRUS": _pos(1008, 111.11, 110.34)}
+    TODAY = {"MU": _pos(108, 923.07, 935.39), "CRUS": _pos(1008, 110.90, 110.88)}
+
+    def test_mu_reversion_is_named_and_priced(self):
+        out = _attribute_mark_basis_divergence(
+            positions=self.TODAY, prior_positions=self.PRIOR,
         )
-        assert uncovered == 1
-        assert set(by_ticker) == {"AAA"}
+        top = out["contributors"][0]
+        assert top["ticker"] == "MU"
+        assert top["contrib_usd"] == pytest.approx(-3_292.92, abs=0.5)
+        assert top["basis_prior_usd"] == pytest.approx(1_962.36, abs=0.5)
+        assert top["basis_today_usd"] == pytest.approx(-1_330.56, abs=0.5)
+        # The mechanism the point detector cannot see.
+        assert top["reversion"] is True
+        # In range on 08-27 — so this is NOT reachable via the range flag.
+        assert top["off_close_pct_today"] == pytest.approx(1.32, abs=0.02)
+
+    def test_contributors_are_ranked_by_absolute_dollars(self):
+        out = _attribute_mark_basis_divergence(
+            positions=self.TODAY, prior_positions=self.PRIOR,
+        )
+        dollars = [abs(c["contrib_usd"]) for c in out["contributors"]]
+        assert dollars == sorted(dollars, reverse=True)
+
+    def test_explained_excludes_names_whose_mark_IS_the_close(self):
+        """The explanation term is a FILTERED subset keyed on a property of
+        the DATA — that is what makes it non-tautological. A name whose IB
+        mark equals its settled close on both days contributes nothing to
+        it, so a breach moved by something else cannot be explained away."""
+        prior = {"AAA": _pos(100, 50.0, 50.0)}
+        today = {"AAA": _pos(100, 50.0, 50.0), "BBB": _pos(100, 20.0, 20.0)}
+        out = _attribute_mark_basis_divergence(
+            positions=today, prior_positions=prior,
+        )
+        assert out["explained_usd"] == pytest.approx(0.0)
+
+    def test_off_close_floor_is_the_discriminator(self):
+        """Just over the floor counts; just under does not."""
+        over = 1.0 + (IB_MARK_OFF_CLOSE_PCT_FLOOR * 2) / 100.0
+        under = 1.0 + (IB_MARK_OFF_CLOSE_PCT_FLOOR / 2) / 100.0
+        prior = {"OVR": _pos(100, 50.0, 50.0), "UND": _pos(100, 50.0, 50.0)}
+        today = {
+            "OVR": _pos(100, 50.0 * over, 50.0),
+            "UND": _pos(100, 50.0 * under, 50.0),
+        }
+        out = _attribute_mark_basis_divergence(
+            positions=today, prior_positions=prior,
+        )
+        by = {c["ticker"]: c for c in out["contributors"]}
+        assert by["OVR"]["mark_is_not_close"] is True
+        assert by["UND"]["mark_is_not_close"] is False
+        assert out["explained_usd"] == pytest.approx(by["OVR"]["contrib_usd"])
+
+    def test_pre_schema_2_1_names_are_uncovered_not_guessed(self):
+        prior = {"AAA": {"shares": 10, "market_value": 100.0}}
+        today = {"AAA": _pos(10, 11.0, 10.0)}
+        out = _attribute_mark_basis_divergence(
+            positions=today, prior_positions=prior,
+        )
+        assert out["uncovered_names"] == 1
+        assert out["contributors"] == []
+        assert out["explained_usd"] is None
+
+    def test_no_prior_snapshot_is_not_an_error(self):
+        out = _attribute_mark_basis_divergence(
+            positions=self.TODAY, prior_positions=None,
+        )
+        assert {c["ticker"] for c in out["contributors"]} == {"MU", "CRUS"}
+
+
+class TestFormatMarkBasisContributors:
+    """alpha-engine-config-I9085 deliverable — the alert names culprits on
+    EVERY breach, not only when a mark crossed a traded-range boundary. The
+    2026-08-27 page carried a portfolio total and zero tickers, which is the
+    operator failure config#6349 deliverable 2 was filed to end."""
+
+    def test_names_ticker_dollars_and_the_reversion(self):
+        contributors = _attribute_mark_basis_divergence(
+            positions=TestAttributeMarkBasisDivergence.TODAY,
+            prior_positions=TestAttributeMarkBasisDivergence.PRIOR,
+        )["contributors"]
+        detail = _format_mark_basis_contributors(contributors)
+        assert "MU" in detail
+        assert "-3,292" in detail or "-3,293" in detail
+        assert "REVERSION" in detail
+
+    def test_empty_contributors_render_empty(self):
+        assert _format_mark_basis_contributors([]) == ""
 
 
 class TestFormatMarkRangeDetail:
@@ -732,3 +846,75 @@ class TestLoadConstituentsSectorMap:
         )
         mock_boto3.client.return_value = s3
         assert _load_constituents_sector_map("bucket") == {}
+
+
+class TestHardGateWiringIsNotTautological:
+    """alpha-engine-config-I9085 — the defect the unit tests could not see.
+
+    `_classify_nav_breach`'s `reconcile_defect` branch was exercised only by
+    tests that hand-fed a `full_book_mark_basis_usd` the CALL SITE cannot
+    produce: `run()` passes `sum(compute_pricing_timing_by_ticker(...))`,
+    which is the same quantity `pricing_timing_usd` is built from. These
+    tests assert on the composition `run()` actually performs.
+    """
+
+    def _wire(self, positions, prior_positions, pricing_timing_usd):
+        """Exactly the composition at the `run()` hard-gate call site."""
+        from executor.eod_report import compute_pricing_timing_by_ticker
+
+        by_ticker, uncovered = compute_pricing_timing_by_ticker(
+            positions, prior_positions,
+        )
+        mb = _attribute_mark_basis_divergence(
+            positions=positions, prior_positions=prior_positions,
+        )
+        return mb, _classify_nav_breach(
+            pricing_timing_usd,
+            _detect_ib_mark_outside_range(
+                positions=positions, day_low={}, day_high={},
+            ),
+            full_book_mark_basis_usd=sum(by_ticker.values()),
+            full_book_uncovered_names=uncovered,
+            mark_divergence_explained_usd=mb["explained_usd"],
+        )
+
+    def test_marks_that_are_the_close_cannot_explain_a_breach(self):
+        """A large divergence with every IB mark equal to its settled close
+        is NOT a broker data-quality event — it is unexplained, and pages at
+        error. Under the shipped (I8733) wiring this returned
+        `broker_data_quality` at severity `warning`."""
+        prior = {"AAA": _pos(1000, 100.0, 100.0)}
+        today = {"AAA": _pos(1000, 100.0, 100.0)}
+        _mb, result = self._wire(today, prior, pricing_timing_usd=-6_000.0)
+        assert result["classification"] == "reconcile_defect"
+        assert result["attribution_basis"] == "off_close_marks"
+
+    def test_2026_08_27_reversion_day_classifies_and_names_mu(self):
+        """The live breach this was filed on: −$4,393, ZERO tickers out of
+        range, MU carrying 75% of it via a mark $12.32 below the settled
+        close and INSIDE the day's traded range."""
+        prior = TestAttributeMarkBasisDivergence.PRIOR
+        today = TestAttributeMarkBasisDivergence.TODAY
+        mb, result = self._wire(today, prior, pricing_timing_usd=-4_051.62)
+        assert result["classification"] == "broker_data_quality"
+        assert mb["contributors"][0]["ticker"] == "MU"
+        assert mb["contributors"][0]["reversion"] is True
+        # Deliverable: the alert names a ticker even though nothing was
+        # flagged out of range.
+        assert result["total_mark_error_usd"] == 0.0
+        assert "MU" in _format_mark_basis_contributors(mb["contributors"])
+
+    def test_explanation_term_is_strictly_narrower_than_the_full_book(self):
+        """The structural guard: if these two are ever equal by
+        construction, the classifier is tautological again."""
+        prior = {
+            "OFF": _pos(100, 50.0, 50.0),
+            "ON": _pos(100, 50.0, 50.0),
+        }
+        today = {
+            "OFF": _pos(100, 55.0, 50.0),   # 10% off close
+            "ON": _pos(100, 50.001, 50.0),  # 0.002% — the mark IS the close
+        }
+        mb, _result = self._wire(today, prior, pricing_timing_usd=500.1)
+        assert mb["explained_usd"] != pytest.approx(mb["covered_usd"])
+        assert mb["explained_usd"] == pytest.approx(500.0)

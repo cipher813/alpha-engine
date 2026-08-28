@@ -104,7 +104,13 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.5"
+SCHEMA_VERSION = "2.6"
+# 2.6 (alpha-engine-config-I9085): additive only. Each position row gains
+# ``mark_basis_usd`` (``ib_market_value − market_value``) and
+# ``ib_mark_off_close_pct``. The pre-existing ``ib_mark_outside_range`` flag
+# is a strict SUBSET of these — a mark inside the day's traded range can
+# still be off the settled close by a full percent and still moves
+# ``pricing_timing_usd`` dollar for dollar. No 2.5 field changed meaning.
 # 2.5 (alpha-engine-config-I8188, class sweep): additive only. The
 # ``alpha_attribution`` block gains ``identity_is_tautological``,
 # ``identity_residual_note``, ``components_finite`` and ``component_sum_usd``.
@@ -579,6 +585,15 @@ def build_eod_report(
             "ib_market_value": pos.get("ib_market_value"),
             "ib_mark_outside_range": pos.get("ib_mark_outside_range", False),
             "ib_mark_range_error_usd": pos.get("ib_mark_range_error_usd"),
+            # Schema 2.4 (alpha-engine-config-I9085): the out-of-range flag
+            # above is a strict SUBSET of "the IB mark is not the settled
+            # close". A mark inside the day's traded range but off the close
+            # moves `pricing_timing_usd` dollar for dollar and is invisible to
+            # that flag — MU 2026-08-27, mark $923.07 vs close $935.39
+            # (-1.32%, in range), carried 75% of a -$4,393 hard-gate breach
+            # with zero tickers flagged.
+            "mark_basis_usd": pos.get("mark_basis_usd"),
+            "ib_mark_off_close_pct": pos.get("ib_mark_off_close_pct"),
             "pct_nav": (mv / nav * 100.0) if nav else None,
             "daily_return_pct": pos.get("daily_return_pct"),
             "daily_return_usd": pos.get("daily_return_usd"),

@@ -5,33 +5,33 @@
 # I2734 intent CANNOT be a second per-ecosystem block on its own monthly schedule
 # (that shape is invalid and disables ALL updates for the repo). The `majors`
 # group + `cooldown.semver-major-days: 30` below is the closest legal expression.
+#
+# THE PIP ECOSYSTEM IS DELIBERATELY ABSENT (alpha-engine-config-I9060).
+# requirements.txt in this repo is a `uv pip compile` artifact of
+# requirements.in, and pyproject.toml's nousergon-lib pin is held in lockstep
+# with the tag requirements.in declares. Dependabot edits requirements.txt and
+# pyproject.toml directly and knows nothing about requirements.in, so by
+# construction every pip PR it opened arrived red on BOTH:
+#
+#   lockfile-reproducible  FAIL: requirements.txt is not reproducible from
+#                          requirements.in.
+#   test                   nousergon-lib pin drift: requirements.in=v0.124.93
+#                          but pyproject.toml==0.124.94
+#
+# (measured on crucible-executor#511, 2026-08-28). Dependabot PRs are a
+# STANDING auto-merge exception (`auto-merge-policy`); an exception whose PRs
+# are structurally incapable of going green never fires, so the fleet believed
+# this repo had automated dependency maintenance and it had none.
+#
+# Python dependencies are upgraded by `.github/upgrade_lock.sh` instead — the
+# tool that owns the lockfile, running the same compile flags the guard
+# verifies against (`.github/lockfile_compile.sh`) — driven weekly by
+# nousergon/alpha-engine-config's `lockfile-upgrade-sweep`, which opens the PR
+# under the ne-groomer App token so CI actually grades it. Removing the
+# ecosystem here loses nothing that worked: pip-audit still runs on every PR
+# and on the daily schedule, and it is what catches a vulnerable pin.
 version: 2
 updates:
-  - package-ecosystem: pip
-    directory: "/"
-    schedule:
-      interval: weekly
-    cooldown:
-      semver-major-days: 30
-    groups:
-      minor-and-patch:
-        update-types:
-          - minor
-          - patch
-      majors:
-        update-types:
-          - major
-    ignore:
-      # pandas major 3.x is unreachable while arcticdb (latest 6.23.0, measured
-      # 2026-08-28 via `curl -s https://pypi.org/pypi/arcticdb/json`) pins
-      # `pandas<3` — requirements.in documents the same ceiling. Every proposal
-      # burns a CI run on a ResolutionImpossible that no change here can fix
-      # (alpha-engine-config-I6956, I8309, I7141). Un-ignore once arcticdb's
-      # requires_dist admits pandas 3.
-      - dependency-name: "pandas"
-        update-types:
-          - "version-update:semver-major"
-
   # NOTE: no cooldown here — Dependabot rejects cooldown.semver-major-days for
   # the github-actions ecosystem (semver cooldown keys are per-ecosystem; pip
   # supports them, actions does not — validated live 2026-07-16). The majors
