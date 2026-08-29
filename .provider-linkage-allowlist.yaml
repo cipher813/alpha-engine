@@ -1,0 +1,37 @@
+# .provider-linkage-allowlist.yaml -- baseline for the fleet-wide
+# provider-linkage guard (alpha-engine-config-I9295, spine I9294 --
+# Brian's 2026-08-29 ruling: the entire nous ergon system runs through
+# the krepis router, no parallel setups).
+#
+# Every entry pre-clears a KNOWN match that is not a live call site. A new
+# match with no entry fails the build. An entry whose `expires` has passed
+# fails loudly -- re-justify or remove, never silently re-grandfather. An
+# entry that no longer matches anything ALSO fails, so the allowance cannot
+# quietly widen after the thing it covered is gone.
+#
+# `pattern` is the namespaced `<provider>:<class>` identifier the guard
+# reports. The key is (path, pattern) -- one entry covers every line in
+# that file matching that class.
+
+schema_version: 1
+entries:
+  - path: infrastructure/systemd/alpha-engine-daemon.service
+    pattern: anthropic:env_key
+    reason: >-
+      Comment explaining why ANTHROPIC_API_KEY is NOT read by the daemon
+      unit (executor LLM path removed 2026-05-25, deprecated legacy env
+      file in a prior PR (#890) -- every live secret is now sourced via
+      nousergon_lib.secrets.get_secret()). Documents an absence, not a
+      call site.
+    expires: "2027-02-28"
+    tracking: alpha-engine-config-I9295
+
+  - path: tests/test_no_secret_environ_reads.py
+    pattern: anthropic:env_key
+    reason: >-
+      Regression test asserting ANTHROPIC_API_KEY is never read via
+      os.environ.get/os.getenv anywhere in this repo -- the literal appears
+      only inside the _PINNED_SECRETS frozenset the test greps against, to
+      confirm its absence.
+    expires: "2027-02-28"
+    tracking: alpha-engine-config-I9295
