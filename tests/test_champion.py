@@ -29,6 +29,7 @@ from executor.champion import (
     CHAMPION_POINTER_KEY,
     COHORT_FRESH_MAX_DAYS,
     RESEARCH_FREE_PARQUET_KEY,
+    SHADOW_SIGNALS_KEY_TEMPLATE,
     THINKTANK_COVERAGE_FRESHNESS_MAX_DAYS,
     ChampionPointerError,
     StaleChampionFeedError,
@@ -1588,3 +1589,316 @@ class TestScannerPredictorDirectIsUntouched:
         )
 
         assert not any(k.startswith("universe_membership/") for k in s3.reads), s3.reads
+
+
+# ── The generic shadow-signals arm handler (alpha-engine-config-I9299) ──────
+
+
+def _shadow_key(arm: str, date: str) -> str:
+    return SHADOW_SIGNALS_KEY_TEMPLATE.format(arm=arm, date=date)
+
+
+def _shadow_bytes(
+    arm: str,
+    date: str,
+    *,
+    entries: list[tuple[str, float]] | None = None,
+    holds: list[str] | None = None,
+    producer: str | None = ...,  # type: ignore[assignment]
+    declared_date: str | None = ...,  # type: ignore[assignment]
+) -> bytes:
+    """A conforming ``arm_shadow_signals.schema.json`` document.
+
+    Built from the schema's declared shape, not copied from a live artifact:
+    the shape under test is ``signals`` keyed by ticker with ``signal`` and a
+    numeric ``score``, which is what the shared scorer reads.
+    """
+    entries = entries if entries is not None else [("AAA", 91.0), ("BBB", 77.0), ("CCC", 64.0)]
+    signals: dict[str, dict] = {
+        t: {"ticker": t, "signal": "ENTER", "score": s, "champion_arm": arm}
+        for t, s in entries
+    }
+    for t in holds or []:
+        signals[t] = {"ticker": t, "signal": "HOLD", "score": 12.0}
+    doc: dict = {"schema_version": 1, "signals": signals}
+    if producer is not ...:
+        doc["producer"] = producer
+    else:
+        doc["producer"] = arm
+    if declared_date is not ...:
+        doc["date"] = declared_date
+    else:
+        doc["date"] = date
+    return json.dumps(doc).encode()
+
+
+_SHADOW_CONFIG = {
+    "champion_freshness_max_days": 8,
+    "champion_top_n_default": 2,
+    "champion_score_floor": 60,
+    "champion_score_ceiling": 95,
+}
+
+
+class TestShadowSignalsArm:
+    """The two arms Brian's 2026-08-29 ruling made promotion-eligible."""
+
+    RUN_DATE = "2026-08-31"
+
+    def _apply(self, arm="no_agent_quant", objects=None, config=None, signals_raw=None):
+        if objects is None:
+            objects = {_shadow_key(arm, self.RUN_DATE): _shadow_bytes(arm, self.RUN_DATE)}
+        s3 = _FakeS3(objects)
+        return apply_champion_selection(
+            signals_raw if signals_raw is not None else {"date": self.RUN_DATE, "buy_candidates": [], "universe": []},
+            {},
+            bucket="test-bucket",
+            run_date=self.RUN_DATE,
+            config=config or _SHADOW_CONFIG,
+            sector_map={"AAA": "Tech"},
+            s3_client=s3,
+            pointer={"schema_version": 1, "champion": arm, "promotion_source": "gate_engine"},
+        )
+
+    @pytest.mark.parametrize("arm", ["no_agent_quant", "single_agent_quant"])
+    def test_serves_both_eligible_arms(self, arm):
+        signals_raw, preds = self._apply(arm=arm)
+        assert signals_raw["champion"] == arm
+        tickers = [c["ticker"] for c in signals_raw["buy_candidates"]]
+        assert tickers == ["AAA", "BBB"]  # champion_top_n_default=2, best first
+        assert all(c["champion_arm"] == arm for c in signals_raw["buy_candidates"])
+        assert set(preds) == {"AAA", "BBB"}
+
+    def test_pointer_for_a_shadow_arm_is_accepted_by_the_loader(self):
+        """The regression I9299 exists to prevent: promoting onto one of these
+        arms used to raise at planner start and HALT trading."""
+        for arm in ("no_agent_quant", "single_agent_quant"):
+            s3 = _FakeS3({CHAMPION_POINTER_KEY: _pointer_bytes(champion=arm)})
+            assert load_champion_pointer("test-bucket", s3_client=s3)["champion"] == arm
+
+    def test_hold_entries_are_ignored_and_enter_entries_ranked(self):
+        objects = {
+            _shadow_key("no_agent_quant", self.RUN_DATE): _shadow_bytes(
+                "no_agent_quant", self.RUN_DATE,
+                entries=[("LOW", 61.0), ("HIGH", 99.0), ("MID", 80.0)],
+                holds=["ZZZ", "YYY"],
+            )
+        }
+        signals_raw, _ = self._apply(objects=objects, config={**_SHADOW_CONFIG, "champion_top_n_default": 3})
+        assert [c["ticker"] for c in signals_raw["buy_candidates"]] == ["HIGH", "MID", "LOW"]
+
+    def test_score_is_remapped_onto_the_shared_band_not_carried_raw(self):
+        """The arm's own composite is 0-100; the served score must be on the
+        same band every other arm uses or min_score_to_enter would gate the
+        arms at different effective thresholds (§4)."""
+        signals_raw, _ = self._apply(
+            config={**_SHADOW_CONFIG, "champion_top_n_default": 3},
+        )
+        scores = [c["score"] for c in signals_raw["buy_candidates"]]
+        assert scores[0] == 95.0
+        assert scores[-1] == 60.0
+        assert scores == sorted(scores, reverse=True)
+        # ...and the arm's own score is preserved for forensics.
+        assert [c["arm_score"] for c in signals_raw["buy_candidates"]] == [91.0, 77.0, 64.0]
+
+    def test_ties_break_on_ticker_so_the_served_set_is_reproducible(self):
+        objects = {
+            _shadow_key("no_agent_quant", self.RUN_DATE): _shadow_bytes(
+                "no_agent_quant", self.RUN_DATE, entries=[("ZZZ", 70.0), ("AAA", 70.0)],
+            )
+        }
+        signals_raw, _ = self._apply(objects=objects)
+        assert [c["ticker"] for c in signals_raw["buy_candidates"]] == ["AAA", "ZZZ"]
+
+    def test_count_matches_live_buy_candidates_when_present(self):
+        signals_raw, _ = self._apply(
+            signals_raw={
+                "date": self.RUN_DATE,
+                "buy_candidates": [{"ticker": "OLD1"}],
+                "universe": [],
+            },
+        )
+        assert len(signals_raw["buy_candidates"]) == 1
+
+    def test_injected_predictions_assert_no_alpha_and_are_confidence_neutral(self):
+        _, preds = self._apply()
+        for row in preds.values():
+            assert row["predicted_alpha"] is None
+            assert row["predicted_direction"] is None
+            assert row["prediction_confidence"] == 0.0
+            assert "alpha_anchor" not in row
+
+    def test_injected_predictions_cover_the_synthesized_candidates(self):
+        signals_raw, preds = self._apply()
+        assert_predictions_cover_buy_candidates(signals_raw, preds)
+
+    def test_champion_cohort_block_is_emitted_on_the_healthy_path(self):
+        signals_raw, _ = self._apply()
+        cohort = signals_raw["champion_cohort"]
+        assert cohort["cohort_prediction_date"] == self.RUN_DATE
+        assert cohort["age_days"] == 0
+        assert cohort["is_stale"] is False
+        assert cohort["pool_source"] == "shadow_signals:no_agent_quant"
+        assert cohort["pool_key"] == _shadow_key("no_agent_quant", self.RUN_DATE)
+
+    def test_sector_is_stamped_from_the_sector_map(self):
+        signals_raw, _ = self._apply()
+        by_ticker = {c["ticker"]: c["sector"] for c in signals_raw["buy_candidates"]}
+        assert by_ticker["AAA"] == "Tech"
+        assert by_ticker["BBB"] == "Unknown"
+
+    # ── failure modes ───────────────────────────────────────────────────
+
+    def test_absent_artifact_raises_and_says_absent_not_stale(self):
+        with pytest.raises(ChampionPointerError) as exc:
+            self._apply(objects={})
+        assert "ABSENT" in str(exc.value)
+
+    def test_stale_cohort_raises_stale_not_absent(self):
+        """A shadow that exists but is older than the serving bound is a
+        DIFFERENT failure from one that was never written."""
+        old = "2026-08-10"  # 21 days before RUN_DATE, inside the 30d lookback
+        with pytest.raises(StaleChampionFeedError):
+            self._apply(objects={_shadow_key("no_agent_quant", old): _shadow_bytes("no_agent_quant", old)})
+
+    def test_malformed_json_raises(self):
+        with pytest.raises(ChampionPointerError):
+            self._apply(objects={_shadow_key("no_agent_quant", self.RUN_DATE): b"{not json"})
+
+    def test_non_object_document_raises(self):
+        with pytest.raises(ChampionPointerError):
+            self._apply(objects={_shadow_key("no_agent_quant", self.RUN_DATE): b"[1,2,3]"})
+
+    def test_missing_signals_object_raises(self):
+        payload = json.dumps({"date": self.RUN_DATE, "producer": "no_agent_quant"}).encode()
+        with pytest.raises(ChampionPointerError):
+            self._apply(objects={_shadow_key("no_agent_quant", self.RUN_DATE): payload})
+
+    def test_zero_enter_picks_raises_rather_than_serving_an_empty_book(self):
+        objects = {
+            _shadow_key("no_agent_quant", self.RUN_DATE): _shadow_bytes(
+                "no_agent_quant", self.RUN_DATE, entries=[], holds=["AAA", "BBB"],
+            )
+        }
+        with pytest.raises(ChampionPointerError) as exc:
+            self._apply(objects=objects)
+        assert "MISS" in str(exc.value)
+
+    def test_non_numeric_score_on_an_enter_pick_raises(self):
+        doc = {
+            "date": self.RUN_DATE,
+            "producer": "no_agent_quant",
+            "signals": {"AAA": {"ticker": "AAA", "signal": "ENTER", "score": None}},
+        }
+        with pytest.raises(ChampionPointerError):
+            self._apply(objects={_shadow_key("no_agent_quant", self.RUN_DATE): json.dumps(doc).encode()})
+
+    def test_producer_mismatch_raises(self):
+        objects = {
+            _shadow_key("no_agent_quant", self.RUN_DATE): _shadow_bytes(
+                "no_agent_quant", self.RUN_DATE, producer="single_agent_quant",
+            )
+        }
+        with pytest.raises(ChampionPointerError) as exc:
+            self._apply(objects=objects)
+        assert "single_agent_quant" in str(exc.value)
+
+    def test_cohort_date_mismatch_raises(self):
+        objects = {
+            _shadow_key("no_agent_quant", self.RUN_DATE): _shadow_bytes(
+                "no_agent_quant", self.RUN_DATE, declared_date="2026-01-01",
+            )
+        }
+        with pytest.raises(ChampionPointerError):
+            self._apply(objects=objects)
+
+    def test_non_404_s3_error_raises_rather_than_walking_past_it(self):
+        class _DeniedS3:
+            def get_object(self, Bucket, Key):  # noqa: N803
+                raise ClientError(
+                    error_response={"Error": {"Code": "AccessDenied", "Message": "nope"}},
+                    operation_name="GetObject",
+                )
+
+        with pytest.raises(ChampionPointerError):
+            apply_champion_selection(
+                {"date": self.RUN_DATE, "buy_candidates": [], "universe": []},
+                {},
+                bucket="test-bucket",
+                run_date=self.RUN_DATE,
+                config=_SHADOW_CONFIG,
+                sector_map={},
+                s3_client=_DeniedS3(),
+                pointer={"schema_version": 1, "champion": "no_agent_quant"},
+            )
+
+    def test_walk_back_picks_the_NEWEST_cohort_within_the_window(self):
+        objects = {
+            _shadow_key("no_agent_quant", "2026-08-29"): _shadow_bytes(
+                "no_agent_quant", "2026-08-29", entries=[("NEW", 90.0)],
+            ),
+            _shadow_key("no_agent_quant", "2026-08-25"): _shadow_bytes(
+                "no_agent_quant", "2026-08-25", entries=[("OLD", 90.0)],
+            ),
+        }
+        signals_raw, _ = self._apply(objects=objects)
+        assert [c["ticker"] for c in signals_raw["buy_candidates"]] == ["NEW"]
+        assert signals_raw["champion_cohort"]["cohort_prediction_date"] == "2026-08-29"
+
+
+class TestServingRegisterIsDerived:
+    """alpha-engine-config-I9299 deliverable 4 — the allowlist IS the dispatch."""
+
+    def test_every_valid_champion_resolves_to_exactly_one_way_of_being_served(self):
+        from executor import champion as champ
+
+        for arm in champ.VALID_CHAMPIONS:
+            ways = [
+                arm in champ.NOOP_CHAMPION_ARMS_SERVED,
+                arm in champ._DEDICATED_ARM_HANDLERS,
+                arm in champ.SHADOW_SERVED_ARMS,
+            ]
+            assert sum(ways) == 1, f"{arm} is served in {sum(ways)} ways"
+
+    def test_valid_champions_is_not_a_standalone_literal(self):
+        """The defect: a hand-typed tuple 70 lines from the dispatch it had to
+        agree with. It went stale twice. Assert it is BUILT, not typed."""
+        import pathlib
+        import re
+
+        src = pathlib.Path(champion_module_path()).read_text()
+        m = re.search(r"^VALID_CHAMPIONS = (.*?)^\n", src, re.M | re.S)
+        assert m, "VALID_CHAMPIONS assignment not found"
+        body = m.group(1)
+        assert "NOOP_CHAMPION_ARMS_SERVED" in body
+        assert "_DEDICATED_ARM_HANDLERS" in body
+        assert "SHADOW_SERVED_ARMS" in body
+        assert '"agentic"' not in body
+
+    def test_the_two_eligible_arms_are_servable(self):
+        from executor.champion import VALID_CHAMPIONS
+
+        assert "no_agent_quant" in VALID_CHAMPIONS
+        assert "single_agent_quant" in VALID_CHAMPIONS
+
+    def test_sector_map_arm_set_is_derived_and_covers_every_synthesizing_arm(self):
+        from executor.champion import (
+            ARMS_REQUIRING_SECTOR_MAP,
+            NOOP_CHAMPION_ARMS_SERVED,
+            VALID_CHAMPIONS,
+        )
+
+        assert set(ARMS_REQUIRING_SECTOR_MAP) == set(VALID_CHAMPIONS) - set(NOOP_CHAMPION_ARMS_SERVED)
+
+    def test_main_does_not_carry_its_own_arm_literal(self):
+        import pathlib
+
+        src = pathlib.Path(champion_module_path()).parent.joinpath("main.py").read_text()
+        assert 'in ("scanner_predictor_direct", "thinktank_coverage")' not in src
+        assert "ARMS_REQUIRING_SECTOR_MAP" in src
+
+
+def champion_module_path() -> str:
+    from executor import champion as champ
+
+    return champ.__file__
