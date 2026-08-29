@@ -7,8 +7,9 @@
 #
 # Prerequisites:
 #   - Amazon Linux 2023 AMI
-#   - ~/.alpha-engine.env with secrets (GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY,
-#     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+#   - ~/.alpha-engine.env with secrets (GMAIL_APP_PASSWORD,
+#     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) -- no LLM-provider key is a
+#     prerequisite (executor LLM path removed 2026-05-25)
 #   - IB Gateway + IBC installed at ~/ibgateway and ~/ibc
 #   - config/risk.yaml created manually (gitignored)
 #
