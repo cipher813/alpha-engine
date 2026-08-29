@@ -402,6 +402,7 @@ def _read_signals(
     _champion_injected_predictions: dict = {}
     if not simulate:
         from executor.champion import (
+            ARMS_REQUIRING_SECTOR_MAP,
             apply_champion_selection,
             assert_producer_champion_coherence,
             load_champion_pointer,
@@ -418,7 +419,13 @@ def _read_signals(
         # BEFORE apply_champion_selection so the guard sees the producer's
         # own artifact, not a champion-stamped copy.
         assert_producer_champion_coherence(signals_raw, _champion_pointer, config)
-        if _champion_pointer["champion"] in ("scanner_predictor_direct", "thinktank_coverage"):
+        # DERIVED, not a literal (alpha-engine-config-I9299). The tuple that
+        # used to be inline here was a fourth hand-maintained arm register and
+        # had already gone stale: `scanner_top20_predictor` became servable on
+        # 2026-08-27 and was never added, so every entry that arm synthesized
+        # was stamped sector="Unknown" — silently switching the sector
+        # concentration cap off for it.
+        if _champion_pointer["champion"] in ARMS_REQUIRING_SECTOR_MAP:
             from executor.eod_reconcile import _load_constituents_sector_map
             sector_map = _load_constituents_sector_map(signals_bucket)
         else:

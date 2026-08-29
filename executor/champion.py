@@ -9,6 +9,12 @@ candidate source between arms without touching the exit/risk stack:
   * ``scanner_predictor_direct`` — the "measured" arm: entries synthesized
                                  directly from the research-free predictor's
                                  outcome parquet, ranked by predicted_alpha.
+  * ``no_agent_quant`` /      — served GENERICALLY from the arm's own
+    ``single_agent_quant``       ``signals_shadow/{arm}/{date}/signals.json``
+                                 artifact by ``_apply_shadow_signals_arm``
+                                 (alpha-engine-config-I9299). Any arm
+                                 crucible-research registers that publishes
+                                 that artifact is servable with no edit here.
   * ``thinktank_coverage``    — the Think Tank challenger arm (epic I2515):
                                  entries synthesized from the Think Tank
                                  challenger-selection artifact
@@ -70,11 +76,69 @@ RESEARCH_FREE_PARQUET_KEY = "predictor/research_free_backfill/predictor_outcomes
 # crucible-research; the key is a stable S3 contract, not shared code).
 CHALLENGER_SELECTION_LATEST_KEY = "thinktank/challenger_selection/latest.json"
 
-VALID_CHAMPIONS = (
-    "agentic",
-    "scanner_predictor_direct",
-    "scanner_top20_predictor",
-    "thinktank_coverage",
+#: The COMPARABLE per-arm artifact every registered producer arm writes, on
+#: every weekly pass, regardless of which arm the pointer currently serves
+#: (champion-challenger-policy.md §3). Schema:
+#: ``crucible-research/contracts/arm_shadow_signals.schema.json`` — a top-level
+#: ``signals`` object keyed by ticker, each entry carrying ``signal`` and a
+#: numeric ``score``. Kept as a literal here rather than a cross-repo import,
+#: the same convention ``CHALLENGER_SELECTION_LATEST_KEY`` already uses: a
+#: stable S3 contract is not shared code.
+SHADOW_SIGNALS_KEY_TEMPLATE = "signals_shadow/{arm}/{date}/signals.json"
+
+#: How far back the shadow resolver LOOKS, which is deliberately much wider
+#: than how far back it will SERVE (``champion_freshness_max_days``, default 8).
+#:
+#: The two bounds do different jobs and collapsing them is the defect
+#: alpha-engine-config-I9307 was about: an arm that has never written a shadow
+#: (ABSENT) and an arm whose shadow stopped six weeks ago (STALE) are different
+#: failures with different operator actions, and a resolver that only looked 8
+#: days back would report both as "absent". So: resolve the newest cohort in a
+#: 30-day window, then let ``_check_freshness`` decide whether it may trade.
+#: Absent → ``ChampionPointerError``; stale → ``StaleChampionFeedError``.
+SHADOW_LOOKBACK_DIAGNOSTIC_DAYS = 30
+
+# ── The SERVING register (alpha-engine-config-I9299) ─────────────────────────
+#
+# ``VALID_CHAMPIONS`` used to be a hand-typed tuple, and was the THIRD such
+# register of the same fact (crucible-backtester ``VALID_CHAMPIONS``,
+# crucible-research ``FILLING_CHAMPION_ARMS``, this one). The other two are now
+# DERIVED from crucible-research's producer register; this one is derived from
+# the only fact this repo actually owns — **which arms this module can serve,
+# and how**. It is assembled at the bottom of this module from the dispatch
+# table itself (``_DEDICATED_ARM_HANDLERS``) plus the generically-served set
+# (``SHADOW_SERVED_ARMS``), so the allowlist can no longer drift from the
+# dispatch: adding a branch without adding it to the allowlist, or the reverse,
+# is not expressible.
+#
+# The names are declared just below; the tuple is BUILT after the handlers
+# exist (Python needs the functions defined first). ``tests/test_champion.py``
+# asserts no standalone literal register remains.
+
+#: Arms this module passes through untouched — they neither read nor fill
+#: ``buy_candidates``. Paired with an empty-by-contract producer this is the
+#: config#5713 incoherence; see ``assert_producer_champion_coherence``.
+NOOP_CHAMPION_ARMS_SERVED = ("agentic",)
+
+#: Arms served by the GENERIC shadow-signals handler
+#: (``_apply_shadow_signals_arm``) rather than a bespoke branch — every arm
+#: whose picks are already published as a conforming
+#: ``signals_shadow/{arm}/{date}/signals.json`` artifact
+#: (``crucible-research/contracts/arm_shadow_signals.schema.json``).
+#:
+#: alpha-engine-config-I9299, and Brian's ruling 2026-08-29 ("for the research
+#: arm, we should make all arms promote eligible, including think tank"):
+#: ``no_agent_quant`` and ``single_agent_quant`` are promotion-ELIGIBLE and are
+#: the two arms with the most evidence, but the executor had no handler for
+#: either — so a promotion onto one would have raised at planner start and
+#: HALTED trading, the most expensive possible way to discover the gap.
+#:
+#: ONE generic handler, not two more per-arm branches. The per-arm branch is
+#: exactly what produced three divergent registers; a third and fourth branch
+#: differing only in an S3 prefix would have produced a fifth.
+SHADOW_SERVED_ARMS = (
+    "no_agent_quant",
+    "single_agent_quant",
 )
 
 # alpha-engine-config-I8755 — the entry-selection arm the pipeline was already
@@ -173,7 +237,7 @@ DEFAULT_EMPTY_BUY_CANDIDATES_PRODUCERS = frozenset({"signals_envelope"})
 # — they neither read nor fill ``buy_candidates``. Today exactly one: the
 # ``agentic`` arm. Config-extensible via ``champion_noop_arms`` for the
 # same fail-closed reason as the producer set.
-DEFAULT_NOOP_CHAMPION_ARMS = frozenset({"agentic"})
+DEFAULT_NOOP_CHAMPION_ARMS = frozenset(NOOP_CHAMPION_ARMS_SERVED)
 
 
 def load_champion_pointer(bucket: str, s3_client=None) -> dict:
@@ -587,50 +651,40 @@ def apply_champion_selection(
         pointer = load_champion_pointer(bucket, s3_client=s3_client)
     champion = pointer["champion"]
 
-    if champion == "agentic":
+    # Re-validated here, not only in ``load_champion_pointer``: callers may
+    # pass an already-resolved pointer (the ``pointer=`` kwarg exists to save
+    # an S3 round-trip), and a caller-supplied dict has not been through that
+    # validation. Without this, the one path that skips the pointer read is
+    # also the one path that skips the guard.
+    if champion not in VALID_CHAMPIONS:
+        raise ChampionPointerError(
+            f"apply_champion_selection: champion={champion!r} is not a servable "
+            f"arm — expected one of {VALID_CHAMPIONS}. Refusing to start a "
+            "trading day on an ambiguous champion."
+        )
+
+    if champion in NOOP_CHAMPION_ARMS_SERVED:
         return signals_raw, predictions_by_ticker
 
-    if champion == "scanner_predictor_direct":
-        return _apply_scanner_predictor_direct(
-            signals_raw,
-            predictions_by_ticker,
-            bucket=bucket,
-            run_date=run_date,
-            config=config,
-            sector_map=sector_map,
-            s3_client=s3_client,
-            pointer=pointer,
-        )
+    handler = _DEDICATED_ARM_HANDLERS.get(champion)
+    if handler is None:
+        # Every remaining servable arm is served GENERICALLY from its own
+        # shadow-signals artifact. This is not a fallback and not a degrade
+        # path: ``VALID_CHAMPIONS`` is built from the union of the dispatch
+        # table, the no-op set and ``SHADOW_SERVED_ARMS``, so reaching here
+        # means the arm is declared as generically-served.
+        handler = _apply_shadow_signals_arm
 
-    if champion == "scanner_top20_predictor":
-        return _apply_scanner_top20_predictor(
-            signals_raw,
-            predictions_by_ticker,
-            bucket=bucket,
-            run_date=run_date,
-            config=config,
-            sector_map=sector_map,
-            s3_client=s3_client,
-            pointer=pointer,
-        )
-
-    if champion == "thinktank_coverage":
-        return _apply_thinktank_coverage(
-            signals_raw,
-            predictions_by_ticker,
-            bucket=bucket,
-            run_date=run_date,
-            config=config,
-            sector_map=sector_map,
-            s3_client=s3_client,
-            pointer=pointer,
-        )
-
-    # Unreachable in practice — load_champion_pointer already validates
-    # against VALID_CHAMPIONS — but fail loud rather than silently
-    # falling through if a new champion value is ever added to the
-    # pointer schema without a matching branch here.
-    raise ChampionPointerError(f"apply_champion_selection has no handling for champion={champion!r}")
+    return handler(
+        signals_raw,
+        predictions_by_ticker,
+        bucket=bucket,
+        run_date=run_date,
+        config=config,
+        sector_map=sector_map,
+        s3_client=s3_client,
+        pointer=pointer,
+    )
 
 
 def _resolve_predictor_cut_pool(
@@ -1243,3 +1297,402 @@ def _apply_thinktank_coverage(
     new_predictions_by_ticker.update(injected_predictions)
 
     return new_signals_raw, new_predictions_by_ticker
+
+
+# ── The generic shadow-signals arm handler (alpha-engine-config-I9299) ───────
+
+
+def _resolve_arm_shadow(
+    bucket: str, arm: str, run_date: str, *, s3_client,
+) -> tuple[dict, str, str]:
+    """``(document, cohort_date, key)`` for ``arm``'s newest shadow-signals
+    artifact at or before ``run_date``.
+
+    Walks back day by day over ``SHADOW_LOOKBACK_DIAGNOSTIC_DAYS`` and returns
+    the FIRST hit, i.e. the newest cohort. The walk is deliberately wider than
+    the serving freshness bound so ABSENT and STALE stay distinguishable — see
+    ``SHADOW_LOOKBACK_DIAGNOSTIC_DAYS``. Freshness is decided by the caller;
+    this function only resolves.
+
+    A day-by-day GET walk rather than a ``list_objects_v2`` prefix listing:
+    the shadow producers run weekly, so the healthy path costs at most a
+    handful of GETs, and the executor's read role needs no ``s3:ListBucket``
+    grant on the research bucket that a listing would require. On the failure
+    path the walk is what produces the diagnostic — the newest date that DOES
+    exist — so the error message can say which of the two failures happened.
+
+    RAISES ``ChampionPointerError`` when the arm has written nothing in the
+    window (absent), or when the artifact it did write is unreadable or
+    malformed. Never falls back to the raw ``signals.json`` candidates —
+    same failure-mode convention as ``_load_challenger_selection``.
+    """
+    from datetime import timedelta as _td
+
+    try:
+        start = date.fromisoformat(run_date)
+    except ValueError as e:
+        raise ChampionPointerError(
+            f"{arm} champion selected but run_date={run_date!r} is not an ISO "
+            f"date — cannot resolve this arm's shadow cohort: {e}"
+        ) from e
+
+    probed: list[str] = []
+    for days_back in range(SHADOW_LOOKBACK_DIAGNOSTIC_DAYS + 1):
+        cohort_date = (start - _td(days=days_back)).isoformat()
+        key = SHADOW_SIGNALS_KEY_TEMPLATE.format(arm=arm, date=cohort_date)
+        probed.append(key)
+        try:
+            body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                continue
+            # Any error that is NOT "the key doesn't exist" is ambiguous: an
+            # AccessDenied or a throttle would otherwise be indistinguishable
+            # from an arm that simply did not produce, and the walk would sail
+            # past it and serve a much older cohort.
+            raise ChampionPointerError(
+                f"{arm} champion selected but s3://{bucket}/{key} is "
+                f"unreadable: {e}. Refusing to trade on a missing champion feed."
+            ) from e
+
+        try:
+            doc = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
+            raise ChampionPointerError(
+                f"{arm} shadow-signals artifact s3://{bucket}/{key} is malformed: {e}"
+            ) from e
+        if not isinstance(doc, dict):
+            raise ChampionPointerError(
+                f"{arm} shadow-signals artifact s3://{bucket}/{key} did not "
+                f"parse to a JSON object (got {type(doc).__name__})"
+            )
+        return doc, cohort_date, key
+
+    raise ChampionPointerError(
+        f"{arm} champion selected but the arm has written NO shadow-signals "
+        f"artifact in the {SHADOW_LOOKBACK_DIAGNOSTIC_DAYS} calendar day(s) "
+        f"up to {run_date} (probed s3://{bucket}/{probed[0]} back to "
+        f"{probed[-1]}). This is an ABSENT feed, not a stale one — the arm's "
+        "producer has never run for these dates, or is writing under a "
+        "different name. Refusing to trade on a missing champion feed."
+    )
+
+
+def _shadow_enter_picks(
+    doc: dict, *, arm: str, key: str, bucket: str,
+) -> list[tuple[str, float]]:
+    """``[(ticker, own_score)]`` for every ENTER pick in a shadow artifact,
+    sorted best-first with an explicit ticker tie-break.
+
+    Reads the SAME surface the shared scorer reads
+    (``crucible-research/scoring/leaderboard_producers.py::_picks_by_date``):
+    the top-level ``signals`` object, entries whose ``signal == "ENTER"`` and
+    whose ``score`` is numeric. Reading the arm's scored surface — rather than
+    its ``buy_candidates`` mirror — is what makes what the executor SERVES the
+    same ranking the leaderboard SCORED. An arm measured on one surface and
+    served from another has a track record that means something other than
+    what it claims.
+
+    The tie-break is explicit for the same reason it is explicit in
+    ``crucible-research/producers/filling_arms.py::rank_by_alpha``: an unstable
+    order would make the served set unreproducible from the same artifact.
+    """
+    signals = doc.get("signals")
+    if not isinstance(signals, dict):
+        raise ChampionPointerError(
+            f"{arm} shadow-signals artifact s3://{bucket}/{key} has no "
+            f"top-level 'signals' object (got {type(signals).__name__}) — "
+            "cannot resolve this arm's picks."
+        )
+
+    picks: list[tuple[str, float]] = []
+    for ticker, entry in signals.items():
+        if not isinstance(entry, dict):
+            raise ChampionPointerError(
+                f"{arm} shadow-signals artifact s3://{bucket}/{key} entry "
+                f"{ticker!r} is not an object (got {type(entry).__name__})"
+            )
+        if entry.get("signal") != "ENTER":
+            continue
+        score = entry.get("score")
+        if not isinstance(score, (int, float)) or isinstance(score, bool) or score != score:
+            raise ChampionPointerError(
+                f"{arm} shadow-signals artifact s3://{bucket}/{key} entry "
+                f"{ticker!r} is an ENTER pick carrying a non-numeric "
+                f"score={score!r} — an unrankable pick must not be silently "
+                "dropped from an arm's served set."
+            )
+        picks.append((str(ticker).upper(), float(score)))
+
+    if not picks:
+        # DISTINCT from the absent case above, and deliberately still fatal.
+        # An arm that wrote a well-formed artifact with no ENTER pick has
+        # legitimately recorded a MISS for measurement purposes
+        # (champion-challenger-policy.md §3) — but the executor cannot trade a
+        # miss: the live signals producer is empty-by-contract, so serving zero
+        # candidates would mean the book trades down and never up, which is the
+        # config#5713 condition arrived at by a different road.
+        raise ChampionPointerError(
+            f"{arm} shadow-signals artifact s3://{bucket}/{key} contains "
+            f"{len(signals)} entr(ies) but ZERO with signal=='ENTER' — the arm "
+            "recorded a legitimate MISS for this cohort. That is valid "
+            "measurement and an untradeable serving state: with an "
+            "empty-by-contract signals producer it guarantees no new entry is "
+            "ever proposed (config#5713). Refusing to start a trading day on it."
+        )
+
+    return sorted(picks, key=lambda row: (-row[1], row[0]))
+
+
+def _apply_shadow_signals_arm(
+    signals_raw: dict,
+    predictions_by_ticker: dict,
+    *,
+    bucket: str,
+    run_date: str,
+    config: dict,
+    sector_map: dict[str, str] | None,
+    s3_client,
+    pointer: dict,
+) -> tuple[dict, dict]:
+    """Serve ANY registered producer arm from its own shadow-signals artifact
+    (alpha-engine-config-I9299).
+
+    One handler for every arm whose picks are already published as a conforming
+    ``signals_shadow/{arm}/{date}/signals.json``
+    (``crucible-research/contracts/arm_shadow_signals.schema.json``). Today that
+    is ``no_agent_quant`` and ``single_agent_quant``, the two arms Brian's
+    2026-08-29 ruling made promotion-eligible and the two with the most
+    evidence; tomorrow it is any arm crucible-research registers, with no edit
+    here — which is the point. A per-arm branch differing only in an S3 prefix
+    is what produced three divergent arm registers.
+
+    **Failure modes, all fatal, matching this module's convention exactly:**
+
+    * artifact absent for the whole lookback → ``ChampionPointerError``
+      (see ``_resolve_arm_shadow``);
+    * artifact present but unreadable/malformed/not an object →
+      ``ChampionPointerError``;
+    * artifact present but the cohort is older than
+      ``champion_freshness_max_days`` → ``StaleChampionFeedError``;
+    * artifact present, well-formed, and carrying no ENTER pick →
+      ``ChampionPointerError`` (see ``_shadow_enter_picks``).
+
+    There is NO fallback to the raw ``signals.json`` candidates on any of them,
+    exactly as for ``scanner_predictor_direct``'s missing parquet and
+    ``thinktank_coverage``'s missing selection artifact.
+
+    **Score re-mapping, and why the arm's own score is not carried through.**
+    Each arm's ``score`` is on its own scale — ``no_agent_quant`` emits the
+    technical composite (0-100), the filling arms emit a 60-95 rank band, Think
+    Tank emits a subjective rating. Only its ORDER is load-bearing (the shadow
+    schema says so explicitly: the leaderboard ranks on it and never reads its
+    level). Downstream, ``decide_entries``' ``min_score_to_enter`` gate reads
+    the LEVEL — so carrying a raw composite through would mean one arm's picks
+    were gated at a different effective threshold than another's, and the slot
+    would be comparing score scales rather than selection rules
+    (champion-challenger-policy.md §4). Rank is therefore re-mapped onto the
+    same ``champion_score_floor``/``champion_score_ceiling`` band every other
+    arm uses, by the same monotone ``_rank_to_score`` — order preserved
+    exactly, level made comparable. This mirrors what
+    ``_apply_thinktank_coverage`` already does with Think Tank's 0-100 rating.
+
+    **Count-matching (§4, alpha-engine-config-I4983).** ``n`` is resolved the
+    way every other arm resolves it — the live ``buy_candidates`` count when
+    non-zero, else ``champion_top_n_default`` — so the served width is the
+    slot's width and not the arm's own top-N. The rank-fraction denominator is
+    the arm's ENTER set, which is its submission, the same choice
+    ``_apply_thinktank_coverage`` makes and for the same reason: there is no
+    wider scored population on this artifact to rank against.
+
+    **Injected predictions carry no alpha, deliberately.** Like
+    ``thinktank_coverage``, this arm's ranking quantity is its own conviction
+    score, not a log-alpha estimate on the optimizer's anchor. ``None`` rather
+    than a fabricated number keeps the entry out of ``main._should_hold_book``'s
+    cross-sectional dispersion calc entirely, and no ``alpha_anchor`` is
+    stamped because the record asserts no level (``assert_optimizer_anchor``
+    skips records with no numeric alpha for exactly this reason). Named
+    consequence, inherited from the same contract: such a name lands at
+    ``alpha_hat`` 0.0, so it can tie but never beat the benchmark on the alpha
+    term. That is honest about a conviction score and is a property of the
+    optimizer contract, not of this handler.
+    """
+    arm = pointer["champion"]
+    s3 = s3_client or boto3.client("s3")
+    max_days = int(config.get("champion_freshness_max_days", 8))
+
+    doc, cohort_date, key = _resolve_arm_shadow(bucket, arm, run_date, s3_client=s3)
+
+    # §7.5 — the artifact NAMES its producer, so a shadow written under one
+    # arm's prefix by another arm's code is caught rather than served under a
+    # name it does not belong to. Tolerated when absent (the prefix predates
+    # the schema); never tolerated when it disagrees.
+    declared_producer = doc.get("producer")
+    if declared_producer is not None and declared_producer != arm:
+        raise ChampionPointerError(
+            f"{arm} shadow-signals artifact s3://{bucket}/{key} declares "
+            f"producer={declared_producer!r} — the artifact under this arm's "
+            "prefix was written by a different arm, so serving it would trade "
+            f"{declared_producer!r}'s picks under {arm!r}'s name and record the "
+            "result against the wrong arm."
+        )
+    declared_date = doc.get("date")
+    if declared_date is not None and str(declared_date) != cohort_date:
+        raise ChampionPointerError(
+            f"{arm} shadow-signals artifact s3://{bucket}/{key} declares "
+            f"date={declared_date!r} but sits under the {cohort_date} path "
+            "segment — a cohort-date mismatch makes the arm's record "
+            "unverifiable (arm_shadow_signals.schema.json)."
+        )
+
+    _check_freshness(
+        cohort_date, run_date, max_days, feed_label=f"{arm} shadow-signals cohort",
+    )
+    staleness = evaluate_cohort_staleness(cohort_date, run_date, config)
+
+    ranked = _shadow_enter_picks(doc, arm=arm, key=key, bucket=bucket)
+    pool_size = len(ranked)
+
+    n_buy_candidates = len(signals_raw.get("buy_candidates") or [])
+    n = n_buy_candidates if n_buy_candidates > 0 else int(config.get("champion_top_n_default", 10))
+    top_n = ranked[:n]
+
+    score_floor = float(config.get("champion_score_floor", 60))
+    score_ceiling = float(config.get("champion_score_ceiling", 95))
+    sector_map = sector_map or {}
+
+    synthesized: list[dict] = []
+    injected_predictions: dict[str, dict] = {}
+    for rank, (ticker, own_score) in enumerate(top_n):
+        rank_fraction = rank / max(pool_size - 1, 1)
+        synthesized.append({
+            "signal": "ENTER",
+            "ticker": ticker,
+            "date": run_date,
+            "sector": sector_map.get(ticker, "Unknown"),
+            "score": _rank_to_score(rank_fraction, score_floor, score_ceiling),
+            "conviction": "medium",
+            "stance": None,
+            "price_target_upside": None,
+            "catalyst_date": None,
+            "thesis_summary": (
+                f"{arm} shadow-signals champion arm (alpha-engine-config-I9299)"
+            ),
+            "champion_arm": arm,
+            # Forensics: the arm's OWN score, on the arm's own scale, beside
+            # the band-mapped one the risk gates read. Without it the served
+            # score is unattributable to the artifact row it came from.
+            "arm_score": own_score,
+        })
+
+        injected_predictions[ticker] = {
+            # See the docstring: no fabricated alpha, and therefore no anchor.
+            "predicted_alpha": None,
+            "predicted_direction": None,
+            # Same neutral value as every other synthesizing arm — keeps the
+            # high-confidence-DOWN veto and the hold-book dispersion gate
+            # authoritative rather than skewed by champion-injected entries.
+            "prediction_confidence": 0.0,
+            "shadow_arm": arm,
+            "arm_score": own_score,
+        }
+
+    logger.info(
+        "[champion] %s selected %d/%d candidate(s) from shadow cohort=%s "
+        "age=%dd key=%s (n_buy_candidates=%d, enter_pool=%d)",
+        arm, len(synthesized), n, cohort_date, staleness["age_days"], key,
+        n_buy_candidates, pool_size,
+    )
+
+    new_signals_raw = dict(signals_raw)
+    new_signals_raw["buy_candidates"] = synthesized
+    new_signals_raw["champion"] = arm
+    new_signals_raw["promotion_source"] = pointer.get("promotion_source")
+    new_signals_raw["champion_cohort"] = {
+        **staleness,
+        "cohort_size": pool_size,
+        "n_selected": len(synthesized),
+        "pool_source": f"shadow_signals:{arm}",
+        "pool_size": pool_size,
+        "pool_key": key,
+        # No alpha_anchor: this arm injects no numeric alpha to anchor.
+    }
+
+    new_predictions_by_ticker = dict(predictions_by_ticker)
+    new_predictions_by_ticker.update(injected_predictions)
+
+    return new_signals_raw, new_predictions_by_ticker
+
+
+# ── The serving register, DERIVED (alpha-engine-config-I9299) ────────────────
+#
+# Built from the dispatch itself, at the bottom of the module where the
+# handlers exist. This is the whole point of I9299's deliverable 4: the
+# allowlist and the dispatch cannot disagree, because the allowlist IS the
+# dispatch. Compare the state it replaces — a four-name tuple 70 lines above
+# the branch chain that had to be edited in lockstep with it, and which had
+# already gone stale twice.
+
+#: Arms with a BESPOKE handler, because their picks come from an input no
+#: other arm reads. Every other servable arm is served generically from its
+#: shadow-signals artifact and needs no entry here.
+_DEDICATED_ARM_HANDLERS = {
+    "scanner_predictor_direct": _apply_scanner_predictor_direct,
+    "scanner_top20_predictor": _apply_scanner_top20_predictor,
+    "thinktank_coverage": _apply_thinktank_coverage,
+}
+
+VALID_CHAMPIONS = (
+    NOOP_CHAMPION_ARMS_SERVED
+    + tuple(_DEDICATED_ARM_HANDLERS)
+    + SHADOW_SERVED_ARMS
+)
+
+#: Arms whose synthesized entries need a sector stamped on them, i.e. every
+#: arm that fills ``buy_candidates`` from a source carrying no sector of its
+#: own — which is every arm except the no-op passthrough.
+#:
+#: DERIVED, for the same reason as ``VALID_CHAMPIONS``: this was a FOURTH
+#: hand-maintained arm literal, inline in ``executor/main.py``
+#: (``in ("scanner_predictor_direct", "thinktank_coverage")``), and it had
+#: already gone stale — ``scanner_top20_predictor`` became a servable arm on
+#: 2026-08-27 and was never added, so every one of its synthesized entries has
+#: been stamped ``sector="Unknown"`` since. Silent: an Unknown sector is a
+#: legal value, so nothing failed; it just switched the sector-concentration
+#: cap off for that arm's entries.
+ARMS_REQUIRING_SECTOR_MAP = tuple(
+    arm for arm in VALID_CHAMPIONS if arm not in NOOP_CHAMPION_ARMS_SERVED
+)
+
+
+def _assert_serving_register_coherent() -> None:
+    """Import-time guard: every servable arm resolves to exactly one way of
+    being served, and every declared way of serving belongs to a servable arm.
+
+    Checked at import rather than per run because this is a structural
+    property, not a measurement outcome — the same posture crucible-research's
+    ``producers/registry.py::_assert_score_source_can_carry_output`` takes.
+    A module that cannot say how it would serve its own declared arms must not
+    load at all.
+    """
+    overlap = set(_DEDICATED_ARM_HANDLERS) & set(SHADOW_SERVED_ARMS)
+    if overlap:
+        raise ValueError(
+            f"arms {sorted(overlap)} are declared BOTH dedicated and "
+            "shadow-served — one arm, one way of being served."
+        )
+    noop_overlap = set(NOOP_CHAMPION_ARMS_SERVED) & (
+        set(_DEDICATED_ARM_HANDLERS) | set(SHADOW_SERVED_ARMS)
+    )
+    if noop_overlap:
+        raise ValueError(
+            f"arms {sorted(noop_overlap)} are declared as no-op passthroughs "
+            "AND as synthesizing arms — the config#5713 coherence guard reads "
+            "the no-op set, so this would make it lie."
+        )
+    if len(set(VALID_CHAMPIONS)) != len(VALID_CHAMPIONS):
+        raise ValueError(f"VALID_CHAMPIONS contains duplicates: {VALID_CHAMPIONS}")
+
+
+_assert_serving_register_coherent()
