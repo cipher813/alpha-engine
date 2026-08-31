@@ -281,6 +281,9 @@ def solve_target_weights(
     turnover_meta = _apply_turnover_constraint(
         cp, w, w_prev, constraints, effective_caps, cash_idx, cfg,
         eligibility=eligibility,
+        alpha_hat=alpha_hat,
+        alpha_uncertainty=alpha_uncertainty,
+        spy_idx=spy_idx,
     )
 
     problem = cp.Problem(objective, constraints)
@@ -399,6 +402,57 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     # bypassed/disabled); rolling = sum over the last N sessions at WARN
     # (churn-by-a-thousand-cuts — each day under the cap, week abnormal; the
     # signature of the 5/29, 6/01, 6/04 incidents this generalizes).
+    # ── Conviction gate on the DISCRETIONARY turnover budget (I9315) ─────
+    # SAFETY guardrail — NOT an alpha knob. The daily turnover budget answers
+    # "how far may the book move today". It has never answered "is today's
+    # target worth moving toward at all", and between 2026-08-17 and 2026-08-31
+    # that gap put the optimizer at the 20%/day cap on 12 consecutive sessions:
+    # the predictor's cross-sectional α̂ spread had collapsed to ~1/30th of its
+    # own published per-name σ_α̂, so the ranking driving the target was noise,
+    # and the target itself moved 11–59% one-way PER DAY (measured by replaying
+    # each day's stored solve with the budget removed). A budget alone cannot
+    # see that: it caps the step, never the reason for the step.
+    #
+    # The gate scales the DISCRETIONARY budget by a measured signal-quality
+    # multiplier q ∈ [min_multiple, 1]:
+    #
+    #     IR_xs = stdev_cross_section(α̂_eligible) / median(σ_α̂_eligible)
+    #     q     = clip((IR_xs − ir_floor) / (ir_full − ir_floor), min, 1)
+    #
+    # IR_xs is the cross-sectional information ratio of the alpha vector — how
+    # large the spread the optimizer is ranking on is, relative to the error
+    # bar the model itself puts on each element of it. Below ir_floor the names
+    # are statistically tied and rebalancing between them is a pure transaction
+    # cost.
+    #
+    # The band is DERIVED, not chosen. Measured over 2026-07-31..2026-08-31
+    # (20 sessions of stored optimizer_shadow artifacts): IR_xs ∈ [1.01, 5.20]
+    # on every session of the healthy regime (n=7, executed turnover 0.4%–8.1%)
+    # and IR_xs ∈ [0.025, 0.320] on every session of the churning regime (n=13,
+    # executed turnover 10.3%–20.0%). [0.35, 0.75] sits inside that empirical
+    # gap and touches neither side, so the gate is inert over the whole healthy
+    # sample and fully engaged over the whole degraded one.
+    #
+    # The MANDATORY floor is unaffected: `_apply_turnover_constraint` still
+    # raises the effective budget to the forced-exit / ineligibility / cash-pin
+    # floor. A hard-risk exit is not discretionary and is never starved of
+    # budget by this gate — measured floors up to 13.2% one-way in the same
+    # window still execute in full.
+    #
+    # min_multiple is deliberately non-zero: a book that can NEVER trade
+    # discretionarily cannot recover from small drift, and a hard zero makes
+    # the constraint's feasible set degenerate. 0.05 × 0.20 = 1%/day one-way,
+    # i.e. 5%/5d against a 60%/5d tripwire band.
+    #
+    # Degradation is loud, not silent: when σ_α̂ is absent, non-finite, or
+    # zero, the gate CANNOT be evaluated, q is 1.0 (no throttle — never a
+    # tighter budget from missing data) and `conviction_gate_reason` names the
+    # reason in the diagnostics and the shadow artifact.
+    "conviction_budget_gate_enabled": True,
+    "conviction_ir_floor": 0.35,
+    "conviction_ir_full": 0.75,
+    "conviction_budget_min_multiple": 0.05,
+    "conviction_gate_min_names": 3,
     "turnover_tripwire_enabled": True,
     "turnover_tripwire_daily_multiple": 1.25,
     "turnover_tripwire_rolling_days": 5,
@@ -1015,6 +1069,111 @@ def _decompose_mandatory_turnover(
     }
 
 
+def compute_conviction_budget_multiplier(
+    alpha_hat: np.ndarray,
+    alpha_uncertainty: np.ndarray | None,
+    eligibility: np.ndarray | None,
+    spy_idx: int,
+    cash_idx: int,
+    cfg: dict,
+) -> dict:
+    """Signal-quality multiplier on the DISCRETIONARY daily turnover budget.
+
+    Returns a block that is emitted on EVERY solve — gate on, gate off, gate
+    inevaluable — because a field that appears only when the gate engages is
+    indistinguishable from a dead gate. Keys:
+
+    ``conviction_gate_applied``  bool — the multiplier actually scaled the budget
+    ``conviction_ir_xs``         float|None — stdev_xs(α̂) / median(σ_α̂)
+    ``conviction_alpha_dispersion`` float|None — the numerator, on its own
+    ``conviction_alpha_noise``   float|None — the denominator, on its own
+    ``conviction_n_names``       int — discretionary names the statistic used
+    ``conviction_budget_multiplier`` float — q ∈ [min_multiple, 1.0]
+    ``conviction_gate_reason``   str — why q is what it is, always populated
+
+    Never raises: every degradation path returns q = 1.0 (the UNTHROTTLED
+    budget) with a reason. Missing data must never produce a TIGHTER budget
+    than the operator configured — a gate that silently stops the book on an
+    input outage is a worse failure than the churn it exists to stop.
+    """
+    out: dict = {
+        "conviction_gate_applied": False,
+        "conviction_ir_xs": None,
+        "conviction_alpha_dispersion": None,
+        "conviction_alpha_noise": None,
+        "conviction_n_names": 0,
+        "conviction_budget_multiplier": 1.0,
+        "conviction_gate_reason": "disabled",
+    }
+    if not cfg.get("conviction_budget_gate_enabled", True):
+        return out
+    if alpha_uncertainty is None:
+        out["conviction_gate_reason"] = "no_alpha_uncertainty_vector"
+        return out
+
+    alpha = np.asarray(alpha_hat, dtype=float)
+    sigma = np.asarray(alpha_uncertainty, dtype=float)
+    n = alpha.shape[0]
+    if sigma.shape[0] != n:
+        out["conviction_gate_reason"] = "alpha_uncertainty_length_mismatch"
+        return out
+
+    # Discretionary names only: SPY is the benchmark fill and CASH the sleeve —
+    # neither carries a predicted alpha, and both would drag the dispersion
+    # toward a number that says nothing about the ranking being traded on.
+    mask = np.ones(n, dtype=bool)
+    for i in (spy_idx, cash_idx):
+        if 0 <= i < n:
+            mask[i] = False
+    if eligibility is not None:
+        elig = np.asarray(eligibility, dtype=bool)
+        if elig.shape[0] == n:
+            mask &= elig
+    mask &= np.isfinite(alpha)
+
+    min_names = int(cfg.get("conviction_gate_min_names", 3))
+    if int(mask.sum()) < max(2, min_names):
+        out["conviction_n_names"] = int(mask.sum())
+        out["conviction_gate_reason"] = "too_few_discretionary_names"
+        return out
+
+    sig_ok = mask & np.isfinite(sigma) & (sigma > 0)
+    if int(sig_ok.sum()) < max(2, min_names):
+        out["conviction_n_names"] = int(mask.sum())
+        out["conviction_gate_reason"] = "no_usable_alpha_uncertainty"
+        return out
+
+    dispersion = float(np.std(alpha[mask]))
+    noise = float(np.median(sigma[sig_ok]))
+    out["conviction_alpha_dispersion"] = dispersion
+    out["conviction_alpha_noise"] = noise
+    out["conviction_n_names"] = int(mask.sum())
+    if not np.isfinite(dispersion) or not np.isfinite(noise) or noise <= 0:
+        out["conviction_gate_reason"] = "non_finite_statistic"
+        return out
+
+    ir = dispersion / noise
+    out["conviction_ir_xs"] = float(ir)
+
+    lo = float(cfg.get("conviction_ir_floor", 0.35))
+    hi = float(cfg.get("conviction_ir_full", 0.75))
+    q_min = float(cfg.get("conviction_budget_min_multiple", 0.05))
+    q_min = min(max(q_min, 0.0), 1.0)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        # A misconfigured band must not silently become an arbitrary throttle.
+        out["conviction_gate_reason"] = "invalid_ir_band"
+        return out
+
+    q = (ir - lo) / (hi - lo)
+    q = float(min(max(q, q_min), 1.0))
+    out["conviction_budget_multiplier"] = q
+    out["conviction_gate_applied"] = bool(q < 1.0)
+    out["conviction_gate_reason"] = (
+        "signal_quality_ok" if q >= 1.0 else "alpha_spread_below_own_noise"
+    )
+    return out
+
+
 def _apply_turnover_constraint(
     cp,
     w,
@@ -1024,6 +1183,10 @@ def _apply_turnover_constraint(
     cash_idx: int,
     cfg: dict,
     eligibility: np.ndarray | None = None,
+    *,
+    alpha_hat: np.ndarray | None = None,
+    alpha_uncertainty: np.ndarray | None = None,
+    spy_idx: int | None = None,
 ) -> dict:
     """Append the L1 daily-turnover budget to ``constraints``.
 
@@ -1033,12 +1196,35 @@ def _apply_turnover_constraint(
     (legacy behaviour, bit-identical).
     """
     cap = cfg.get("max_daily_turnover")
+    # The conviction block is computed and emitted even when the budget is OFF:
+    # "how good was today's signal" is an operator fact in its own right, and a
+    # statistic that only exists on the throttled path cannot be used to judge
+    # whether the throttle was right.
+    conviction = (
+        compute_conviction_budget_multiplier(
+            alpha_hat, alpha_uncertainty, eligibility,
+            spy_idx if spy_idx is not None else -1, cash_idx, cfg,
+        )
+        if alpha_hat is not None
+        else {
+            "conviction_gate_applied": False,
+            "conviction_ir_xs": None,
+            "conviction_alpha_dispersion": None,
+            "conviction_alpha_noise": None,
+            "conviction_n_names": 0,
+            "conviction_budget_multiplier": 1.0,
+            "conviction_gate_reason": "no_alpha_vector_supplied",
+        }
+    )
     meta: dict = {
         "turnover_constraint_applied": False,
         "turnover_constraint_cap": None,
+        "turnover_budget_configured": None if cap is None else float(cap),
+        "turnover_budget_discretionary": None,
         "turnover_mandatory_floor": None,
         "turnover_mandatory_floor_by_cause": None,
         "turnover_constraint": None,
+        **conviction,
     }
     if cap is None or cap <= 0:
         return meta
@@ -1057,7 +1243,14 @@ def _apply_turnover_constraint(
     # A small slack above the floor: the floor is a bound on an attainable
     # point, and pinning the RHS exactly to it would leave a feasible set of
     # measure ~zero that an interior-point solver reports as infeasible.
-    effective_cap = max(float(cap), floor * (1.0 + 1e-6) + 1e-9)
+    # The conviction gate scales the DISCRETIONARY budget only. The mandatory
+    # floor is applied AFTER it, so a throttled budget can never starve a
+    # forced exit — the two are different kinds of trading and the `max` below
+    # keeps them ordered correctly.
+    q = float(conviction.get("conviction_budget_multiplier", 1.0))
+    discretionary = float(cap) * q
+    meta["turnover_budget_discretionary"] = discretionary
+    effective_cap = max(discretionary, floor * (1.0 + 1e-6) + 1e-9)
     constraint = cp.norm(w - w_prev, 1) / 2 <= effective_cap
     constraints.append(constraint)
     meta.update({
@@ -1067,6 +1260,24 @@ def _apply_turnover_constraint(
         "turnover_mandatory_floor_by_cause": by_cause,
         "turnover_constraint": constraint,
     })
+    if q < 1.0:
+        logger.warning(
+            "conviction gate THROTTLED the discretionary turnover budget from "
+            "%.4f to %.4f (multiplier %.3f): the cross-sectional alpha spread "
+            "is %.5f against a median per-name sigma_alpha of %.5f, i.e. an "
+            "information ratio of %.3f over %d discretionary names, below the "
+            "%.2f floor. The names the optimizer is ranking are not "
+            "statistically distinguishable from one another; rebalancing "
+            "between them is a transaction cost, not a trade. Mandatory "
+            "turnover (%.4f) is unaffected and still executes.",
+            float(cap), discretionary, q,
+            conviction.get("conviction_alpha_dispersion") or float("nan"),
+            conviction.get("conviction_alpha_noise") or float("nan"),
+            conviction.get("conviction_ir_xs") or float("nan"),
+            conviction.get("conviction_n_names") or 0,
+            float(cfg.get("conviction_ir_floor", 0.35)),
+            float(floor),
+        )
     if effective_cap > float(cap) + 1e-9:
         logger.warning(
             "turnover budget RAISED from the configured %.4f to %.4f: the "
@@ -1077,6 +1288,16 @@ def _apply_turnover_constraint(
             float(cap), effective_cap, floor,
         )
     return meta
+
+
+# Complementary-slackness tolerances for the turnover-budget binding test.
+# _DUAL_ACTIVE_TOL sits six orders of magnitude above the numerical dust an
+# interior-point solver returns for an INACTIVE constraint (measured 1.6e-8 …
+# 4.2e-9 on the live book) and four below the smallest genuine active dual in
+# the same window (5.4e-3). _PRIMAL_AT_BOUND_REL_TOL is wide enough to admit
+# the post-clip-and-renormalize drift (measured 0.19978 against a 0.2000 cap).
+_DUAL_ACTIVE_TOL = 1e-6
+_PRIMAL_AT_BOUND_REL_TOL = 5e-3
 
 
 def _turnover_diagnostics(
@@ -1113,6 +1334,20 @@ def _turnover_diagnostics(
         ),
         "turnover_constraint_binding": False,
         "turnover_constraint_shadow_price": None,
+        # Conviction gate (I9315) — emitted on every solve, throttled or not.
+        "turnover_budget_configured": turnover_meta.get("turnover_budget_configured"),
+        "turnover_budget_discretionary": turnover_meta.get(
+            "turnover_budget_discretionary"
+        ),
+        "conviction_gate_applied": turnover_meta.get("conviction_gate_applied", False),
+        "conviction_ir_xs": turnover_meta.get("conviction_ir_xs"),
+        "conviction_alpha_dispersion": turnover_meta.get("conviction_alpha_dispersion"),
+        "conviction_alpha_noise": turnover_meta.get("conviction_alpha_noise"),
+        "conviction_n_names": turnover_meta.get("conviction_n_names", 0),
+        "conviction_budget_multiplier": turnover_meta.get(
+            "conviction_budget_multiplier", 1.0
+        ),
+        "conviction_gate_reason": turnover_meta.get("conviction_gate_reason"),
     }
     if cap is not None:
         constraint = turnover_meta.get("turnover_constraint")
@@ -1122,21 +1357,43 @@ def _turnover_diagnostics(
                 out["turnover_constraint_shadow_price"] = float(np.ravel(dual)[0])
             except (TypeError, ValueError, IndexError):
                 out["turnover_constraint_shadow_price"] = None
-        # The DUAL is the primary binding test, not a comparison of the final
-        # turnover against the cap. `weights` here is post-clip-and-renormalize,
-        # so its turnover is a few bp off the solver's own — measured 2026-08-14
-        # on the live book: solver at the 0.2000 cap, post-clip 0.19978, which a
-        # numeric ">= cap − ε" test reads as NOT binding while the dual is
-        # 0.00926. A strictly positive dual is the definition of an active
-        # constraint; the numeric test is kept only as the fallback for solvers
-        # or statuses that return no dual.
+        # COMPLEMENTARY SLACKNESS, both halves (I9315). A constraint is active
+        # iff its dual is strictly positive AND its primal sits at the bound.
+        # Testing only one half is wrong in a different direction each way:
+        #
+        #  * Primal only — `weights` here is post-clip-and-renormalize, so its
+        #    turnover is a few bp off the solver's own. Measured 2026-08-14 on
+        #    the live book: solver at the 0.2000 cap, post-clip 0.19978, which a
+        #    ">= cap · (1 − 1e-3)" test reads as NOT binding while the dual is
+        #    0.00926. The relative tolerance below is widened to 5e-3 so that
+        #    real case stays inside it.
+        #
+        #  * Dual only — an interior-point solver returns numerical dust for an
+        #    INACTIVE constraint, and a 1e-9 threshold is far below that dust.
+        #    Measured on the live book: 2026-08-21 dual 4.2e-9 with executed
+        #    turnover 14.98%, 2026-08-27 dual 2.4e-8 at 16.99%, 2026-08-28 dual
+        #    1.6e-8 at 12.27% — all against a 20% cap with up to 7.7 points of
+        #    it unspent. All three were reported binding and all three fired an
+        #    operator alert stating that the budget "BOUND the solve". A
+        #    detector that says the opposite of the truth on 3 of 12 sessions is
+        #    worse than no detector.
+        #
+        # Requiring both halves accepts the 2026-08-14 case and rejects all
+        # three false positives. The dual tolerance is 1e-6 — six orders of
+        # magnitude above the observed dust and four below the smallest genuine
+        # dual measured in the same window (5.4e-3).
         shadow = out["turnover_constraint_shadow_price"]
+        at_bound = bool(executed >= float(cap) * (1.0 - _PRIMAL_AT_BOUND_REL_TOL) - 1e-6)
         if shadow is not None:
-            out["turnover_constraint_binding"] = bool(shadow > 1e-9)
-        else:
             out["turnover_constraint_binding"] = bool(
-                executed >= float(cap) * (1.0 - 1e-3) - 1e-6
+                shadow > _DUAL_ACTIVE_TOL and at_bound
             )
+        else:
+            # No dual available (fallback solver / non-optimal status): the
+            # primal test is all there is. Recorded so the ambiguity is visible.
+            out["turnover_constraint_binding"] = at_bound
+            out["turnover_binding_test"] = "primal_only_no_dual"
+        out.setdefault("turnover_binding_test", "complementary_slackness")
     # ``turnover_capped`` keeps its consumer-facing meaning — "the daily
     # turnover budget bound this solve" — which is now the binding test
     # rather than "a post-hoc shrink was applied".
@@ -1207,8 +1464,21 @@ def _apply_turnover_governor(
     # would go permanently silent — a detector killed by a fix is a worse
     # outcome than the fix is good. `binding` is the honest successor signal:
     # the optimizer wanted to move more than the budget allowed.
+    #
+    # When the conviction gate is throttling, a binding budget is the guard
+    # DOING ITS JOB, not a large move: the optimizer wants to churn a book of
+    # statistically tied names and the gate is refusing. Flagging that would
+    # reproduce the exact alert this arc exists to end — one that fires every
+    # session on a healthy state and asks a human to approve something no
+    # human has a channel to approve. The fact is not lost: the whole
+    # conviction block is in the diagnostics and the shadow artifact, and the
+    # rolling tripwire reads it and reports the throttle as the DRIVER.
+    gate_on = bool(gov.get("conviction_gate_applied"))
     if above_flag:
         gov["large_move_reason"] = "executed_turnover_above_flag"
+    elif binding and gate_on:
+        gov["large_move_reason"] = "conviction_throttled_budget_binding"
+        gov["large_move_flagged"] = bool(above_flag)
     elif binding:
         gov["large_move_reason"] = "turnover_budget_binding"
     else:

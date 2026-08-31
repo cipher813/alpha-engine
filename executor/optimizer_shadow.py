@@ -341,38 +341,95 @@ def _build_and_solve(
         name_sigma=name_sigma,
     )
 
-    # Large-move flag: the book is moving hard today. Two reasons now raise
-    # it, and the message says WHICH (alpha-engine-config-I7346):
+    # Large-move flag: the book is moving hard today, for a reason the SOLVE
+    # could not itself justify. Two reasons raise it, and the message says
+    # WHICH (alpha-engine-config-I7346):
     #   * executed_turnover_above_flag — executed one-way turnover exceeds
     #     large_move_turnover_flag outright (only reachable when the daily
     #     budget is off or set above the flag).
-    #   * turnover_budget_binding — the daily turnover budget bound the solve,
-    #     i.e. the optimizer wanted to move MORE than it was allowed to. This
-    #     is the successor to the old "requested >> executed" gap: with the
-    #     budget enforced inside the convex program there is no longer a
-    #     pre-cap request to compare against, and without this branch the
-    #     detector would have gone permanently silent.
+    #   * turnover_budget_binding — the daily turnover budget bound the solve
+    #     on a day the conviction gate did NOT throttle, i.e. the optimizer
+    #     wanted to move more than it was allowed to on a signal the model
+    #     stands behind. That is a real operator fact.
+    #
+    # `conviction_throttled_budget_binding` is deliberately NOT flagged
+    # (alpha-engine-config-I9315). Between 2026-08-17 and 2026-08-31 this alert
+    # fired on 8 of 12 sessions saying the budget bound the solve, and it was
+    # RIGHT on the mechanics and useless as a signal: the budget bound because
+    # the predictor's cross-sectional alpha spread had collapsed to ~1/30th of
+    # its own published per-name sigma, so the optimizer was trying to reshuffle
+    # a book of statistically tied names. The conviction gate now refuses that
+    # move; the budget still binds, but on the THROTTLED budget, and a guard
+    # working as designed is not an incident. The fact is not lost — the whole
+    # conviction block is persisted in this artifact's diagnostics and the
+    # rolling turnover tripwire reads it and names the throttle as the driver.
+    #
+    # The message carries the DRIVER it found. It does not ask the operator to
+    # go and read the shadow logs, and it does not ask for an approval there is
+    # no channel to give: an alert whose only instruction is unanswerable is an
+    # unactionable surface (principles.md 2.3, 2.7), and a scheduled request for
+    # a human decision with no state is not coverage.
     # Alert-publish is best-effort secondary observability — the budget already
     # protected the book, so a publish failure must never block the planner.
     # See [[feedback_no_silent_fails]] (recording surface = the WARN log + the
     # shadow-log turnover fields below).
-    if result.diagnostics.get("large_move_flagged"):
-        _req = result.diagnostics.get("requested_turnover_one_way", 0.0)
+    _diag = result.diagnostics
+    if _diag.get("conviction_gate_applied"):
+        logger.info(
+            "conviction gate active (run_date=%s): IR_xs=%.4f over %d names "
+            "(alpha spread %.5f vs sigma_alpha %.5f) -> discretionary budget "
+            "%.4f of a configured %.4f; executed %.4f, mandatory floor %.4f. "
+            "No alert: the guard refusing to churn statistically tied names is "
+            "the designed behaviour.",
+            run_date,
+            _diag.get("conviction_ir_xs") or float("nan"),
+            _diag.get("conviction_n_names") or 0,
+            _diag.get("conviction_alpha_dispersion") or float("nan"),
+            _diag.get("conviction_alpha_noise") or float("nan"),
+            _diag.get("turnover_budget_discretionary") or float("nan"),
+            _diag.get("turnover_budget_configured") or float("nan"),
+            _diag.get("turnover_one_way") or float("nan"),
+            _diag.get("turnover_mandatory_floor") or float("nan"),
+        )
+    if _diag.get("large_move_flagged"):
+        _req = _diag.get("requested_turnover_one_way", 0.0)
         _cap = optimizer_cfg.get("max_daily_turnover")
         _flag = optimizer_cfg.get("large_move_turnover_flag")
-        _reason = result.diagnostics.get("large_move_reason")
-        _shadow = result.diagnostics.get("turnover_constraint_shadow_price")
+        _reason = _diag.get("large_move_reason")
+        _shadow = _diag.get("turnover_constraint_shadow_price")
+        _floor = _diag.get("turnover_mandatory_floor")
+        _ir = _diag.get("conviction_ir_xs")
         if _reason == "turnover_budget_binding":
+            _forced = (
+                f" Of that, {_floor:.1%} was MANDATORY (forced exits / "
+                f"ineligibility / cash pin); the rest was discretionary."
+                if _floor is not None
+                else ""
+            )
+            _conv = (
+                f" Signal quality passed the conviction gate "
+                f"(IR_xs={_ir:.2f} over {_diag.get('conviction_n_names', 0)} "
+                f"names), so the model stands behind the move it wanted."
+                if _ir is not None
+                else f" Conviction gate not evaluable "
+                     f"({_diag.get('conviction_gate_reason')})."
+            )
             _detail = (
                 f"the {(_cap or 0):.0%}/day turnover budget BOUND the solve "
                 f"(executed {_req:.1%}, shadow price "
                 f"{'n/a' if _shadow is None else format(_shadow, '.4f')}) — the "
-                f"optimizer wanted to move further and the budget stopped it. "
-                f"Every name it did trade is sized where it wants it; the "
-                f"remainder is deferred to subsequent daily re-solves."
+                f"optimizer wanted to move further and the budget stopped it."
+                f"{_forced}{_conv} Every name it did trade is sized where it "
+                f"wants it; the remainder is deferred to subsequent daily "
+                f"re-solves, which is the designed behaviour of a gradual "
+                f"rebalance. No action is required unless this repeats across "
+                f"sessions — the rolling turnover tripwire owns that case."
             )
         else:
-            _detail = f"executed one-way turnover {_req:.1%} exceeds the {(_flag or 0):.0%} large-move flag."
+            _detail = (
+                f"executed one-way turnover {_req:.1%} exceeds the "
+                f"{(_flag or 0):.0%} large-move flag."
+            )
         logger.warning(
             "Optimizer large-move flag (%s): %s (run_date=%s)",
             _reason,
@@ -385,8 +442,7 @@ def _build_and_solve(
             publish_ops_alert(
                 message=(
                     f"[executor] Optimizer large rebalance ({_reason}): "
-                    f"{_detail} (run_date={run_date}) Review and approve "
-                    f"acceleration if the reallocation is intended."
+                    f"{_detail} (run_date={run_date})"
                 ),
                 severity="WARN",
                 source="alpha-engine/executor/optimizer_shadow.py",

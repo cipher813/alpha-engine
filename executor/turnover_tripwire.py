@@ -20,6 +20,18 @@ Two independent bands, checked daily in the morning planner (via
   week's cumulative rebalance abnormal — the actual signature of the three
   incidents above. Pages at WARN.
 
+The rolling alert CARRIES ITS DRIVER (alpha-engine-config-I9315). It used to
+end "review the optimizer shadow logs for the driver", which asks a human to
+perform the diagnosis the detector is already standing on the data to perform —
+partial coverage under ``principles.md`` §2.3 and an unactionable surface under
+§2.7. ``_attribute`` now splits the window into forced versus discretionary
+turnover and names the dominant driver out of a closed set (forced exits,
+conviction-gate throttling, predictor conviction collapse, budget saturation,
+or an explicit ``unattributed`` when the combination is one the attribution
+does not recognise — a new failure mode is reported as new, never rounded to
+the nearest known one). The block is written into the shadow artifact on every
+run, breach or not, so a condition can be watched building.
+
 Posture (per [[feedback_no_silent_fails]]): the tripwire itself RAISES on a
 breach via ``alerts.publish`` (SNS + Telegram, deduped per run_date). It is
 secondary observability hung off the planner's primary path, so an internal
@@ -109,8 +121,8 @@ def check_turnover_tripwire(
         prior = _read_prior_turnovers(
             signals_bucket, run_date, rolling_days - 1, s3_client
         )
-        window = [today] + prior
-        rolling_sum = float(sum(window))
+        window = [_driver_row(run_date, diagnostics or {})] + prior
+        rolling_sum = float(sum(r["turnover_one_way"] for r in window))
 
         daily_breach = today > daily_band
         rolling_breach = rolling_sum > rolling_band
@@ -138,8 +150,15 @@ def check_turnover_tripwire(
             status = STATUS_BREACH_ROLLING
         else:
             status = STATUS_OK
+        # Attribution runs on EVERY invocation, breach or not. A driver block
+        # that exists only on the alerting path cannot be used to watch a
+        # condition BUILD, and a slow accumulation each single day looks fine
+        # against is exactly what this tripwire generalizes
+        # (alpha-engine-config-I9315).
+        attribution = _attribute(window)
         out = {
             "status": status,
+            "attribution": attribution,
             "turnover_one_way": round(today, 6),
             "daily_band": round(daily_band, 6),
             "daily_breach": daily_breach,
@@ -176,14 +195,21 @@ def check_turnover_tripwire(
                     f"summed {rolling_sum:.1%} over the last {len(window)} "
                     f"session(s) — above the {rolling_band:.0%}/{rolling_days}d "
                     f"band (run_date={run_date}). The book is churning "
-                    f"abnormally even though each day is under the cap; review "
-                    f"the optimizer shadow logs for the driver."
+                    f"abnormally even though each day is under the cap. "
+                    f"DRIVER ({attribution['driver']}): {attribution['detail']}"
+                    f" Per-session one-way turnover: "
+                    + ", ".join(
+                        f"{r['date']} {r['turnover']:.1%}"
+                        for r in attribution["per_day"]
+                    )
+                    + "."
                 ),
             )
             logger.warning(
                 "TURNOVER TRIPWIRE rolling breach: sum %.1f%% over %d sessions "
-                "> %.1f%% (run_date=%s)",
+                "> %.1f%% (run_date=%s) — driver=%s: %s",
                 rolling_sum * 100, len(window), rolling_band * 100, run_date,
+                attribution["driver"], attribution["detail"],
             )
         if not (daily_breach or rolling_breach):
             logger.info(
@@ -201,7 +227,7 @@ def check_turnover_tripwire(
 
 def _read_prior_turnovers(
     bucket: str, run_date: str, n: int, s3_client=None,
-) -> list[float]:
+) -> list[dict]:
     """Executed ``turnover_one_way`` from the most recent ``n`` dated shadow
     artifacts strictly before ``run_date``. Artifacts that are missing the
     metric (failed/sentinel days) are skipped with a log line — a short window
@@ -233,14 +259,15 @@ def _read_prior_turnovers(
             "cap — rolling window computed from the first %d keys only",
             len(dates),
         )
-    out: list[float] = []
+    out: list[dict] = []
     for d in sorted(dates, reverse=True)[:n]:
         try:
             body = s3.get_object(Bucket=bucket, Key=f"{_SHADOW_PREFIX}{d}.json")
             log_d = json.loads(body["Body"].read())
-            v = (log_d.get("diagnostics") or {}).get("turnover_one_way")
+            dg = log_d.get("diagnostics") or {}
+            v = dg.get("turnover_one_way")
             if v is not None and math.isfinite(float(v)):
-                out.append(float(v))
+                out.append(_driver_row(d, dg))
             else:
                 logger.info(
                     "turnover tripwire: %s shadow log has no turnover "
@@ -252,6 +279,127 @@ def _read_prior_turnovers(
                 "turnover tripwire: could not read shadow log for %s: %s", d, e,
             )
     return out
+
+
+
+def _driver_row(date: str, diagnostics: dict) -> dict:
+    """One session's turnover reduced to the facts that EXPLAIN it.
+
+    The rolling band answers "is the book churning". Until
+    alpha-engine-config-I9315 the alert stopped there and told the operator to
+    "review the optimizer shadow logs for the driver" — which is the diagnosis
+    the detector is standing on top of the data to perform. These fields are
+    already in every shadow artifact; reading them costs nothing extra (the
+    artifact is fetched either way) and turns the alert from a question into an
+    answer.
+    """
+    def _f(key):
+        v = diagnostics.get(key)
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return None
+        return fv if math.isfinite(fv) else None
+
+    return {
+        "date": date,
+        "turnover_one_way": _f("turnover_one_way") or 0.0,
+        "mandatory_floor": _f("turnover_mandatory_floor"),
+        "budget_configured": _f("turnover_budget_configured"),
+        "budget_discretionary": _f("turnover_budget_discretionary"),
+        "conviction_ir_xs": _f("conviction_ir_xs"),
+        "conviction_multiplier": _f("conviction_budget_multiplier"),
+        "conviction_gate_applied": bool(diagnostics.get("conviction_gate_applied")),
+        "conviction_gate_reason": diagnostics.get("conviction_gate_reason"),
+        "binding": bool(diagnostics.get("turnover_constraint_binding")),
+    }
+
+
+def _attribute(window: list[dict]) -> dict:
+    """Split the rolling window's turnover into FORCED and DISCRETIONARY, and
+    name the dominant driver. Returns the block persisted in the artifact."""
+    total = sum(r["turnover_one_way"] for r in window)
+    forced = sum(min(r["mandatory_floor"] or 0.0, r["turnover_one_way"]) for r in window)
+    discretionary = max(total - forced, 0.0)
+    n_binding = sum(1 for r in window if r["binding"])
+    n_gated = sum(1 for r in window if r["conviction_gate_applied"])
+    irs = [r["conviction_ir_xs"] for r in window if r["conviction_ir_xs"] is not None]
+    reasons = {r["conviction_gate_reason"] for r in window if r["conviction_gate_reason"]}
+    median_ir = sorted(irs)[len(irs) // 2] if irs else None
+
+    # Ordered most-specific first: the first predicate that holds IS the driver.
+    if forced > 0.6 * total and total > 0:
+        driver = "forced_exits"
+        detail = (
+            f"{forced:.1%} of the {total:.1%} was MANDATORY turnover — forced "
+            f"exits, ineligibility pins or the cash sleeve. The optimizer is "
+            f"not choosing to churn; hard risk rules are ejecting positions. "
+            f"Look at turnover_mandatory_floor_by_cause in the shadow "
+            f"artifacts, not at the alpha signal."
+        )
+    elif n_gated >= max(1, len(window) // 2):
+        driver = "conviction_gate_throttling"
+        detail = (
+            f"the conviction gate throttled the discretionary budget on "
+            f"{n_gated} of {len(window)} sessions (median cross-sectional "
+            f"IR {median_ir:.3f}), so this turnover is what SURVIVED the "
+            f"throttle. If the band is still breached with the gate engaged, "
+            f"the residue is mandatory turnover or the gate floor is too high."
+        )
+    elif median_ir is not None and median_ir < 0.5:
+        driver = "predictor_conviction_collapse"
+        detail = (
+            f"the predictor's cross-sectional alpha spread is only "
+            f"{median_ir:.3f}x its own published per-name sigma_alpha (median "
+            f"over {len(irs)} sessions). The optimizer is ranking names that "
+            f"are not statistically distinguishable from one another, so the "
+            f"target reshuffles daily on noise. This is an UPSTREAM condition: "
+            f"the executor is behaving correctly on a signal that carries no "
+            f"cross-sectional information. Check the predictor's "
+            f"high-confidence count and the champion model's recent promotion."
+        )
+    elif n_binding >= max(1, len(window) // 2):
+        driver = "budget_saturation"
+        detail = (
+            f"the daily budget bound the solve on {n_binding} of "
+            f"{len(window)} sessions with signal quality PASSING the "
+            f"conviction gate — the optimizer genuinely wants a book this far "
+            f"from the current one and is walking there a capped step at a "
+            f"time. Sustained saturation means the target is moving at least "
+            f"as fast as the budget allows the book to travel, so the walk "
+            f"never converges. Either the reallocation is real and the budget "
+            f"should be spent deliberately, or the target is unstable."
+        )
+    else:
+        driver = "unattributed"
+        detail = (
+            f"no single driver dominates: {forced:.1%} forced of {total:.1%} "
+            f"total, budget binding on {n_binding}/{len(window)} sessions, "
+            f"conviction gate engaged on {n_gated}. This combination is not "
+            f"one the attribution knows; treat it as a new failure mode rather "
+            f"than a known one."
+        )
+    return {
+        "driver": driver,
+        "detail": detail,
+        "forced_sum": round(forced, 6),
+        "discretionary_sum": round(discretionary, 6),
+        "n_binding": n_binding,
+        "n_conviction_gated": n_gated,
+        "median_conviction_ir": median_ir,
+        "gate_reasons": sorted(reasons),
+        "per_day": [
+            {
+                "date": r["date"],
+                "turnover": round(r["turnover_one_way"], 4),
+                "forced": None if r["mandatory_floor"] is None
+                else round(r["mandatory_floor"], 4),
+                "ir": None if r["conviction_ir_xs"] is None
+                else round(r["conviction_ir_xs"], 4),
+            }
+            for r in window
+        ],
+    }
 
 
 def _publish(out: dict, *, severity: str, dedup_key: str, message: str) -> None:
