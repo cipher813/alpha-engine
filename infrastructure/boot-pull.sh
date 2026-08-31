@@ -514,6 +514,55 @@ else
     log "SKIP trades.db restore (no risk.yaml)"
 fi
 
+# ── Self-heal boot-pull-launcher.sh at /usr/local/sbin ──────────────────────
+# alpha-engine-config-I9444: boot-pull.sh already self-heals its OWN unit
+# file — sync_systemd_units_from() below re-copies boot-pull.service into
+# /etc/systemd/system on every boot — but had no equivalent self-heal for the
+# launcher BINARY at /usr/local/sbin/boot-pull-launcher.sh. That path is a
+# two-artifact install (unit file + out-of-tree exec target, config-I8734)
+# where only one artifact self-healed; install-boot-pull.sh provisions the
+# launcher once, by hand, over SSM, and nothing re-verified it afterward.
+#
+# Measured 2026-08-31 on the trading box (i-018eb3307a21329bf): the launcher
+# was never provisioned there when PR #495 shipped, and boot-pull.service
+# FAILed at every boot from 2026-08-28 through 2026-08-31 with
+# `status=203/EXEC: Failed to locate executable
+# /usr/local/sbin/boot-pull-launcher.sh` — invisible except two levels
+# downstream, via a systemd-unit-drift alert on unrelated units this box's
+# normal boot-pull cycle happens to also update. Remediated live via the
+# existing install-boot-pull.sh; this closes the underlying gap so a future
+# occurrence self-heals on the box's own next boot instead of waiting on a
+# human to notice and re-run the installer by hand.
+#
+# Verify+repair on EVERY run (not just first-install) using a byte-for-byte
+# comparison rather than a bare existence check, so a stale launcher left
+# over from an older commit is also repaired, not only a missing one.
+# `install -m 0755 -o root -g root` exactly mirrors install-boot-pull.sh's
+# own mode/owner, so a box that has never run install-boot-pull.sh still
+# converges here using the same sudo surface this script already relies on
+# for the systemd unit copies below. Best-effort by design (matches the
+# ~/.netrc refresh pattern above): a missing $LAUNCHER_SRC means the
+# alpha-engine checkout itself is incomplete, which the repo pull loop above
+# already surfaces loudly — this block only WARNs and skips rather than
+# duplicating that failure.
+LAUNCHER_SRC="/home/ec2-user/alpha-engine/infrastructure/boot-pull-launcher.sh"
+LAUNCHER_DST="/usr/local/sbin/boot-pull-launcher.sh"
+if [ -f "$LAUNCHER_SRC" ]; then
+    if [ ! -f "$LAUNCHER_DST" ] || ! cmp -s "$LAUNCHER_SRC" "$LAUNCHER_DST"; then
+        if sudo install -m 0755 -o root -g root "$LAUNCHER_SRC" "$LAUNCHER_DST" >> "$LOG" 2>&1; then
+            log "OK   boot-pull-launcher: repaired $LAUNCHER_DST (src=$LAUNCHER_SRC)"
+        else
+            log "FAIL boot-pull-launcher: repair of $LAUNCHER_DST failed"
+            PULL_FAILURES=$((PULL_FAILURES + 1))
+            FAILED_REPOS+=("boot-pull-launcher (install)")
+        fi
+    else
+        log "OK   boot-pull-launcher: $LAUNCHER_DST matches repo"
+    fi
+else
+    log "WARN boot-pull-launcher: source $LAUNCHER_SRC not found — skipping self-heal (repo pull failure above already surfaces this loudly)"
+fi
+
 # Sync systemd service files from repo (if alpha-engine has them).
 #
 # Installs NEW units as well as updating existing ones. Prior versions of
