@@ -104,7 +104,17 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.6"
+SCHEMA_VERSION = "2.7"
+# 2.7 (alpha-engine-config-I8188, second pass): additive only.
+# ``transaction_costs`` gains ``gross_available`` and
+# ``gross_unavailable_reason``. When IB attaches no commissionReport to any
+# fill, ``commission_usd`` is now None rather than 0.0 and
+# ``daily_return_gross_pct`` is SUPPRESSED rather than published with a $0.00
+# commission leg — that figure was a net return wearing a gross label. The
+# ``commission_available`` flag already existed and stays; what changes is that
+# the FIGURES now agree with it instead of contradicting it. Measured: 1 of the
+# first 6 live sessions carrying the column persisted commission_usd = 0.0 with
+# commission_available = 0.
 # 2.6 (alpha-engine-config-I9085): additive only. Each position row gains
 # ``mark_basis_usd`` (``ib_market_value − market_value``) and
 # ``ib_mark_off_close_pct``. The pre-existing ``ib_mark_outside_range`` flag
@@ -684,6 +694,8 @@ def build_eod_report(
             "total_cost_usd": recon.get("total_cost_usd"),
             "daily_return_net_pct": recon.get("daily_return_net_pct"),
             "daily_return_gross_pct": recon.get("daily_return_gross_pct"),
+            "gross_available": recon.get("gross_available"),
+            "gross_unavailable_reason": recon.get("gross_unavailable_reason"),
         },
         # Outcome of the integrity gates, so the surface a human reads carries
         # the same verdict the pipeline exit code does.
