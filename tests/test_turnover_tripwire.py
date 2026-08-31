@@ -267,3 +267,117 @@ def test_the_live_2026_08_27_artifact_shape_would_not_report_ok(published):
     assert out["rolling_sum"] == pytest.approx(0.921)
     assert out["daily_breach"] is False
     assert out["status"] == tw.STATUS_BREACH_ROLLING
+
+
+# ── Driver attribution (alpha-engine-config-I9315) ────────────────────────
+# The rolling alert used to end "review the optimizer shadow logs for the
+# driver" — asking a human to perform the diagnosis the detector is already
+# standing on the data to perform. These pin that it now performs it.
+
+
+def _rich_shadow(date, turnover, *, floor=0.0, ir=None, gated=False, binding=False):
+    return {
+        "run_date": date,
+        "diagnostics": {
+            "turnover_one_way": turnover,
+            "turnover_mandatory_floor": floor,
+            "turnover_budget_configured": 0.20,
+            "turnover_budget_discretionary": 0.20 * (0.05 if gated else 1.0),
+            "conviction_ir_xs": ir,
+            "conviction_budget_multiplier": 0.05 if gated else 1.0,
+            "conviction_gate_applied": gated,
+            "conviction_gate_reason": (
+                "alpha_spread_below_own_noise" if gated else "signal_quality_ok"
+            ),
+            "turnover_constraint_binding": binding,
+        },
+    }
+
+
+def _window(rows):
+    return [tw._driver_row(r["run_date"], r["diagnostics"]) for r in rows]
+
+
+def test_attribution_names_predictor_conviction_collapse():
+    # The measured live condition, 2026-08-24..2026-08-31: budget binding
+    # daily, gate NOT yet deployed, cross-sectional IR ~0.03.
+    a = tw._attribute(_window([
+        _rich_shadow(f"2026-08-2{d}", 0.20, ir=0.03, binding=True) for d in range(4, 9)
+    ]))
+    assert a["driver"] == "predictor_conviction_collapse"
+    assert "not statistically distinguishable" in a["detail"]
+    assert "UPSTREAM" in a["detail"]
+    assert a["median_conviction_ir"] == pytest.approx(0.03)
+
+
+def test_attribution_names_forced_exits():
+    a = tw._attribute(_window([
+        _rich_shadow(f"2026-08-2{d}", 0.18, floor=0.17, ir=2.0) for d in range(4, 9)
+    ]))
+    assert a["driver"] == "forced_exits"
+    assert "turnover_mandatory_floor_by_cause" in a["detail"]
+    assert a["forced_sum"] == pytest.approx(0.85)
+
+
+def test_attribution_names_the_gate_when_it_is_throttling():
+    a = tw._attribute(_window([
+        _rich_shadow(f"2026-08-2{d}", 0.14, ir=0.03, gated=True, binding=True)
+        for d in range(4, 9)
+    ]))
+    assert a["driver"] == "conviction_gate_throttling"
+    assert "SURVIVED the throttle" in a["detail"]
+    assert a["n_conviction_gated"] == 5
+
+
+def test_attribution_names_budget_saturation_on_a_signal_that_passes():
+    a = tw._attribute(_window([
+        _rich_shadow(f"2026-08-2{d}", 0.20, ir=3.0, binding=True) for d in range(4, 9)
+    ]))
+    assert a["driver"] == "budget_saturation"
+    assert "never converges" in a["detail"]
+
+
+def test_unknown_combination_is_reported_as_unattributed_not_guessed():
+    # A new failure mode must be reported as new, never rounded to the
+    # nearest known one.
+    a = tw._attribute(_window([
+        _rich_shadow(f"2026-08-2{d}", 0.20, ir=3.0, binding=False) for d in range(4, 9)
+    ]))
+    assert a["driver"] == "unattributed"
+    assert "not one the attribution knows" in a["detail"]
+
+
+def test_attribution_is_emitted_on_a_quiet_day_too(published):
+    # A driver block that exists only on the alerting path cannot be used to
+    # watch a condition build.
+    s3 = _FakeS3({"predictor/optimizer_shadow/2026-08-28.json":
+                  _rich_shadow("2026-08-28", 0.01, ir=3.0)})
+    out = tw.check_turnover_tripwire(
+        {"turnover_one_way": 0.01, "conviction_ir_xs": 3.0},
+        _CFG, "b", "2026-08-31", s3_client=s3,
+    )
+    assert out["status"] == tw.STATUS_OK
+    assert published == []
+    assert "attribution" in out and out["attribution"]["driver"]
+
+
+def test_rolling_alert_message_carries_the_driver_and_the_series(published):
+    objs = {
+        f"predictor/optimizer_shadow/2026-08-2{d}.json":
+        _rich_shadow(f"2026-08-2{d}", 0.20, ir=0.03, binding=True)
+        for d in range(4, 9)
+    }
+    out = tw.check_turnover_tripwire(
+        {"turnover_one_way": 0.20, "conviction_ir_xs": 0.03,
+         "turnover_constraint_binding": True, "turnover_mandatory_floor": 0.0},
+        _CFG, "b", "2026-08-31", s3_client=_FakeS3(objs),
+    )
+    assert out["rolling_breach"] is True
+    assert len(published) == 1
+    msg = published[0]["message"]
+    assert "DRIVER (predictor_conviction_collapse)" in msg
+    # The old text asked the operator to go and do the diagnosis.
+    assert "review the optimizer shadow logs" not in msg
+    # The per-session series is in the message, not only in the artifact.
+    assert "2026-08-31 20.0%" in msg
+    assert out["attribution"]["per_day"][0]["date"] == "2026-08-31"

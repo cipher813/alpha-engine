@@ -480,6 +480,34 @@ portfolio_optimizer:
   # re-solves). Defaults ON (fail-safe — a tighter cap only slows rebalancing,
   # never worsens a trade). Set max_daily_turnover: null to disable.
   max_daily_turnover: 0.20          # ≤20% one-way turnover executed per day
+  # ── Conviction gate on the DISCRETIONARY budget (alpha-engine-config-I9315)
+  # The budget above answers "how far may the book move today". It never
+  # answered "is today's target worth moving toward at all". Between
+  # 2026-08-17 and 2026-08-31 that gap held the optimizer at the 20%/day cap
+  # for 12 consecutive sessions while the predictor's cross-sectional alpha
+  # spread sat at ~1/30th of its own published per-name sigma_alpha — the book
+  # was being reshuffled between names the model could not tell apart.
+  #
+  # The gate scales the DISCRETIONARY budget by q, from the cross-sectional
+  # information ratio of the alpha vector:
+  #     IR_xs = stdev_xs(alpha_hat_eligible) / median(sigma_alpha_eligible)
+  #     q     = clip((IR_xs - ir_floor) / (ir_full - ir_floor), min_mult, 1.0)
+  # Mandatory turnover (forced exits, ineligibility pins, the cash sleeve) is
+  # applied AFTER the gate and is never throttled by it.
+  #
+  # The band is derived from measurement, not chosen: over the 20 stored
+  # optimizer_shadow artifacts for 2026-07-31..2026-08-31, IR_xs was 1.90-5.49
+  # on every session of the healthy regime and 0.025-0.221 on every session of
+  # the churning one. [0.35, 0.75] sits inside that gap and touches neither
+  # side. Re-derive it if the predictor's uncertainty scale changes.
+  #
+  # Set conviction_budget_gate_enabled: false to restore the pre-I9315
+  # budget-only behaviour.
+  conviction_budget_gate_enabled: true
+  conviction_ir_floor: 0.35         # at/below this, q = min multiple
+  conviction_ir_full: 0.75          # at/above this, q = 1.0 (no throttle)
+  conviction_budget_min_multiple: 0.05   # floor on q -> 1%/day one-way
+  conviction_gate_min_names: 3      # fewer discretionary names -> gate inert
   # When the REQUESTED (uncapped) one-way turnover exceeds this, the planner
   # emits a WARN + SNS/Telegram alert for operator approval to accelerate —
   # the move is still executed gradually under the cap regardless.

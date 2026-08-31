@@ -24,6 +24,8 @@ from executor.portfolio_optimizer import (
     TurnoverBudgetError,
     _apply_turnover_governor,
     _mandatory_turnover_floor,
+    _turnover_diagnostics,
+    compute_conviction_budget_multiplier,
     solve_target_weights,
 )
 
@@ -1523,3 +1525,252 @@ def test_adv_partial_coverage_mixes_impact_and_floor():
     assert result.diagnostics["tcost_term_mode"] == "sqrt_impact"
     assert result.diagnostics["tcost_n_names_with_adv"] == 2  # names 0 and 2
     assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+class TestConvictionBudgetGate:
+    """alpha-engine-config-I9315 — the discretionary turnover budget is gated
+    on measured signal quality, not only on a fixed cap.
+
+    Measured driver (20 stored optimizer_shadow artifacts, 2026-07-31 ..
+    2026-08-31): from 2026-08-17 the optimizer sat at the 20%/day budget on 12
+    consecutive sessions. Replaying each day's stored solve with the budget
+    removed showed the UNCONSTRAINED optimum itself moving 11%-59% one-way per
+    day, so the walk could never converge. One-at-a-time input attribution put
+    0.110 of the mean 0.148 daily target move on alpha_hat and exactly 0.000 on
+    the covariance and on eligibility. Over the same window the cross-sectional
+    alpha spread was 0.025x-0.221x the predictor's own median per-name
+    sigma_alpha: the optimizer was ranking names it could not tell apart.
+    """
+
+    @staticmethod
+    def _gate(alpha, sigma, cfg=None, n=None):
+        n = n if n is not None else len(alpha)
+        return compute_conviction_budget_multiplier(
+            np.array(alpha, dtype=float),
+            None if sigma is None else np.array(sigma, dtype=float),
+            np.ones(n, dtype=bool),
+            spy_idx=n - 2,
+            cash_idx=n - 1,
+            cfg={**OPTIMIZER_CONFIG_DEFAULTS, **(cfg or {})},
+        )
+
+    def test_high_conviction_is_not_throttled(self):
+        # Healthy regime: spread well above the model's own error bar.
+        out = self._gate([0.10, -0.10, 0.05, -0.05, 0.0, 0.0], [0.02] * 6)
+        assert out["conviction_ir_xs"] > 0.75
+        assert out["conviction_budget_multiplier"] == 1.0
+        assert out["conviction_gate_applied"] is False
+        assert out["conviction_gate_reason"] == "signal_quality_ok"
+
+    def test_tied_names_are_throttled_to_the_floor(self):
+        # The live 2026-08-24..28 regime: spread ~1/30th of sigma_alpha.
+        out = self._gate([0.001, 0.002, 0.0015, 0.0012, 0.0, 0.0], [0.24] * 6)
+        assert out["conviction_ir_xs"] < 0.05
+        assert out["conviction_budget_multiplier"] == pytest.approx(0.05)
+        assert out["conviction_gate_applied"] is True
+        assert out["conviction_gate_reason"] == "alpha_spread_below_own_noise"
+
+    def test_multiplier_is_monotone_in_signal_quality(self):
+        qs = [
+            self._gate([s, -s, s / 2, -s / 2, 0.0, 0.0], [0.10] * 6)[
+                "conviction_budget_multiplier"
+            ]
+            for s in (0.01, 0.05, 0.10, 0.30)
+        ]
+        assert qs == sorted(qs)
+        assert qs[0] < 1.0 and qs[-1] == 1.0
+
+    def test_missing_uncertainty_never_tightens_the_budget(self):
+        # Missing data must never produce a budget TIGHTER than configured: a
+        # gate that halts the book on an input outage is a worse failure than
+        # the churn it exists to stop. The reason is recorded, not swallowed.
+        for sigma, reason in (
+            (None, "no_alpha_uncertainty_vector"),
+            ([0.0] * 6, "no_usable_alpha_uncertainty"),
+            ([float("nan")] * 6, "no_usable_alpha_uncertainty"),
+        ):
+            out = self._gate([0.001, 0.002, 0.0015, 0.0012, 0.0, 0.0], sigma)
+            assert out["conviction_budget_multiplier"] == 1.0
+            assert out["conviction_gate_applied"] is False
+            assert out["conviction_gate_reason"] == reason
+
+    def test_disabled_gate_is_inert_and_says_so(self):
+        out = self._gate(
+            [0.001, 0.002, 0.0015, 0.0012, 0.0, 0.0], [0.24] * 6,
+            cfg={"conviction_budget_gate_enabled": False},
+        )
+        assert out["conviction_budget_multiplier"] == 1.0
+        assert out["conviction_gate_reason"] == "disabled"
+
+    def test_invalid_band_does_not_become_an_arbitrary_throttle(self):
+        out = self._gate(
+            [0.001, 0.002, 0.0015, 0.0012, 0.0, 0.0], [0.24] * 6,
+            cfg={"conviction_ir_floor": 0.9, "conviction_ir_full": 0.4},
+        )
+        assert out["conviction_budget_multiplier"] == 1.0
+        assert out["conviction_gate_reason"] == "invalid_ir_band"
+
+    def test_too_few_discretionary_names_is_inert(self):
+        out = compute_conviction_budget_multiplier(
+            np.array([0.01, 0.0, 0.0]), np.array([0.2, 0.0, 0.0]),
+            np.ones(3, dtype=bool), spy_idx=1, cash_idx=2,
+            cfg=OPTIMIZER_CONFIG_DEFAULTS,
+        )
+        assert out["conviction_budget_multiplier"] == 1.0
+        assert out["conviction_gate_reason"] == "too_few_discretionary_names"
+
+    # ── end-to-end through the solve ─────────────────────────────────────
+
+    @staticmethod
+    def _solve_tied(gate=True, cap=0.20):
+        # Six statistically tied names against an all-SPY book: alphas differ
+        # by ~1/50th of their own sigma. Ungated, the optimizer spends the
+        # whole 20% budget reshuffling them.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.0100, 0.0102, 0.0104, 0.0106, 0.0108, 0.0110]
+        u["alpha_uncertainty"] = np.full(len(u["tickers"]), 0.25)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[u["spy_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["cfg"] = {
+            "max_daily_turnover": cap,
+            "large_move_turnover_flag": 0.35,
+            "conviction_budget_gate_enabled": gate,
+        }
+        return _solve(u)
+
+    def test_gate_collapses_turnover_on_tied_names(self):
+        ungated = self._solve_tied(gate=False).diagnostics
+        gated = self._solve_tied(gate=True).diagnostics
+        assert ungated["turnover_one_way"] == pytest.approx(0.20, abs=1e-2)
+        assert gated["turnover_one_way"] < 0.05
+        assert gated["conviction_gate_applied"] is True
+        assert gated["turnover_budget_configured"] == pytest.approx(0.20)
+        assert gated["turnover_budget_discretionary"] == pytest.approx(0.01)
+
+    def test_gated_binding_does_not_raise_the_large_move_flag(self):
+        # The alert this arc exists to end: a guard doing its job is not an
+        # incident. The budget still binds (on the throttled budget) and the
+        # reason SAYS which, but no operator alert is raised.
+        gated = self._solve_tied(gate=True).diagnostics
+        assert gated["turnover_constraint_binding"] is True
+        assert gated["large_move_reason"] == "conviction_throttled_budget_binding"
+        assert gated["large_move_flagged"] is False
+
+    def test_high_conviction_still_flags_a_binding_budget(self):
+        # The detector must not be killed by the fix: on a day the model
+        # stands behind, a binding budget is still a real operator fact.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.08, 0.078, 0.076, 0.074, 0.072, 0.070]
+        # sigma_alpha well under the cross-sectional spread (0.0034) -> IR ~1.7,
+        # above the 0.75 full-budget mark: the model stands behind the ranking.
+        u["alpha_uncertainty"] = np.full(len(u["tickers"]), 0.002)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[u["spy_idx"]] = 0.97
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["cfg"] = {"max_daily_turnover": 0.20, "large_move_turnover_flag": 0.35}
+        d = _solve(u).diagnostics
+        assert d["conviction_gate_applied"] is False
+        assert d["turnover_constraint_binding"] is True
+        assert d["large_move_flagged"] is True
+        assert d["large_move_reason"] == "turnover_budget_binding"
+
+    def test_conviction_fields_present_on_every_solve(self):
+        for cap in (0.20, None):
+            for gate in (True, False):
+                d = self._solve_tied(gate=gate, cap=cap).diagnostics
+                for key in (
+                    "conviction_gate_applied",
+                    "conviction_ir_xs",
+                    "conviction_alpha_dispersion",
+                    "conviction_alpha_noise",
+                    "conviction_n_names",
+                    "conviction_budget_multiplier",
+                    "conviction_gate_reason",
+                    "turnover_budget_configured",
+                    "turnover_budget_discretionary",
+                ):
+                    assert key in d, f"{key} missing cap={cap} gate={gate}"
+
+    def test_mandatory_turnover_is_never_starved_by_the_gate(self):
+        # A forced exit is not discretionary. With the gate at its floor
+        # (0.01 discretionary budget), an ineligible position carrying ~10%
+        # of the book must still be fully exited.
+        u = _baseline_universe(n_active=6)
+        u["alpha_hat"][:6] = [0.0100, 0.0102, 0.0104, 0.0106, 0.0108, 0.0110]
+        u["alpha_uncertainty"] = np.full(len(u["tickers"]), 0.25)
+        w_prev = np.zeros(len(u["tickers"]))
+        w_prev[0] = 0.10
+        w_prev[u["spy_idx"]] = 0.87
+        w_prev[u["cash_idx"]] = 0.03
+        u["w_prev"] = w_prev
+        u["eligibility"] = np.ones(len(u["tickers"]), dtype=bool)
+        u["eligibility"][0] = False
+        u["cfg"] = {"max_daily_turnover": 0.20, "large_move_turnover_flag": 0.35}
+        result = _solve(u)
+        d = result.diagnostics
+        assert d["conviction_gate_applied"] is True
+        assert d["turnover_budget_discretionary"] == pytest.approx(0.01)
+        # The forced exit sets the floor, and the effective budget is raised
+        # to it rather than clipped to the throttled discretionary number.
+        assert d["turnover_mandatory_floor"] >= 0.09
+        assert d["turnover_constraint_cap"] >= d["turnover_mandatory_floor"]
+        assert result.weights[0] == pytest.approx(0.0, abs=1e-6)
+
+
+class TestBudgetBindingComplementarySlackness:
+    """alpha-engine-config-I9315 — a binding verdict needs BOTH halves.
+
+    Measured on the live book: 2026-08-21 dual 4.2e-9 at 14.98% executed,
+    2026-08-27 dual 2.4e-8 at 16.99%, 2026-08-28 dual 1.6e-8 at 12.27%, all
+    against a 20% cap with up to 7.7 points unspent. All three were reported
+    binding and all three published an operator alert stating the budget
+    "BOUND the solve". The old test was `dual > 1e-9`, which is far below the
+    numerical dust an interior-point solver returns for an INACTIVE constraint.
+    """
+
+    @staticmethod
+    def _diag(executed, cap, dual):
+        w_prev = np.zeros(4)
+        w_prev[0] = 1.0
+        weights = w_prev.copy()
+        weights[0] -= executed
+        weights[1] += executed
+
+        class _C:
+            dual_value = dual
+
+        return _turnover_diagnostics(
+            weights, w_prev,
+            {"turnover_constraint_applied": True,
+             "turnover_constraint_cap": cap,
+             "turnover_constraint": _C()},
+        )
+
+    def test_dual_dust_below_the_bound_is_not_binding(self):
+        for executed, dual in ((0.1498, 4.2e-9), (0.1699, 2.4e-8), (0.1227, 1.6e-8)):
+            d = self._diag(executed, 0.20, dual)
+            assert d["turnover_constraint_binding"] is False, executed
+            assert d["turnover_capped"] is False
+
+    def test_post_clip_drift_at_the_bound_is_still_binding(self):
+        # The 2026-08-14 case the dual-only test was introduced to catch:
+        # solver at the 0.2000 cap, post-clip-and-renormalize 0.19978.
+        d = self._diag(0.19978, 0.20, 0.00926)
+        assert d["turnover_constraint_binding"] is True
+        assert d["turnover_capped"] is True
+
+    def test_real_dual_at_the_bound_is_binding(self):
+        d = self._diag(0.20, 0.20, 0.0256)
+        assert d["turnover_constraint_binding"] is True
+
+    def test_no_dual_falls_back_to_the_primal_and_records_it(self):
+        d = self._diag(0.20, 0.20, None)
+        assert d["turnover_constraint_binding"] is True
+        assert d["turnover_binding_test"] == "primal_only_no_dual"
+
+    def test_binding_test_is_named_in_the_diagnostics(self):
+        d = self._diag(0.20, 0.20, 0.0256)
+        assert d["turnover_binding_test"] == "complementary_slackness"
