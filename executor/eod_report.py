@@ -104,7 +104,7 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.9"
+SCHEMA_VERSION = "2.10"
 # 2.7 (alpha-engine-config-I8188, second pass): additive only.
 # ``transaction_costs`` gains ``gross_available`` and
 # ``gross_unavailable_reason``. When IB attaches no commissionReport to any
@@ -135,11 +135,16 @@ SCHEMA_VERSION = "2.9"
 # declaration that ``spy_return_pct`` is now TOTAL return, not price return).
 # Both are additive; no 2.3 field changed meaning.
 #
-# 2.9 (alpha-engine-config-I9637) adds ``integrity.mark_check_coverage`` and
-# per-position ``ib_mark_range_checked`` — the custodian-mark gate's own
-# coverage. The ArcticDB macro library is Close-only, so a macro-routed
-# holding has no traded range to check against and its mark reached NAV
-# unverified AND unrecorded. Additive.
+# 2.9 (alpha-engine-config-I9637) adds ``integrity.mark_check_coverage`` — the
+# custodian-mark gate's own coverage. The ArcticDB macro library is Close-only,
+# so a macro-routed holding has no traded range to check against and its mark
+# reached NAV unverified AND unrecorded. Additive.
+#
+# 2.10 (alpha-engine-config-I9637) carries ``ib_mark_range_checked`` and
+# ``ib_mark_range_uncheckable_reason`` onto each POSITION row. 2.9 published
+# the book-level count but not the per-name stamp, so a reader inspecting one
+# position still could not tell "checked and in range" from "never evaluated" —
+# the ambiguity relocated rather than closed. Additive.
 #
 # 2.8 (alpha-engine-config-I9627) adds ``integrity.nav_mark_correction``: the
 # broker NAV as received, the per-name repair applied to any provably-wrong
@@ -607,7 +612,19 @@ def build_eod_report(
             # settled-close override, so a NAV hard-gate breach is
             # self-diagnosing from the artifact instead of a by-hand trace.
             "ib_market_value": pos.get("ib_market_value"),
+            # `ib_mark_outside_range` alone cannot say whether the check RAN
+            # (alpha-engine-config-I9637). Its `, False` default makes an
+            # unevaluated mark read exactly like one that was checked and
+            # passed — the same ambiguity `mark_check_coverage` closes for the
+            # book as a whole, still open at the row level until this field
+            # travels with it. Measured on the 2026-08-31 artifact: every
+            # position carried `ib_mark_outside_range: false` and no reader
+            # could tell that from `ib_mark_range_checked: null`.
             "ib_mark_outside_range": pos.get("ib_mark_outside_range", False),
+            "ib_mark_range_checked": pos.get("ib_mark_range_checked"),
+            "ib_mark_range_uncheckable_reason": pos.get(
+                "ib_mark_range_uncheckable_reason"
+            ),
             "ib_mark_range_error_usd": pos.get("ib_mark_range_error_usd"),
             # Schema 2.4 (alpha-engine-config-I9085): the out-of-range flag
             # above is a strict SUBSET of "the IB mark is not the settled

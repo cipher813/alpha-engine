@@ -439,14 +439,14 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_9(self):
+    def test_schema_version_is_2_10(self):
         """2.9 (alpha-engine-config-I9637): the `integrity` block gains
         `mark_check_coverage` — how many held marks the range check could
         actually evaluate. 2.8 (I9627) added `nav_mark_correction`: the
         `nav_mark_correction` — the raw broker NAV and the repair applied to
         it, so a corrected headline stays traceable to what IB sent.
         Additive only."""
-        assert SCHEMA_VERSION == "2.9"
+        assert SCHEMA_VERSION == "2.10"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -498,7 +498,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.9"
+        assert report["schema_version"] == "2.10"
         # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
         # and the integrity-gate verdict reach the artifact. Before this the
         # only cost figure anywhere in the P&L path was the portfolio
@@ -661,3 +661,41 @@ class TestMarkCheckCoverageIsPublished:
             positions={}, prior_positions={}, conn=_conn(),
         )
         assert report["integrity"]["mark_check_coverage"] is None
+
+
+class TestPerPositionMarkStampTravels:
+    """Schema 2.10 (alpha-engine-config-I9637). The book-level coverage count
+    is not enough: a reader inspecting ONE position must be able to tell
+    "checked and in range" from "never evaluated"."""
+
+    def _row(self, pos):
+        report = build_eod_report(
+            run_date="2026-09-01", nav=1_000_000.0, prior_nav=None,
+            daily_return=None, spy_return=None, alpha=None,
+            positions={"AAA": dict(pos, shares=10, market_value=1000.0)},
+            prior_positions={}, conn=_conn(),
+        )
+        return next(r for r in report["positions"] if r["ticker"] == "AAA")
+
+    def test_a_checked_in_range_mark_is_distinguishable(self):
+        row = self._row({"ib_mark_range_checked": True,
+                         "ib_mark_outside_range": False})
+        assert row["ib_mark_range_checked"] is True
+        assert row["ib_mark_outside_range"] is False
+        assert row["ib_mark_range_uncheckable_reason"] is None
+
+    def test_an_unevaluated_mark_is_distinguishable_and_says_why(self):
+        row = self._row({"ib_mark_range_checked": False,
+                         "ib_mark_range_uncheckable_reason":
+                             "macro library is Close-only"})
+        # The old artifact showed exactly this as `ib_mark_outside_range:
+        # false` with nothing else — indistinguishable from the case above.
+        assert row["ib_mark_range_checked"] is False
+        assert row["ib_mark_outside_range"] is False
+        assert row["ib_mark_range_uncheckable_reason"] == "macro library is Close-only"
+
+    def test_a_flagged_mark_still_reports_flagged_and_checked(self):
+        row = self._row({"ib_mark_range_checked": True,
+                         "ib_mark_outside_range": True})
+        assert row["ib_mark_range_checked"] is True
+        assert row["ib_mark_outside_range"] is True
