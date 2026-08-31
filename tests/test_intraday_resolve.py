@@ -223,3 +223,37 @@ def test_build_redeploy_entry_shape():
     assert e["sizing_source"] == "optimizer_redeploy"
     assert e["status"] == "pending"
     assert e["triggers"]["vwap"] is None
+
+
+# ── I9452: the intraday re-solve must rebuild the SAME Omega ────────────────
+
+def test_redeploy_rebuilds_the_guw_omega_from_the_persisted_epistemic_field():
+    """The afternoon re-solve reads its inputs off the morning shadow artifact.
+
+    If it does not read `alpha_uncertainty_epistemic`, it silently runs the GUW
+    penalty INOPERATIVE on a day the morning solve had it armed — the same book,
+    sized under two different objectives, with nothing anywhere saying so
+    (alpha-engine-config-I9452).
+    """
+    log = _shadow_log(n_active=3)
+    log["optimizer_cfg"] = {**log["optimizer_cfg"], "alpha_uncertainty_penalty": 500.0}
+    log["alpha_uncertainty"] = [0.0975, 0.0977, 0.0983, 0.0, 0.0]
+    log["alpha_uncertainty_epistemic"] = [0.0134, 0.0187, 0.0126, 0.0, 0.0]
+    positions = {"T0": {"market_value": 80_000}}
+
+    res = solve_redeploy(
+        shadow_log=log, current_positions=positions, nav=1_000_000.0, stopped_out=set(),
+    )
+    assert res["status"] in ("optimal", "optimal_inaccurate")
+
+    # Same artifact minus the epistemic key = a pre-PR596 morning log. The
+    # re-solve must then report the penalty inoperative rather than substitute
+    # the total, and must still solve.
+    legacy = {k: v for k, v in log.items() if k != "alpha_uncertainty_epistemic"}
+    res_legacy = solve_redeploy(
+        shadow_log=legacy, current_positions=positions, nav=1_000_000.0, stopped_out=set(),
+    )
+    assert res_legacy["status"] in ("optimal", "optimal_inaccurate")
+    # The armed re-solve and the inoperative one must not be the same solve —
+    # that is the whole point of carrying the field forward.
+    assert res["target_weights"] != res_legacy["target_weights"]

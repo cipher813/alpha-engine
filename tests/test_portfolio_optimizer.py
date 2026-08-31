@@ -650,9 +650,17 @@ def test_oas_distinct_from_lw_on_correlated_small_sample():
 # ─── B.3 α̂-uncertainty penalty tests ────────────────────────────────────────
 # Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.3
 #
-# Adds γ · sum_i(σ_α̂_i² · w_i²) to the MVO objective when γ > 0 and
-# alpha_uncertainty is provided. Garlappi-Uppal-Wang 2007 diagonal-Ω form.
+# Adds γ · sum_i(σ_ε_i² · w_i²) to the MVO objective when γ > 0 and a USABLE
+# epistemic vector is provided. Garlappi-Uppal-Wang 2007 diagonal-Ω form.
 # Default OFF (γ=0) preserves bit-identical legacy MVO behavior.
+#
+# alpha-engine-config-I9452 changed WHICH vector feeds Ω. It is
+# `alpha_uncertainty_epistemic` (= predicted_alpha_std_epistemic, sqrt(xᵀΣ_w x))
+# and never `alpha_uncertainty` (the total predictive std). Passing only the
+# total leaves the term INOPERATIVE with a recorded reason — these tests were
+# migrated to the new kwarg, and two of them assert the DELIBERATE REVERSAL of
+# an earlier property: a cross-sectionally flat Ω is now reported inoperative
+# instead of being applied as a uniform ridge.
 
 
 def test_default_alpha_uncertainty_penalty_is_off_and_bit_identical():
@@ -673,17 +681,26 @@ def test_default_alpha_uncertainty_penalty_is_off_and_bit_identical():
     r_b3 = _solve(u_b3)
     np.testing.assert_allclose(r_legacy.weights, r_b3.weights, atol=1e-12)
     assert r_b3.diagnostics["alpha_uncertainty_penalty_used"] is False
+    # The reason is populated on EVERY solve, including the ones where nothing
+    # was wrong — a field that only appears on the throttled path cannot be
+    # used to tell "off by configuration" from "off because it broke".
+    assert r_b3.diagnostics["alpha_uncertainty_inoperative_reason"] == "gamma_zero"
 
 
 def test_alpha_uncertainty_penalty_off_when_arg_none_even_if_gamma_positive():
-    """γ > 0 but alpha_uncertainty=None → penalty term skipped (covers the
-    1-week soak window before BR pickle promoted in production)."""
+    """γ > 0 but no epistemic vector → penalty skipped, reason recorded.
+
+    Covers every stored artifact predating crucible-predictor PR596 and any
+    champion with no learned noise precision."""
     u = _baseline_universe(n_active=2)
     u["alpha_hat"][:2] = 0.05
     u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
 
     result = _solve(u)
     assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert result.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "epistemic_field_absent"
+    )
     # Same as legacy MVO — both names hit the cap
     assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
     assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
@@ -700,8 +717,11 @@ def test_alpha_uncertainty_penalty_off_when_all_std_zero_or_nan():
 
     N = len(u["tickers"])
     all_nan = np.full(N, np.nan)
-    result = solve_target_weights(**u, alpha_uncertainty=all_nan)
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=all_nan)
     assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert result.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "epistemic_field_absent"
+    )
 
 
 def test_high_uncertainty_pick_shrinks_relative_to_confident_pick():
@@ -721,8 +741,9 @@ def test_high_uncertainty_pick_shrinks_relative_to_confident_pick():
     unc[0] = 0.04  # diffuse
     unc[1] = 0.002  # confident
 
-    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
     assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    assert result.diagnostics["alpha_uncertainty_vintage"] == "epistemic"
     assert result.weights[0] < 0.05, (
         f"High-σ pick should shrink below cap; got {result.weights[0]:.4f}"
     )
@@ -733,66 +754,159 @@ def test_high_uncertainty_pick_shrinks_relative_to_confident_pick():
     assert result.weights[0] < result.weights[1]
 
 
-def test_uniform_high_uncertainty_shrinks_all_conviction_picks_proportionally():
-    """All conviction picks have identical high σ → all shrink equally
-    relative to the baseline (no penalty) case. Plan acceptance:
-    'high-uncertainty case shrinks all conviction picks proportionally.'"""
+def test_uniform_uncertainty_is_reported_inoperative_not_applied():
+    """DELIBERATE REVERSAL of the original B.3 property (I9452 deliverable 3).
+
+    B.3 originally asserted that a uniformly high σ shrinks every conviction
+    pick proportionally. It does — and that is precisely the failure mode: a
+    flat Ω discriminates between nothing, so it is not robust sizing, it is an
+    undeclared risk-aversion increase applied through a knob nobody is reading
+    as one. Measured, that was not a corner case: over every stored session
+    from the 2026-06-01 BayesianRidge cutover to 2026-08-31 the emitted TOTAL
+    σ had a cross-name CV of at most 0.008, so this branch was the only branch
+    the production wiring could ever have taken.
+
+    A flat Ω is now REPORTED inoperative and the solve is bit-identical to
+    γ=0 — the operator sees a named reason instead of an unexplained shrink.
+    """
     u_baseline = _baseline_universe(n_active=3)
     u_baseline["alpha_hat"][:3] = 0.05
     u_baseline["cfg"] = {"covariance_shrinkage": "sample"}
 
-    u_high_unc = _baseline_universe(n_active=3)
-    u_high_unc["alpha_hat"][:3] = 0.05
-    u_high_unc["returns_panel"] = u_baseline["returns_panel"].copy()
-    u_high_unc["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 500.0}
-    u_high_unc["stance_caps"][u_high_unc["spy_idx"]] = 1.0
-    u_high_unc["stance_caps"][u_high_unc["cash_idx"]] = 1.0
+    u_flat = _baseline_universe(n_active=3)
+    u_flat["alpha_hat"][:3] = 0.05
+    u_flat["returns_panel"] = u_baseline["returns_panel"].copy()
+    u_flat["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 500.0}
+    u_flat["stance_caps"][u_flat["spy_idx"]] = 1.0
+    u_flat["stance_caps"][u_flat["cash_idx"]] = 1.0
 
     r_baseline = _solve(u_baseline)
-    N = len(u_high_unc["tickers"])
+    N = len(u_flat["tickers"])
     unc = np.zeros(N)
-    unc[:3] = 0.05  # equal high uncertainty across all 3
-    r_high_unc = solve_target_weights(**u_high_unc, alpha_uncertainty=unc)
+    unc[:3] = 0.05  # identical across every discretionary name
+    r_flat = solve_target_weights(**u_flat, alpha_uncertainty_epistemic=unc)
 
-    # Baseline: all three at cap
-    assert all(r_baseline.weights[i] == pytest.approx(0.08, abs=1e-3) for i in range(3))
-    # With uniform high σ: all three shrink, all roughly equal to each other
-    assert all(r_high_unc.weights[i] < 0.07 for i in range(3)), (
-        "All conviction picks should shrink when uncertainty is uniformly high"
+    assert r_flat.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert r_flat.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "cross_section_below_floor"
     )
-    spread = np.max(r_high_unc.weights[:3]) - np.min(r_high_unc.weights[:3])
-    assert spread < 0.005, (
-        f"Equal-σ picks should shrink to equal weights; spread={spread:.4f}"
+    assert r_flat.diagnostics["alpha_uncertainty_epistemic_cv"] == pytest.approx(0.0)
+    np.testing.assert_allclose(r_baseline.weights, r_flat.weights, atol=1e-6)
+
+
+def test_large_but_flat_omega_is_caught_by_cv_not_by_magnitude():
+    """A magnitude test could not have caught the real degenerate regime.
+
+    Champion ``v3.0-meta-2026-08-21-7d3d1cce`` served 2026-08-24..28 with an
+    epistemic vector of 0.207-0.230 — an order of magnitude LARGER than the
+    healthy champion's 0.009-0.023 — and a cross-sectional CV of 0.00007-0.00025
+    because its posterior never left its prior. Big and useless. Only the CV
+    floor separates it.
+    """
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 500.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    # Real reconstructed values from predictor/optimizer_shadow/2026-08-27.json
+    # against that champion's learned noise precision (alpha_ = 93.18750247).
+    unc[:3] = [0.23019744, 0.23019854, 0.23021499]
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    assert max(unc) > 10 * 0.023, "fixture must be LARGE, or it tests nothing"
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert result.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "cross_section_below_floor"
+    )
+
+
+def test_real_healthy_session_clears_the_floor():
+    """The counterpart: the healthy champion's own numbers must stay operative,
+    or the floor is a permanent false positive rather than a detector.
+
+    Reconstructed from predictor/optimizer_shadow/2026-08-31.json against
+    champion ``v3.0-meta-2026-08-14-119e069b`` (alpha_ = 107.28362438).
+    """
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 500.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    unc = np.zeros(N)
+    unc[:3] = [0.01342714, 0.01872044, 0.01263466]
+
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
+    assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
+    assert result.diagnostics["alpha_uncertainty_epistemic_cv"] > 0.01
+
+
+def test_the_total_could_never_have_cleared_the_floor():
+    """Pins the finding that made this change necessary (I9446).
+
+    These are the ACTUAL emitted ``predicted_alpha_std`` values for three names
+    on 2026-08-31. Built into Ω they are a uniform ridge, and the CV floor says
+    so — so the "fall back to the total when the epistemic field is absent"
+    path would have been dead code that only ever produced an inoperative
+    report. That is why there is no fallback.
+    """
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
+    u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 500.0}
+    u["stance_caps"][u["spy_idx"]] = 1.0
+    u["stance_caps"][u["cash_idx"]] = 1.0
+
+    N = len(u["tickers"])
+    totals = np.zeros(N)
+    totals[:3] = [0.097475, 0.098344, 0.097369]
+
+    # Passed as the TOTAL (its real role) → the term never arms.
+    r_total_only = solve_target_weights(**u, alpha_uncertainty=totals)
+    assert r_total_only.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert r_total_only.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "epistemic_field_absent"
+    )
+
+    # And even if something DID hand the total to Ω, the floor rejects it.
+    r_forced = solve_target_weights(**u, alpha_uncertainty_epistemic=totals)
+    assert r_forced.diagnostics["alpha_uncertainty_penalty_used"] is False
+    assert r_forced.diagnostics["alpha_uncertainty_inoperative_reason"] == (
+        "cross_section_below_floor"
     )
 
 
 def test_nan_entries_treated_as_zero_uncertainty():
-    """Partial-rollout case: one ticker has BR std, the other still on legacy
-    Ridge (std=None → NaN). NaN entries get zero penalty (no info)."""
-    u = _baseline_universe(n_active=2)
-    u["alpha_hat"][:2] = 0.05
+    """Partial-rollout case: some tickers carry the epistemic field, one does
+    not (legacy Ridge → None → NaN). NaN entries get zero penalty (no info)."""
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
     u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
     u["stance_caps"][u["spy_idx"]] = 1.0
     u["stance_caps"][u["cash_idx"]] = 1.0
 
     N = len(u["tickers"])
     unc = np.full(N, np.nan)
-    unc[0] = 0.04  # T0 has BR std → penalty applies
-    # T1 stays NaN → no penalty
+    unc[0] = 0.04   # T0: diffuse
+    unc[1] = 0.004  # T1: confident
+    # T2 stays NaN → no penalty for it
 
-    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
     assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
-    # T0 shrinks (penalty applied), T1 stays at cap (no info, no penalty)
-    assert result.weights[0] < 0.05
-    assert result.weights[1] == pytest.approx(0.08, abs=1e-3)
+    # T0 shrinks hardest, T2 (no info) stays at cap.
+    assert result.weights[0] < result.weights[1]
+    assert result.weights[2] == pytest.approx(0.08, abs=1e-3)
 
 
 def test_negative_alpha_uncertainty_coerced_to_zero_with_warning(caplog):
     """Negative σ is an upstream contract violation but we don't crash the
     morning planner over it — log loud, coerce to 0."""
     import logging
-    u = _baseline_universe(n_active=2)
-    u["alpha_hat"][:2] = 0.05
+    u = _baseline_universe(n_active=3)
+    u["alpha_hat"][:3] = 0.05
     u["cfg"] = {"covariance_shrinkage": "sample", "alpha_uncertainty_penalty": 1000.0}
     u["stance_caps"][u["spy_idx"]] = 1.0
     u["stance_caps"][u["cash_idx"]] = 1.0
@@ -801,9 +915,10 @@ def test_negative_alpha_uncertainty_coerced_to_zero_with_warning(caplog):
     unc = np.zeros(N)
     unc[0] = -0.05  # invalid
     unc[1] = 0.002
+    unc[2] = 0.030
 
     with caplog.at_level(logging.WARNING):
-        result = solve_target_weights(**u, alpha_uncertainty=unc)
+        result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
     assert any("negative entries" in rec.message for rec in caplog.records)
     # Solve still completes; T0 gets zero penalty (coerced), so it stays at cap
     assert result.weights[0] == pytest.approx(0.08, abs=1e-3)
@@ -818,8 +933,8 @@ def test_alpha_uncertainty_wrong_shape_raises():
     u["stance_caps"][u["cash_idx"]] = 1.0
 
     wrong_shape = np.array([0.01, 0.02])  # N=4 expected
-    with pytest.raises(ValueError, match="alpha_uncertainty shape"):
-        solve_target_weights(**u, alpha_uncertainty=wrong_shape)
+    with pytest.raises(ValueError, match="alpha_uncertainty_epistemic shape"):
+        solve_target_weights(**u, alpha_uncertainty_epistemic=wrong_shape)
 
 
 def test_uncertainty_penalty_diagnostics_populated():
@@ -833,11 +948,15 @@ def test_uncertainty_penalty_diagnostics_populated():
 
     N = len(u["tickers"])
     unc = np.zeros(N)
-    unc[:2] = 0.03
+    unc[0] = 0.03
+    unc[1] = 0.01
 
-    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
     diag = result.diagnostics
     assert diag["alpha_uncertainty_penalty_used"] is True
+    assert diag["alpha_uncertainty_vintage"] == "epistemic"
+    assert diag["alpha_uncertainty_inoperative_reason"] is None
+    assert diag["alpha_uncertainty_epistemic_cv"] > 0.01
     assert "mean_alpha_std_active" in diag
     assert diag["mean_alpha_std_active"] > 0
     assert "alpha_uncertainty_penalty_contribution" in diag
@@ -864,7 +983,7 @@ def test_uncertainty_penalty_composes_with_horizon_and_ewma():
     unc[0] = 0.04
     unc[1] = 0.002
 
-    result = solve_target_weights(**u, alpha_uncertainty=unc)
+    result = solve_target_weights(**u, alpha_uncertainty_epistemic=unc)
     # Solve succeeds AND uncertainty penalty active AND differentiates picks
     assert result.diagnostics["status"] in ("optimal", "optimal_inaccurate")
     assert result.diagnostics["alpha_uncertainty_penalty_used"] is True
