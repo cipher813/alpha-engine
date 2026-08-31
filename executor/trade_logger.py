@@ -193,6 +193,13 @@ _EOD_MIGRATIONS = [
     # Integrity-gate outcomes, persisted BEFORE the run raises so a red
     # pipeline never costs us the evidence that made it red.
     "ALTER TABLE eod_pnl ADD COLUMN integrity_breach_json TEXT",
+    # The broker NAV as received and the repair applied to it. A published NAV
+    # that silently differs from what IB sent is untraceable; these three make
+    # the correction inspectable from the ledger alone
+    # (alpha-engine-config-I9627).
+    "ALTER TABLE eod_pnl ADD COLUMN nav_ib_raw_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN nav_mark_correction_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN nav_mark_correction_json TEXT",
     # accrued_today - released_today; the term that keeps the reconciliation
     # identity closed on BOTH the ex-date and the pay date once dividends are
     # accrued on the ex-date against a cash-basis NAV. See
@@ -616,8 +623,9 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
              dividend_accrual_available, spy_dividend_per_share,
              integrity_breach_json, dividend_timing_usd,
              dividend_receivable_usd,
+             nav_ib_raw_usd, nav_mark_correction_usd, nav_mark_correction_json,
              created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             eod["date"],
@@ -651,6 +659,9 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("integrity_breach_json"),
             eod.get("dividend_timing_usd"),
             eod.get("dividend_receivable_usd"),
+            eod.get("nav_ib_raw_usd"),
+            eod.get("nav_mark_correction_usd"),
+            eod.get("nav_mark_correction_json"),
             datetime.now(UTC).isoformat(),
         ),
     )

@@ -824,6 +824,7 @@ def check_custodian_marks(
     *,
     nav: float | None,
     run_date: str = "",
+    corrected_tickers: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Promote an out-of-range broker mark from a flag to a FAILURE.
 
@@ -837,12 +838,25 @@ def check_custodian_marks(
     returned only when the mark error is also MATERIAL against NAV, so a
     provably-wrong mark on a trivially small position does not halt the
     pipeline.
+
+    ``corrected_tickers`` (alpha-engine-config-I9627) names the marks whose
+    error ``plan_nav_mark_correction`` has already REMOVED from NAV. A halt
+    exists to stop the book carrying a number known to be wrong; once the wrong
+    number is gone the halt has nothing left to protect, and re-raising on it
+    would fail every future EOD for a condition the pipeline has just repaired.
+    The flag, the raw broker mark and the correction are all still persisted, so
+    nothing about the event becomes unobservable. A name NOT in this list — one
+    whose settled close could not prove the error, or one whose correction the
+    bound refused — breaches exactly as before.
     """
     if not mark_range_flags or not nav:
         return []
+    repaired = set(corrected_tickers or ())
     materiality_usd = mark_materiality_usd(nav)
     breaches: list[dict[str, Any]] = []
     for flag in mark_range_flags:
+        if flag.get("ticker") in repaired:
+            continue
         error_usd = flag.get("mark_error_usd")
         try:
             error_usd = float(error_usd)
@@ -875,6 +889,185 @@ def check_custodian_marks(
             ),
         })
     return breaches
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4b. Repairing a provably-wrong broker mark (alpha-engine-config-I9627)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY. ``check_custodian_marks`` above detects an IB portfolio mark that fell
+# outside the day's own traded range and halts the EOD pipeline on it. That is
+# a correct verdict with no remediation attached: the mark is the broker's, the
+# pipeline cannot make IB re-send it, and a rerun on the same snapshot re-raises
+# the identical breach. The postclose SF has therefore been failing on a
+# condition no operator action can clear — 2026-08-31 (DUOL, $1,975 past the
+# breached bound) is the live instance, and ``pnl_measurement_backfill``
+# reconstructs five more over the history.
+#
+# The repair the pipeline can make, and until now did not, is to stop carrying
+# the wrong number. ``eod_reconcile`` ALREADY prices every position off the
+# settled ArcticDB close — ``pos["market_value"]`` is overridden two lines after
+# the IB mark is captured. Only the headline NAV kept the broker's mark, because
+# NAV is read whole from IB ``NetLiquidation``. So the book values one name at
+# two different prices on the same day, and the gate fires on the difference.
+#
+# Correcting NAV by exactly the proven error puts the headline on the same
+# prices the positions already use. It is not a tolerance and not a suppression:
+# every flag still fires, every flag is still persisted, and a name whose error
+# cannot be PROVEN is not touched.
+#
+# THE DISCRIMINATOR. A settled close is a price the security actually traded at,
+# so it lies inside that day's own ``[Low, High]`` by construction. When it does
+# not, the reference data is what is wrong — not the broker mark — and moving
+# NAV towards it would import the error rather than remove it. That name is left
+# uncorrected and the gate raises on it, which is the correct outcome: an
+# ArcticDB row disagreeing with itself is a data-repo defect, not a broker one.
+#
+# THE BOUND. Modelled on ``plan_twr_self_heal``: a correction larger than the
+# bound is REFUSED and raises, because at that size the disagreement is not a
+# stale mark but a different book (a share-count error, a corporate action we
+# did not model, a wrong snapshot). Every instance measured to date sits far
+# below it — DUOL 2026-08-31 $2,860 (28bp), AMD 2026-08-04 $5,220 (50bp) — so
+# the bound refuses nothing that has ever legitimately occurred while still
+# refusing a book-scale disagreement.
+MARK_CORRECTION_MAX_NAV_BPS = 100.0
+MARK_CORRECTION_MAX_USD_FLOOR = 10_000.0
+
+
+def mark_correction_bound_usd(nav: float) -> float:
+    """Largest total NAV mark correction that may be applied automatically."""
+    return max(
+        MARK_CORRECTION_MAX_USD_FLOOR,
+        MARK_CORRECTION_MAX_NAV_BPS / 10_000.0 * nav,
+    )
+
+
+def plan_nav_mark_correction(
+    mark_range_flags: Sequence[Mapping[str, Any]] | None,
+    *,
+    settled_closes: Mapping[str, float] | None,
+    day_low: Mapping[str, float] | None,
+    day_high: Mapping[str, float] | None,
+    nav: float | None,
+    run_date: str = "",
+) -> dict[str, Any]:
+    """Plan the NAV repair for every PROVABLY-wrong broker mark.
+
+    Pure: computes and explains the correction, applies nothing. The caller
+    substitutes ``nav_corrected`` for the broker NAV when ``applied`` is True.
+
+    ``corrected_tickers`` is what ``check_custodian_marks`` consumes: a name in
+    it has had its error removed from NAV and no longer justifies halting the
+    pipeline. Every other flagged name still breaches.
+    """
+    out: dict[str, Any] = {
+        "applied": False,
+        "refused": False,
+        "run_date": run_date,
+        "nav_raw": nav,
+        "nav_corrected": nav,
+        "correction_usd": 0.0,
+        "bound_usd": None,
+        "corrections": [],
+        "corrected_tickers": [],
+        "unrepairable": [],
+        "message": "",
+    }
+    if not mark_range_flags or not nav or not math.isfinite(float(nav)):
+        return out
+    closes = settled_closes or {}
+    lows = day_low or {}
+    highs = day_high or {}
+    bound = mark_correction_bound_usd(float(nav))
+    out["bound_usd"] = bound
+
+    planned: list[dict[str, Any]] = []
+    total = 0.0
+    for flag in mark_range_flags:
+        ticker = flag.get("ticker")
+        try:
+            shares = float(flag.get("shares") or 0)
+            ib_mark = float(flag.get("ib_mark"))
+        except (TypeError, ValueError):
+            out["unrepairable"].append(
+                {"ticker": ticker, "why": "share count or broker mark unreadable"}
+            )
+            continue
+        close = closes.get(ticker)
+        lo, hi = lows.get(ticker), highs.get(ticker)
+        if not shares or close is None or lo is None or hi is None:
+            out["unrepairable"].append(
+                {"ticker": ticker,
+                 "why": "settled close or traded range unavailable for this name"}
+            )
+            continue
+        close = float(close)
+        if not math.isfinite(close) or not (float(lo) <= close <= float(hi)):
+            # The reference data disagrees with itself — see THE DISCRIMINATOR.
+            out["unrepairable"].append(
+                {"ticker": ticker,
+                 "why": (
+                     f"settled close ${close:,.2f} is itself outside the day's "
+                     f"traded range [${float(lo):,.2f}, ${float(hi):,.2f}] — the "
+                     "reference data is wrong, not the broker mark, so NAV is "
+                     "not moved towards it"
+                 )}
+            )
+            continue
+        delta = shares * (close - ib_mark)
+        total += delta
+        planned.append({
+            "ticker": ticker,
+            "shares": shares,
+            "ib_mark": ib_mark,
+            "settled_close": close,
+            "day_low": float(lo),
+            "day_high": float(hi),
+            "correction_usd": delta,
+        })
+
+    if not planned:
+        out["message"] = (
+            f"NAV mark correction NOT APPLIED for {run_date}: none of the "
+            f"{len(mark_range_flags)} out-of-range mark(s) could be proven "
+            "against a settled close inside the day's own traded range. Every "
+            "flagged name still breaches."
+        )
+        return out
+
+    if abs(total) > bound:
+        out["refused"] = True
+        out["correction_usd"] = total
+        out["corrections"] = planned
+        out["message"] = (
+            f"NAV mark correction REFUSED for {run_date}: the total correction "
+            f"${total:+,.0f} ({total / float(nav) * 100:+.3f}% of NAV) exceeds the "
+            f"${bound:,.0f} bound ({MARK_CORRECTION_MAX_NAV_BPS:.0f}bps of NAV). A "
+            "disagreement this large is not a stale mark — it is a different book "
+            "(a share count, an unmodelled corporate action, a wrong snapshot). "
+            "NAV is left as the broker reported it and the custodian gate raises."
+        )
+        return out
+
+    out["applied"] = True
+    out["correction_usd"] = total
+    out["corrections"] = planned
+    out["corrected_tickers"] = [p["ticker"] for p in planned]
+    out["nav_corrected"] = float(nav) + total
+    names = ", ".join(
+        f"{p['ticker']} ${p['ib_mark']:,.2f}->${p['settled_close']:,.2f} "
+        f"(${p['correction_usd']:+,.0f})"
+        for p in planned
+    )
+    out["message"] = (
+        f"NAV mark correction APPLIED for {run_date}: ${total:+,.0f} "
+        f"({total / float(nav) * 100:+.3f}% of NAV) — broker NAV ${float(nav):,.2f} "
+        f"-> ${out['nav_corrected']:,.2f}. {len(planned)} broker mark(s) fell "
+        f"outside the day's traded range and were repriced to the settled close "
+        f"the positions were already valued at: {names}. The raw broker NAV, the "
+        "per-name correction and the original flags are all persisted."
+    )
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

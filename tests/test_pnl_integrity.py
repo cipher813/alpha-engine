@@ -568,3 +568,160 @@ class TestSessionAxisCoverage:
         )
         assert out["closes"] is False
         assert all(b["kind"] == "calendar_lookup_failed" for b in out["breaches"])
+
+# NAV mark correction (alpha-engine-config-I9627)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from executor.pnl_integrity import (  # noqa: E402
+    mark_correction_bound_usd,
+    plan_nav_mark_correction,
+)
+
+# The live failure this exists for: eod-2026-08-31-1788206436 halted the
+# postclose SF on DUOL. The settled close was independently confirmed against
+# two vendors (Finnhub, Alpha Vantage) at $148.36 on a [$144.51, $149.61]
+# range, so IB's $152.40 was the wrong number, not ArcticDB's.
+_DUOL_FLAG = {
+    "ticker": "DUOL",
+    "ib_mark": 152.40,
+    "day_low": 144.51,
+    "day_high": 149.61,
+    "shares": 708,
+    "mark_error_usd": 708 * (152.40 - 149.61),
+}
+_DUOL_NAV = 1_020_009.79
+_DUOL_CLOSES = {"DUOL": 148.36}
+_DUOL_LOW = {"DUOL": 144.51}
+_DUOL_HIGH = {"DUOL": 149.61}
+
+
+def _plan_duol(**over):
+    kwargs = {
+        "settled_closes": _DUOL_CLOSES,
+        "day_low": _DUOL_LOW,
+        "day_high": _DUOL_HIGH,
+        "nav": _DUOL_NAV,
+        "run_date": "2026-08-31",
+    }
+    kwargs.update(over)
+    return plan_nav_mark_correction([_DUOL_FLAG], **kwargs)
+
+
+def test_live_2026_08_31_duol_mark_is_repaired_off_the_settled_close():
+    plan = _plan_duol()
+    assert plan["applied"] is True
+    assert plan["refused"] is False
+    # 708 x (148.36 - 152.40)
+    assert plan["correction_usd"] == pytest.approx(-2860.32, abs=0.01)
+    assert plan["nav_corrected"] == pytest.approx(_DUOL_NAV - 2860.32, abs=0.01)
+    assert plan["corrected_tickers"] == ["DUOL"]
+    assert plan["nav_raw"] == _DUOL_NAV
+    assert "DUOL" in plan["message"] and "148.36" in plan["message"]
+
+
+def test_a_repaired_mark_no_longer_halts_the_pipeline():
+    plan = _plan_duol()
+    assert check_custodian_marks(
+        [_DUOL_FLAG], nav=plan["nav_corrected"], run_date="2026-08-31",
+        corrected_tickers=plan["corrected_tickers"],
+    ) == []
+
+
+def test_an_unrepaired_mark_still_halts_the_pipeline():
+    # Same flag, nothing corrected — the gate is unchanged for every name the
+    # repair could not prove.
+    breaches = check_custodian_marks(
+        [_DUOL_FLAG], nav=_DUOL_NAV, run_date="2026-08-31", corrected_tickers=[],
+    )
+    assert len(breaches) == 1
+    assert breaches[0]["ticker"] == "DUOL"
+
+
+def test_custodian_gate_default_is_unchanged_when_no_correction_is_passed():
+    assert len(check_custodian_marks([_DUOL_FLAG], nav=_DUOL_NAV)) == 1
+
+
+def test_a_settled_close_outside_its_own_range_is_the_reference_data_being_wrong():
+    # THE DISCRIMINATOR: a close is a traded price, so it cannot sit outside
+    # the day's own [Low, High]. When it does, ArcticDB is what is wrong and
+    # NAV must NOT be moved towards it.
+    plan = _plan_duol(settled_closes={"DUOL": 160.00})
+    assert plan["applied"] is False
+    assert plan["corrected_tickers"] == []
+    assert plan["unrepairable"][0]["ticker"] == "DUOL"
+    assert "reference data is wrong" in plan["unrepairable"][0]["why"]
+    # ... and the gate therefore still halts the run.
+    assert len(check_custodian_marks(
+        [_DUOL_FLAG], nav=_DUOL_NAV, corrected_tickers=plan["corrected_tickers"],
+    )) == 1
+
+
+def test_a_missing_settled_close_leaves_the_name_uncorrected():
+    plan = _plan_duol(settled_closes={})
+    assert plan["applied"] is False
+    assert plan["corrected_tickers"] == []
+    assert "unavailable" in plan["unrepairable"][0]["why"]
+
+
+def test_a_book_scale_disagreement_is_refused_not_applied():
+    nav = 1_000_000.0
+    bound = mark_correction_bound_usd(nav)
+    assert bound == 10_000.0  # 100bp of NAV, at this NAV equal to the floor
+    flag = {
+        "ticker": "AAA", "ib_mark": 100.0, "day_low": 60.0, "day_high": 70.0,
+        "shares": 1000, "mark_error_usd": 30_000.0,
+    }
+    plan = plan_nav_mark_correction(
+        [flag], settled_closes={"AAA": 65.0}, day_low={"AAA": 60.0},
+        day_high={"AAA": 70.0}, nav=nav, run_date="2026-01-02",
+    )
+    assert plan["refused"] is True
+    assert plan["applied"] is False
+    assert plan["corrected_tickers"] == []
+    assert plan["nav_corrected"] == nav  # NAV is left exactly as the broker sent it
+    assert "different book" in plan["message"]
+    # The gate still fires, which is the whole point of refusing.
+    assert len(check_custodian_marks(
+        [flag], nav=nav, corrected_tickers=plan["corrected_tickers"],
+    )) == 1
+
+
+def test_every_observed_historical_instance_sits_inside_the_bound():
+    # AMD 2026-08-04 is the largest mark error in the measured window.
+    nav = 1_030_000.0
+    assert abs(-5_220.0) < mark_correction_bound_usd(nav)
+    assert abs(-2_999.0) < mark_correction_bound_usd(nav)   # COIN 2026-07-30
+    assert abs(-2_532.0) < mark_correction_bound_usd(nav)   # LNTH 2026-06-26
+    assert abs(-2_860.32) < mark_correction_bound_usd(nav)  # DUOL 2026-08-31
+
+
+def test_no_flags_is_a_no_op():
+    plan = plan_nav_mark_correction([], settled_closes={}, day_low={},
+                                    day_high={}, nav=1_000_000.0)
+    assert plan["applied"] is False and plan["refused"] is False
+    assert plan["nav_corrected"] == 1_000_000.0
+    assert plan["corrections"] == []
+
+
+def test_partial_repair_corrects_one_name_and_holds_the_gate_on_the_other():
+    ok = {"ticker": "AAA", "ib_mark": 100.0, "day_low": 90.0, "day_high": 95.0,
+          "shares": 100, "mark_error_usd": 500.0}
+    # Above the 15bp-of-NAV materiality floor, so the gate has something to
+    # hold: at NAV $1M that floor is $1,500.
+    bad = {"ticker": "BBB", "ib_mark": 200.0, "day_low": 180.0, "day_high": 190.0,
+           "shares": 100, "mark_error_usd": 2_000.0}
+    plan = plan_nav_mark_correction(
+        [ok, bad],
+        settled_closes={"AAA": 92.0, "BBB": 250.0},  # BBB's close is out of range
+        day_low={"AAA": 90.0, "BBB": 180.0},
+        day_high={"AAA": 95.0, "BBB": 190.0},
+        nav=1_000_000.0, run_date="2026-01-02",
+    )
+    assert plan["applied"] is True
+    assert plan["corrected_tickers"] == ["AAA"]
+    assert [u["ticker"] for u in plan["unrepairable"]] == ["BBB"]
+    breaches = check_custodian_marks(
+        [ok, bad], nav=plan["nav_corrected"],
+        corrected_tickers=plan["corrected_tickers"],
+    )
+    assert [b["ticker"] for b in breaches] == ["BBB"]
