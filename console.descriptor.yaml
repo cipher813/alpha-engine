@@ -1,0 +1,296 @@
+# Console component descriptor — console-policy.md §2.6.
+#
+# WHAT THIS EXISTS FOR (alpha-engine-config-I9497). Before this file the
+# console measured whether Crucible RUNS, never what it PRODUCES: the only
+# `crucible-executor` rows in the fleet registry were `crucible-executor-
+# gitleaks` (a CI scan) and `ae-executor-start` / `ae-executor-stop` (the two
+# EventBridge rules that boot and halt the box). Not one row bound a fill, a
+# NAV, or a P&L number, so `architecture.d/001-objective.md`'s objective —
+# "maximize long-term alpha vs SPY, risk-adjusted" — had no console entity on
+# the EXECUTOR side at all.
+#
+# ── Identity: a PRODUCER identity, not a second schedulable substrate ───────
+#
+# `parent_component` is this registry's mechanism for a component no
+# discoverer can see directly (precedent: `crucible-backtester-attestation`,
+# `ae-preflight-stage-Backtester`). The live book is not its own enumerable
+# object — it is what the daemon on the always-on trading box does between
+# `ae-executor-start` and `ae-executor-stop`. Without `parent_component` this
+# row would be reported ABSENT by a discoverer that can only ever see the
+# EventBridge rule, manufacturing a finding out of a blind spot.
+#
+# ── Why this row cannot render a false transparency gap ────────────────────
+#
+# A registry row with `lifecycle: in-service` and no observation renders
+# UNREPORTED (`console/adapters/yaml_directory.py::_state_from_row`), which is
+# §9.2's transparency-gap count itself. The `document-fields` binding below is
+# what stops that: that driver emits a COMPONENT entity under this row's own
+# `component_id` as an OBSERVATION claim, and observation outranks a
+# declaration-without-lifecycle for `state` (`console/index/merge.py::
+# _state_rank`, 1 vs 3). So this row renders from the live book, and falls
+# back to UNREPORTED only if the executor genuinely stops writing
+# `intraday/nav.json` — which is the finding, not a defect in the row.
+#
+# ── Why the binding cadence is 1440 and the row cadence is a SYMBOL ────────
+#
+# §9.6 (`staleness_honesty`) audits a row's DECLARED cadence against the
+# `as_of` an observation supplied, and counts a violation only when the
+# rendered state has NOT already disclosed its own age. `weekday_sf`
+# translates to `minutes_since(most recent trading day) + 1440`, so its
+# smallest possible value is 1440 (`console/calendar_cadence.py`). Setting
+# the binding cadence to that floor guarantees the DRIVER flips to `MISSED`
+# — a disclosed state — strictly before §9.6 could ever count this row, since
+# §9.6's own threshold adds the observing source's poll cadence on top of the
+# same product. A weekday producer idle on Sunday stays HEALTHY, which is
+# what the calendar symbol exists for.
+
+component_id: crucible-executor-book
+owning_repo: crucible-executor
+substrate: ec2-always-on
+origin: "crucible-executor executor/ — the live trading book on the always-on trading box; writes s3://alpha-engine-research/intraday/nav.json, trades/eod_pnl.csv and trades/shadow_book.csv"
+parent_component: ae-executor-start
+parent_component_reason: >-
+  The book runs on the always-on trading box between the `ae-executor-start`
+  and `ae-executor-stop` EventBridge rules. No discoverer enumerates a
+  standalone "executor book" component — `ec2-always-on` is populated by no
+  discoverer at all — so this is a producer identity for the S3 keys the
+  bindings below read, not a schedulable substrate of its own. Same shape as
+  `crucible-backtester-attestation` and `ae-preflight-stage-Backtester`.
+owner: brian
+lifecycle: in-service
+cadence: weekday_sf
+cadence_source: >-
+  `intraday/nav.json` and `trades/eod_pnl.csv` are written once per NYSE
+  trading day by the executor daemon on the trading box, whose window is
+  opened and closed by the `ae-executor-start` / `ae-executor-stop`
+  EventBridge rules (`governance/observability.d/ae-executor-{start,stop}.yaml`).
+  Declared as the calendar SYMBOL rather than a literal minute count because a
+  literal cadence on a trading-day producer renders a correctly-idle weekend
+  as a miss (alpha-engine-config-I7060/I7847).
+
+authority_tier: act-unattended
+authority_tier_reason: >-
+  The executor places live orders with no human present during the market
+  session. `console_surface` below is declared and non-`unknown` precisely
+  because `principles.md` §3.6 grants authority and visibility together or
+  not at all (`observability_audit.py::check_authority_without_surface`).
+
+signals:
+  execution:
+    status: emitted
+    reason: >-
+      The daemon writes `s3://alpha-engine-research/intraday/heartbeat.json`
+      and `intraday/nav.json` on a live tick, and a per-session row into
+      `trades/eod_pnl.csv` at the close. Probed 2026-08-31: `nav.json`
+      LastModified 2026-08-31, `eod_pnl.csv` LastModified 2026-08-28 (the
+      most recent NYSE session).
+  cost:
+    status: n/a
+    reason: >-
+      The executor makes ZERO LLM calls by standing rule — LLM exposure is
+      confined to the research module — and provisions no compute beyond the
+      always-on box it already runs on, whose cost is attributed to the
+      instance rather than to a run.
+  resource:
+    status: unknown
+    reason: >-
+      Not audited — neither `nav.json` nor the `eod_pnl.csv` row carries a
+      memory/CPU record of the daemon's own execution.
+  data:
+    status: emitted
+    reason: >-
+      `trades/eod_pnl.csv` carries one row per NYSE session with the full
+      attribution decomposition (nav_change_usd, position_pnl_usd,
+      interest_usd, dividend_usd, unattributed_true_usd, pricing_timing_usd,
+      rotation_realized_usd). Measured 2026-08-31: 120 sessions,
+      2026-03-09 → 2026-08-28.
+  outcome:
+    status: emitted
+    reason: >-
+      `daily_alpha_pct` / `spy_return_pct` / `portfolio_nav` in
+      `trades/eod_pnl.csv` are the objective's own numbers, and
+      `intraday/nav.json::net_liquidation` is the standing NAV. The
+      `document-fields` binding below renders the standing book; the
+      `object-store` binding renders the session series' freshness. Audited
+      2026-08-31 (alpha-engine-config-I9497).
+
+log_location: s3://alpha-engine-research/intraday/nav.json
+log_location_reason: >-
+  Declared per §6.2 from the fixed pointer this row's `metrics` binding
+  actually reads and which was probed live 2026-08-31 — not from a naming
+  convention. The daemon's own journald stream is one box and is not
+  fleet-readable (the `router-spend-export` failure, ops-PR904), so the
+  durable S3 pointer is the location this row monitors.
+alert_channel: unknown
+alert_channel_reason: >-
+  Unaudited at registration — whether anything pages on a NAV drawdown or a
+  missing session row was not verified, and asserting a channel that does not
+  fire is worse than recording the gap.
+severity_source: unknown
+severity_source_reason: >-
+  Unaudited at registration. The numeric fields below ship with
+  `baseline: null` declared explicitly (§5.4 — no colour without a baseline);
+  alpha-engine-config-I9005 owns the viability bars and is reserved for
+  Brian's ruling, so no threshold is invented here.
+console_surface: descriptor:metrics/document-fields,artifacts/object-store
+console_surface_reason: >-
+  Declared alpha-engine-config-I9497. This descriptor is the WHOLE onboarding
+  act (console-policy.md §2.6): the console's gatherer reads it directly from
+  this repo via `observability-registry-publish.yml`. No console-repo edit,
+  no console config entry, and NO `governance/observability.d/` row — adding
+  one for a component a repo descriptor already declares is the duplicate
+  that broke the fleet registry publish for nine minutes on 2026-08-28
+  (alpha-engine-config-I9002).
+retention: unknown
+retention_reason: >-
+  Not audited. `intraday/nav.json` is last-write-wins (current value only);
+  `trades/eod_pnl.csv` is append-only and unbounded, but no retention policy
+  was verified at registration.
+
+# ── Metrics: the standing book, read by FIELD NAME ─────────────────────────
+#
+# A metric is read from a structured record addressed by field name, never a
+# pattern matched against prose (console-policy.md §2.6). Two documents, one
+# binding: `intraday/nav.json` (what the book IS right now) and
+# `executor/derisk_gate/latest.json` (whether the book is being sized down,
+# which changes how every other number should be read). Both are FIXED keys
+# that always exist — a date-templated key would render ABSENT every day that
+# is not today, which is a detector that cries wolf rather than one that
+# measures (the `crucible-evaluator` descriptor's own reasoning).
+#
+# `baseline: null` is declared EXPLICITLY on every numeric field rather than
+# omitted: §5.4 says green means better than the baseline and where there is
+# no baseline there is no colour, and the explicit null is the difference
+# between "deliberately uncoloured" and "somebody forgot".
+metrics:
+  - driver: document-fields
+    documents:
+      # The book-gate pointers FIRST, and deliberately: `main.py` writes both
+      # `latest.json` pointers once per run_date on the pre-open path, so they
+      # are the executor's own DAILY, non-best-effort statements about itself.
+      # `intraday/nav.json` is richer but is written fire-and-forget on a poll
+      # tick during market hours only (`executor/intraday_snapshot.py`'s own
+      # docstring: "S3 writes are fire-and-forget — failures are logged at
+      # WARNING and never raise"), so it must not be the only thing standing
+      # between this row and UNREPORTED. `document-fields` takes the MAX of
+      # every document's stamp as the binding's `as_of`, so the freshest of
+      # the three answers for the component and each key's individual
+      # freshness is rendered separately by the `artifacts` bindings below.
+      - key: "s3://alpha-engine-research/executor/hold_book_flags/latest.json"
+        fields:
+          book_held:
+            path: held
+            render: text
+          book_held_reason:
+            path: reason
+            render: text
+          book_held_failed_check:
+            path: failed_check
+            render: text
+          book_run_date:
+            path: run_date
+            render: text
+          book_predictions_date:
+            path: predictions_date
+            render: text
+      - key: "s3://alpha-engine-research/executor/derisk_gate/latest.json"
+        fields:
+          derisk_gate_enabled:
+            path: enabled
+            render: text
+          derisk_gate_active:
+            path: active
+            render: text
+          derisk_sizing_multiplier:
+            path: sizing_multiplier
+            unit: ratio
+            baseline: null
+          derisk_reason:
+            path: reason
+            render: text
+      - key: "s3://alpha-engine-research/intraday/nav.json"
+        fields:
+          portfolio_nav_usd:
+            path: net_liquidation
+            unit: usd
+            baseline: null
+          total_cash_usd:
+            path: total_cash
+            unit: usd
+            baseline: null
+          gross_position_value_usd:
+            path: gross_position_value
+            unit: usd
+            baseline: null
+          unrealized_pnl_usd:
+            path: unrealized_pnl
+            unit: usd
+            baseline: null
+          spy_last_usd:
+            path: spy_last
+            unit: usd
+            baseline: null
+          broker_connected:
+            path: ib_connected
+            render: text
+          book_as_of:
+            path: timestamp
+            render: text
+    # The floor of `weekday_sf`'s own translation — see the header. Declared
+    # because without a cadence staleness is not computable and the console
+    # says so rather than assuming fresh (§5.2).
+    cadence_minutes: 1440
+
+# ── Artifacts: the session series ──────────────────────────────────────────
+#
+# `object-store` is a HEAD, not a body read: it renders freshness with the
+# four-field row contract (state · source · as-of · evidence link) and makes
+# the P&L series reachable by structure and by relation (§3.1) without
+# pulling a 365 KB CSV into every ~180 s index build.
+#
+# WHAT IS DELIBERATELY NOT BOUND HERE, and why it is a follow-up rather than
+# an omission: the per-session fan-out of `eod_pnl.csv` into one entity per
+# trading day. `s3-records` reads `format: csv` and would do it, but it has
+# no `limit`/`tail` selector — it mints one entity per record, unbounded and
+# growing ~250/year, and a per-trading-day `id_template` risks colliding with
+# the `pipeline-reliability` adapter's own Cycle ids, where a `kind`
+# disagreement RAISES rather than merges. And the trailing-window aggregates
+# (`alpha_vs_spy_30d`, `realized_ic_30d`, `unattributed_residual_pct`) exist
+# in no artifact at all: computing them needs a producer to write them, which
+# alpha-engine-config-I9041 makes out of scope until the clause-1 clock has
+# run. Both are filed rather than hacked around.
+#
+# `cadence_minutes: 5760` (4 days) is the longest silence a healthy
+# trading-day producer can show — a three-day holiday weekend plus the write
+# window. A literal 1440 here would render `stale` every Saturday and Sunday,
+# manufacturing a weekend miss out of a correctly-idle producer.
+artifacts:
+  - driver: object-store
+    key: "s3://alpha-engine-research/trades/eod_pnl.csv"
+    cadence_minutes: 5760
+  - driver: object-store
+    key: "s3://alpha-engine-research/trades/shadow_book.csv"
+    cadence_minutes: 5760
+  - driver: object-store
+    key: "s3://alpha-engine-research/trades/trades_latest.db"
+    cadence_minutes: 5760
+
+# ── Lineage (§6) ───────────────────────────────────────────────────────────
+#
+# `consumes` is the direction that matters: the forward edge is a property of
+# the producer and is written down somewhere already, while "who breaks if
+# this is stale" exists nowhere unless somebody states it.
+consumes:
+  # The two upstream artifacts `executor/upstream_artifact_gate.py` names by
+  # `s3_key_template`, verbatim — not inferred from a key pattern.
+  - "s3://alpha-engine-research/signals/{trading_day}/signals.json"
+  - "s3://alpha-engine-research/predictor/predictions/{trading_day}.json"
+produces:
+  - "s3://alpha-engine-research/intraday/nav.json"
+  - "s3://alpha-engine-research/intraday/heartbeat.json"
+  - "s3://alpha-engine-research/intraday/latest_prices.json"
+  - "s3://alpha-engine-research/executor/derisk_gate/latest.json"
+  - "s3://alpha-engine-research/executor/hold_book_flags/latest.json"
+  - "s3://alpha-engine-research/trades/eod_pnl.csv"
+  - "s3://alpha-engine-research/trades/shadow_book.csv"
+  - "s3://alpha-engine-research/trades/trades_latest.db"
