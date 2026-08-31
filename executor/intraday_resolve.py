@@ -216,12 +216,22 @@ def solve_redeploy(
     covariance = np.asarray(shadow_log["covariance_daily"], dtype=float)
     cfg = dict(shadow_log.get("optimizer_cfg") or {})
 
-    au = shadow_log.get("alpha_uncertainty")
-    alpha_uncertainty = None
-    if au is not None:
-        alpha_uncertainty = np.asarray(
-            [np.nan if x is None else float(x) for x in au], dtype=float,
+    def _vec(key):
+        raw = shadow_log.get(key)
+        if raw is None:
+            return None
+        return np.asarray(
+            [np.nan if x is None else float(x) for x in raw], dtype=float,
         )
+
+    # TOTAL -> the conviction gate. EPISTEMIC -> the GUW Omega. Reading both
+    # off the morning artifact is what makes the re-solve mechanism-identical
+    # to the morning solve (alpha-engine-config-I9452); an artifact written
+    # before the decomposition shipped simply carries no epistemic key, and
+    # the solve then reports the penalty inoperative for the same reason the
+    # morning run did.
+    alpha_uncertainty = _vec("alpha_uncertainty")
+    alpha_uncertainty_epistemic = _vec("alpha_uncertainty_epistemic")
 
     # Exclude same-day stopped-out names: the morning alpha is still positive
     # for a name a gap stop just exited, so without this the re-solve would
@@ -244,6 +254,7 @@ def solve_redeploy(
         cash_idx=cash_idx,
         cfg=cfg,
         alpha_uncertainty=alpha_uncertainty,
+        alpha_uncertainty_epistemic=alpha_uncertainty_epistemic,
         covariance=covariance,
     )
     status = result.diagnostics.get("status")

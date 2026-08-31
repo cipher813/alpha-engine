@@ -276,11 +276,24 @@ def _build_and_solve(
         cash_idx=cash_idx,
     )
     alpha_hat = _build_alpha_hat(tickers, predictions_by_ticker, spy_idx, cash_idx)
+    # TOTAL — the conviction gate's input; its band was derived at this scale.
     alpha_uncertainty = _build_alpha_uncertainty(
         tickers,
         predictions_by_ticker,
         spy_idx,
         cash_idx,
+    )
+    # EPISTEMIC — sqrt(x'Sigma_w x), the ONLY vector the GUW Omega is built
+    # from (alpha-engine-config-I9452). All-NaN on artifacts written before
+    # crucible-predictor PR596 deployed (2026-08-31); the solve then declares
+    # the penalty inoperative with a reason rather than falling back to the
+    # total, which is a uniform ridge that double-counts Sigma.
+    alpha_uncertainty_epistemic = _build_alpha_uncertainty(
+        tickers,
+        predictions_by_ticker,
+        spy_idx,
+        cash_idx,
+        field="predicted_alpha_std_epistemic",
     )
     returns_panel = _build_returns_panel(tickers, price_histories, cash_idx)
     # Σ_daily (pre-horizon) is persisted below for the daemon's intraday
@@ -336,6 +349,7 @@ def _build_and_solve(
         cash_idx=cash_idx,
         cfg=optimizer_cfg,
         alpha_uncertainty=alpha_uncertainty,
+        alpha_uncertainty_epistemic=alpha_uncertainty_epistemic,
         adv_usd=adv_usd,
         portfolio_notional=float(portfolio_nav) if portfolio_nav and portfolio_nav > 0 else None,
         name_sigma=name_sigma,
@@ -483,6 +497,7 @@ def _build_and_solve(
         tickers=tickers,
         alpha_hat=alpha_hat,
         alpha_uncertainty=alpha_uncertainty,
+        alpha_uncertainty_epistemic=alpha_uncertainty_epistemic,
         returns_panel=returns_panel,
         w_prev=w_prev,
         sectors=sectors,
@@ -510,6 +525,13 @@ def _build_and_solve(
         # which is a finding, not a pass.
         "alpha_anchor": alpha_anchor,
         "alpha_uncertainty": _alpha_uncertainty_to_json(alpha_uncertainty),
+        # I9452 — persisted so the daemon's intraday re-solve builds the SAME
+        # Omega the morning solve did. Without it the re-solve would silently
+        # run the penalty inoperative on a day the morning run had it armed,
+        # and the two would size the same book differently.
+        "alpha_uncertainty_epistemic": _alpha_uncertainty_to_json(
+            alpha_uncertainty_epistemic
+        ),
         "eligibility": [bool(x) for x in eligibility],
         "eligibility_reasons": list(eligibility_reasons),
         # Names deleted BEFORE the solve, with a typed reason each. Distinct
@@ -556,6 +578,7 @@ def _maybe_run_ablation(
     tickers: list[str],
     alpha_hat: np.ndarray,
     alpha_uncertainty: np.ndarray,
+    alpha_uncertainty_epistemic: np.ndarray | None,
     returns_panel: np.ndarray,
     w_prev: np.ndarray,
     sectors: list[str],
@@ -575,7 +598,16 @@ def _maybe_run_ablation(
     gamma = float(optimizer_cfg.get("alpha_uncertainty_penalty", 0.0))
     if gamma <= 0.0:
         return None
-    has_any_signal = bool(np.any(np.isfinite(alpha_uncertainty) & (alpha_uncertainty > 0.0)))
+    # The ablation contrasts the CANONICAL solve against gamma=0, so it must
+    # test the vector the canonical solve's Omega is built from — the
+    # epistemic one. Testing the total here would run a second solve on days
+    # the penalty was inoperative and report a difference of exactly zero as
+    # if it were a measurement.
+    if alpha_uncertainty_epistemic is None:
+        return None
+    has_any_signal = bool(
+        np.any(np.isfinite(alpha_uncertainty_epistemic) & (alpha_uncertainty_epistemic > 0.0))
+    )
     if not has_any_signal:
         return None
 
@@ -592,7 +624,8 @@ def _maybe_run_ablation(
             spy_idx=spy_idx,
             cash_idx=cash_idx,
             cfg=no_penalty_cfg,
-            alpha_uncertainty=alpha_uncertainty,  # passed but γ=0 → unused
+            alpha_uncertainty=alpha_uncertainty,
+            alpha_uncertainty_epistemic=alpha_uncertainty_epistemic,  # γ=0 → unused
         )
     except Exception as exc:
         logger.warning(
@@ -615,7 +648,14 @@ def _maybe_run_ablation(
                     "with_penalty": float(active[i]),
                     "no_penalty": float(no_penalty_weights[i]),
                     "delta": float(deltas[i]),
-                    "sigma_alpha": (float(alpha_uncertainty[i]) if np.isfinite(alpha_uncertainty[i]) else None),
+                    "sigma_alpha": (
+                        float(alpha_uncertainty[i])
+                        if np.isfinite(alpha_uncertainty[i]) else None
+                    ),
+                    "sigma_alpha_epistemic": (
+                        float(alpha_uncertainty_epistemic[i])
+                        if np.isfinite(alpha_uncertainty_epistemic[i]) else None
+                    ),
                 }
             )
     return {
@@ -838,21 +878,35 @@ def _build_alpha_uncertainty(
     predictions_by_ticker: dict[str, dict],
     spy_idx: int,
     cash_idx: int,
+    field: str = "predicted_alpha_std",
 ) -> np.ndarray:
-    """Read per-ticker σ_α̂ from the predictor's BayesianRidge posterior
-    (predicted_alpha_std field shipped in B.1, predictor PR #199).
+    """Read a per-ticker uncertainty field off the predictions artifact.
+
+    ``field`` selects the vintage, and the two are NOT interchangeable
+    (alpha-engine-config-I9446 / I9452):
+
+    ``predicted_alpha_std``           the TOTAL predictive std,
+                                      sqrt(1/α̂ + xᵀΣ_w x). Cross-sectionally
+                                      flat by construction (the 1/α̂ term is one
+                                      number for the whole batch). This is the
+                                      CONVICTION GATE's input — its IR band was
+                                      derived against this scale (PR518).
+    ``predicted_alpha_std_epistemic`` sqrt(xᵀΣ_w x), the estimation-error std.
+                                      The ONLY vector the Garlappi-Uppal-Wang Ω
+                                      may be built from. Absent (None) on every
+                                      artifact written before 2026-08-31 and on
+                                      any champion with no learned noise
+                                      precision.
 
     Returns a length-N array with:
       • 0.0 for SPY and CASH (sentinels — no uncertainty)
-      • finite σ_α̂ ≥ 0 when the predictor emitted a usable value
-      • NaN when the predictor's predicted_alpha_std was missing, None,
-        or non-numeric (legacy Ridge fallback case during the 1-week
-        soak between B.1 landing and the first BayesianRidge model
-        promoted by the Saturday training cycle)
+      • finite σ ≥ 0 when the predictor emitted a usable value
+      • NaN when the field was missing, None, or non-numeric
 
-    The downstream B.3 solve_target_weights treats NaN entries as
-    zero-penalty for that name — partial-rollout is tolerated by design.
-    Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.4.
+    ``solve_target_weights`` treats NaN as zero-penalty for that name, and
+    declares the whole term inoperative — with a reason on the artifact — when
+    the epistemic vector is absent or cross-sectionally flat. It never
+    substitutes one vintage for the other.
     """
     sigma = np.full(len(tickers), np.nan)
     for i, t in enumerate(tickers):
@@ -860,7 +914,7 @@ def _build_alpha_uncertainty(
             sigma[i] = 0.0
             continue
         pred = predictions_by_ticker.get(t, {})
-        raw_std = pred.get("predicted_alpha_std")  # B.1 field; may be missing/None
+        raw_std = pred.get(field)  # may be missing/None
         if raw_std is None:
             continue
         try:
@@ -869,7 +923,7 @@ def _build_alpha_uncertainty(
             continue
         if math.isfinite(v) and v >= 0.0:
             sigma[i] = v
-        # else leave NaN — partial-rollout case; B.3 handles by skipping penalty
+        # else leave NaN — partial-rollout case, handled downstream
     return sigma
 
 

@@ -464,13 +464,48 @@ portfolio_optimizer:
   # RiskMetrics canonical (~11d half-life); 0.97 ↔ ~23d half-life (closer to
   # canonical 21d α̂ horizon). Must be in [0.5, 1.0].
   ewma_lambda_decay: 0.94
-  # γ for the Garlappi-Uppal-Wang 2007 α̂-uncertainty penalty term
-  # γ · sum_i(σ_α̂_i² · w_i²). σ_α̂ comes from the predictor's BayesianRidge
-  # posterior (predicted_alpha_std field in predictions JSON, B.1).
-  # 0.0 (default) disables the term and preserves bit-identical legacy MVO.
-  # Backtester-tunable via param sweep; cutover gated by B.5. See
-  # optimizer-sota-upgrades-260526.md §B.3.
+  # ── Garlappi-Uppal-Wang alpha-uncertainty penalty (alpha-engine-config-I9452)
+  # gamma * sum_i(sigma_eps_i^2 * w_i^2), where sigma_eps is the predictor's
+  # `predicted_alpha_std_epistemic` = sqrt(x' Sigma_w x) — the ESTIMATION-error
+  # std of alpha_hat, which is what GUW's Omega is defined over.
+  #
+  # It is NOT built from `predicted_alpha_std`. That field is the BayesianRidge
+  # PREDICTIVE std, 1/alpha_hat + x' Sigma_w x, whose first term is a scalar
+  # learned once at fit time. Feeding it to Omega double-counts observation risk
+  # that Sigma already carries AND adds a per-batch constant that annihilates
+  # the cross-section the penalty exists to exploit. Measured over the 62 stored
+  # predictions artifacts from the 2026-06-01 BayesianRidge cutover to
+  # 2026-08-31 that constant carried 90-98% of the predictive variance and the
+  # total's cross-name CV never exceeded 0.008.
+  #
+  # gamma is DERIVED, not inherited. It was swept over 13 values from 0 to 1e4
+  # against a replay of the 60 stored optimizer_shadow solves (2026-06-01 ..
+  # 2026-08-31), with the epistemic vector reconstructed per session from the
+  # serving champion's learned noise precision, graded on realised 21-day
+  # market-relative return of the solved book (the system's canonical target)
+  # net of a 10bps/side cost, with the conviction gate both on and off. The
+  # measured optimum on that objective is gamma = 0. Every positive gamma was
+  # neutral at the low end and significantly negative above ~300; the 5-day
+  # diagnostic horizon showed a weak, not-significant optimum near 100. The
+  # mechanism is why: on a long-only, sum-to-one, cap-constrained book a ridge
+  # on w_i^2 shrinks toward the SPY fill rather than reallocating along the
+  # sigma_eps cross-section, so it buys robustness the caps already impose and
+  # pays alpha for it. Full sweep table: alpha-engine-config-I9452.
+  #
+  # So the term ships ARMED-CAPABLE and OFF: the Omega is now correct and the
+  # knob is honest about when it is inoperative, but nothing sizes on it until
+  # a measurement says it should. Re-run the sweep
+  # (scripts/derive_alpha_uncertainty_penalty.py) when the champion family
+  # changes or when the long-only/cap structure of the book changes.
   alpha_uncertainty_penalty: 0.0
+  # Cross-sectional CV floor below which Omega is declared INOPERATIVE and
+  # reported as such on the solve artifact, rather than applied as a uniform
+  # ridge that discriminates between nothing. Mirrors the producer's
+  # crucible-predictor/monitoring/drift_detector.py::ALPHA_UNCERTAINTY_MIN_CV
+  # so consumer and producer call the same channel dead on the same sessions.
+  # A magnitude test cannot replace it: a champion whose posterior never left
+  # its prior emits a LARGE and flat epistemic vector.
+  alpha_uncertainty_min_cv: 0.01
   # ── Turnover governor (gradual-rebalance guardrail) ───────────────────
   # SAFETY guardrail, NOT backtester-tuned. The book WALKS to the optimizer's
   # target over several days rather than jumping in one session: when a

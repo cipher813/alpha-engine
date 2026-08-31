@@ -46,14 +46,34 @@ Under i.i.d. log-return assumption, Σ_H = H · Σ_daily — see
 `alpha-engine-docs/private/optimizer-sota-upgrades-260526.md` §A.1 for the
 rationale (align Σ horizon with the canonical 21d log-domain α̂).
 
-α̂-uncertainty term (workstream B.3): Ω = diag(σ_α̂²) penalizes positions
-in proportion to per-name predictor variance — Garlappi-Uppal-Wang 2007
-diagonal-Ω form. γ = cfg["alpha_uncertainty_penalty"] (default 0.0 = OFF,
-preserves bit-identical legacy MVO). σ_α̂ comes from the predictor's
-BayesianRidge posterior (`predicted_alpha_std` in predictions JSON, shipped
-in alpha-engine-predictor B.1 #199). When `alpha_uncertainty=None` or all
-entries are NaN, the term is skipped regardless of γ — covers the 1-week
-soak window before the next training cycle promotes a BayesianRidge model.
+α̂-uncertainty term (workstream B.3): Ω = diag(σ_ε²) penalizes positions in
+proportion to per-name ESTIMATION variance — Garlappi-Uppal-Wang 2007
+diagonal-Ω form. γ = cfg["alpha_uncertainty_penalty"].
+
+WHICH VINTAGE OF THE UNCERTAINTY FIELD, AND WHY (alpha-engine-config-I9452).
+Ω is built from `predicted_alpha_std_epistemic` — sqrt(xᵀΣ_w x), the
+estimation-error std of α̂, shipped by crucible-predictor PR596 — and never
+from `predicted_alpha_std`. The latter is the BayesianRidge PREDICTIVE std,
+1/α̂ + xᵀΣ_w x, whose first term is a scalar learned at fit time. GUW's Ω is
+defined as the covariance of the estimation error of μ̂, so including the
+observation-noise term both double-counts risk Σ already carries and adds a
+per-batch constant that annihilates the cross-section. Measured over the 62
+stored predictions/{date}.json artifacts from the 2026-06-01 BayesianRidge
+cutover to 2026-08-31, that constant carried 90–98% of the predictive
+variance and the total's cross-name CV never exceeded 0.008 — so between
+2026-06-01 and this change the term was a uniform ridge (γ was 0.0 in
+production throughout, so nothing traded on it).
+
+When the epistemic vector is absent, unusable, or itself cross-sectionally
+flat (CV below cfg["alpha_uncertainty_min_cv"]), the term is declared
+INOPERATIVE and the reason is written to the solve diagnostics. It is never
+silently re-pointed at the total. See `_resolve_alpha_uncertainty`.
+
+`alpha_uncertainty` (the total) is still a parameter, and still the input to
+the CONVICTION GATE on the discretionary turnover budget, whose IR band was
+derived against the total's scale (PR518). The two knobs read different
+vintages ON PURPOSE: swapping the gate's denominator to the epistemic half
+would multiply IR_xs by ~6x and silently move its operating point.
 
 This module is a pure function over numpy inputs. It does no I/O, no logging
 config side effects, no S3 calls — easy to unit-test (PR 1) and easy to wire
@@ -69,6 +89,11 @@ from dataclasses import dataclass
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Cross-sectional CV floor for the GUW Ω input, mirroring the producer's
+# crucible-predictor/monitoring/drift_detector.py::ALPHA_UNCERTAINTY_MIN_CV.
+# Overridable via cfg["alpha_uncertainty_min_cv"].
+_ALPHA_UNCERTAINTY_MIN_CV = 0.01
 
 _CLARABEL = "CLARABEL"
 _FALLBACK_SOLVERS = ("SCS", "OSQP")
@@ -93,6 +118,7 @@ def solve_target_weights(
     cfg: dict,
     *,
     alpha_uncertainty: np.ndarray | None = None,
+    alpha_uncertainty_epistemic: np.ndarray | None = None,
     covariance: np.ndarray | None = None,
     adv_usd: np.ndarray | None = None,
     portfolio_notional: float | None = None,
@@ -125,16 +151,18 @@ def solve_target_weights(
             to w_i = 0. SPY and CASH must be eligibility=True.
         spy_idx, cash_idx: positions in tickers list.
         cfg: dict with optimizer parameters. See OPTIMIZER_CONFIG_DEFAULTS.
-        alpha_uncertainty: optional shape (N,) array of σ_α̂ per ticker —
-            the BayesianRidge posterior std emitted by the predictor
-            (predicted_alpha_std field in predictions JSON, B.1). When
-            provided AND cfg["alpha_uncertainty_penalty"] > 0, adds the
-            Garlappi-Uppal-Wang 2007 diagonal-Ω penalty term to the MVO
-            objective so noisy picks size down proportionally. NaN entries
-            are treated as zero uncertainty (no penalty for that name);
-            covers the partial-rollout case during the 1-week soak between
-            B.1 landing and the first BayesianRidge model being promoted
-            in production. None ↔ no penalty regardless of γ.
+        alpha_uncertainty: optional shape (N,) array of the predictor's
+            TOTAL predictive std per ticker (`predicted_alpha_std`, B.1).
+            This is the CONVICTION GATE's input — the gate's IR band was
+            derived against this field's scale (PR518) and must keep reading
+            it. It does NOT enter the GUW Ω; see the module docstring.
+        alpha_uncertainty_epistemic: optional shape (N,) array of
+            sqrt(xᵀΣ_w x) per ticker (`predicted_alpha_std_epistemic`,
+            crucible-predictor PR596) — the estimation-error std, and the
+            ONLY vector the Garlappi-Uppal-Wang Ω is built from. NaN entries
+            are treated as zero uncertainty (no penalty for that name).
+            None, unusable, or cross-sectionally flat ↔ the penalty is
+            declared inoperative with a recorded reason, regardless of γ.
         covariance: optional shape (N,N) DAILY covariance matrix Σ_daily
             (pre-horizon-scaling). When provided, the returns-panel estimator
             step is skipped and this matrix is used directly (horizon scaling
@@ -197,7 +225,9 @@ def solve_target_weights(
         sigma = horizon * sigma_daily
     else:
         sigma = _estimate_covariance(returns_panel, cfg)
-    omega_diag, alpha_unc_used = _resolve_alpha_uncertainty(alpha_uncertainty, N, cfg)
+    omega_diag, alpha_unc_used, alpha_unc_meta = _resolve_alpha_uncertainty(
+        alpha_uncertainty, alpha_uncertainty_epistemic, N, cfg,
+    )
 
     try:
         import cvxpy as cp
@@ -294,6 +324,7 @@ def solve_target_weights(
         diagnostics = _build_diagnostics(
             weights, w_prev, sigma, alpha_hat, spy_idx, "infeasible_fallback", cfg,
             omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
+            alpha_unc_meta=alpha_unc_meta,
         )
         diagnostics.update(tcost.diagnostics)
         diagnostics.update(adv_cap_meta)
@@ -311,6 +342,7 @@ def solve_target_weights(
     diagnostics = _build_diagnostics(
         weights, w_prev, sigma, alpha_hat, spy_idx, status, cfg,
         omega_diag=omega_diag, alpha_unc_used=alpha_unc_used,
+        alpha_unc_meta=alpha_unc_meta,
     )
     diagnostics.update(governor)
     diagnostics.update(tcost.diagnostics)
@@ -375,6 +407,12 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
     # preserves bit-identical legacy MVO behavior. Backtester-tunable.
     # See optimizer-sota-upgrades-260526.md §B.3.
     "alpha_uncertainty_penalty": 0.0,
+    # Cross-sectional CV floor below which Ω is declared INOPERATIVE rather
+    # than applied. Mirrors the producer's
+    # crucible-predictor/monitoring/drift_detector.py::ALPHA_UNCERTAINTY_MIN_CV
+    # so the consumer stops using a channel on exactly the sessions the
+    # producer's detector calls dead. See _resolve_alpha_uncertainty.
+    "alpha_uncertainty_min_cv": 0.01,
     # ── Turnover governor (gradual-rebalance guardrail) ──────────────────
     # SAFETY guardrail — NOT an alpha knob, NOT backtester-tuned. Caps the
     # one-way turnover the book may execute in a single day by scaling the
@@ -462,46 +500,144 @@ OPTIMIZER_CONFIG_DEFAULTS: dict = {
 
 def _resolve_alpha_uncertainty(
     alpha_uncertainty: np.ndarray | None,
+    alpha_uncertainty_epistemic: np.ndarray | None,
     N: int,
     cfg: dict,
-) -> tuple[np.ndarray, bool]:
-    """Build omega_diag = σ_α̂² and decide whether the penalty term is
-    active for this solve.
+) -> tuple[np.ndarray, bool, dict]:
+    """Build Ω = diag(σ_ε²) for the GUW term and decide whether it is OPERATIVE.
 
-    Returns (omega_diag, used) where ``used`` is True iff γ > 0 AND at
-    least one σ_α̂ entry is finite AND non-zero. On used=False the caller
-    skips the penalty term, preserving bit-identical legacy behavior.
+    Ω is the covariance of the **estimation error of μ̂** (Garlappi, Uppal &
+    Wang 2007). The predictor's ``predicted_alpha_std`` is the BayesianRidge
+    *predictive* std,
 
-    Negative or non-finite σ_α̂ entries are coerced to 0 (no penalty for
-    that name) so partial-rollout (legacy Ridge std=None → NaN) does not
-    raise. Caller's alpha_uncertainty contract is "predictor posterior
-    std or NaN per ticker"; we enforce the σ ≥ 0 invariant defensively
-    here too — a negative entry IS an upstream bug (BR posterior is
-    always positive), but the optimizer is the wrong place to crash the
-    morning planner over it. Log loud, treat as missing.
+        σ_pred(x)² = 1/α̂  +  xᵀ Σ_w x
+                     ^^^^     ^^^^^^^^^^
+                     scalar   per-name
+
+    whose first term is learned once at fit time and is the SAME number for
+    every name in a batch. Feeding the total to Ω therefore (a) double-counts
+    observation risk the covariance matrix Σ already carries and (b) adds a
+    per-batch constant that annihilates the cross-section the penalty exists
+    to exploit. Measured over the 62 stored ``predictions/{date}.json``
+    artifacts from the 2026-06-01 BayesianRidge cutover to 2026-08-31, the
+    noise term carried 90–98% of σ_pred² and the cross-name coefficient of
+    variation of the total NEVER exceeded 0.008 — the term has been a uniform
+    ridge for three months (alpha-engine-config-I9446 / I9452).
+
+    So Ω is built from ``predicted_alpha_std_epistemic`` (= sqrt(xᵀΣ_w x),
+    shipped by ``crucible-predictor`` PR596) and from NOTHING ELSE. The three
+    ways it can be inoperative are all RECORDED, never silent:
+
+    ``gamma_zero``                γ ≤ 0 — the term is configured off.
+    ``epistemic_field_absent``    the caller passed no epistemic vector, or
+                                  every entry is unusable. Covers every stored
+                                  artifact written before 2026-08-31 and any
+                                  champion family with no scalar noise
+                                  variance (a legacy Ridge pickle). It does
+                                  NOT fall back to ``predicted_alpha_std``:
+                                  that would silently reinstate the uniform
+                                  ridge this change exists to remove, with
+                                  nothing on the artifact saying so. It also
+                                  does not raise — a degraded sizing knob must
+                                  not halt the morning planner.
+    ``cross_section_below_floor`` the epistemic vector is present but its
+                                  cross-sectional CV is below
+                                  ``alpha_uncertainty_min_cv``, i.e. it too is
+                                  a uniform ridge. Same floor (0.01) the
+                                  producer's
+                                  ``drift_detector.ALPHA_UNCERTAINTY_MIN_CV``
+                                  is calibrated on, and the same regime it
+                                  separates: a champion whose posterior never
+                                  left its prior emits a LARGE but flat
+                                  epistemic vector (measured 0.207–0.230 with
+                                  CV 0.00007–0.00025 on
+                                  ``v3.0-meta-2026-08-21-7d3d1cce``), which a
+                                  magnitude test cannot catch.
+
+    Returns ``(omega_diag, used, meta)``. ``meta`` is merged into the solve
+    diagnostics and is populated on EVERY path — a field that appears only
+    when the penalty engages is indistinguishable from a dead penalty.
+
+    ``alpha_uncertainty`` (the total) is accepted but never enters Ω. It stays
+    in the signature because it remains the CONVICTION GATE's input, whose
+    band was derived against the total's scale (``crucible-executor`` PR518,
+    alpha-engine-config-I9447), and because a shape mismatch on it is still
+    a caller bug worth raising on.
     """
     gamma = float(cfg.get("alpha_uncertainty_penalty", 0.0))
-    if alpha_uncertainty is None or gamma <= 0.0:
-        return np.zeros(N), False
-    arr = np.asarray(alpha_uncertainty, dtype=np.float64).ravel()
+    meta: dict = {
+        "alpha_uncertainty_vintage": "epistemic",
+        "alpha_uncertainty_inoperative_reason": None,
+        "alpha_uncertainty_epistemic_cv": None,
+        "alpha_uncertainty_min_cv": float(cfg.get("alpha_uncertainty_min_cv", _ALPHA_UNCERTAINTY_MIN_CV)),
+        "alpha_uncertainty_n_usable": 0,
+    }
+    if gamma <= 0.0:
+        meta["alpha_uncertainty_inoperative_reason"] = "gamma_zero"
+        return np.zeros(N), False, meta
+    if alpha_uncertainty_epistemic is None:
+        meta["alpha_uncertainty_inoperative_reason"] = "epistemic_field_absent"
+        logger.warning(
+            "GUW alpha-uncertainty penalty INOPERATIVE (gamma=%.4g): no "
+            "predicted_alpha_std_epistemic vector was supplied. The total "
+            "predicted_alpha_std is NOT substituted — it is cross-sectionally "
+            "flat (CV <= 0.008 on every measured session) and Omega built from "
+            "it is a uniform ridge that double-counts observation risk already "
+            "carried by Sigma. Sizing proceeds without the penalty; see "
+            "alpha-engine-config-I9452.",
+            gamma,
+        )
+        return np.zeros(N), False, meta
+
+    arr = np.asarray(alpha_uncertainty_epistemic, dtype=np.float64).ravel()
     if arr.shape != (N,):
         raise ValueError(
-            f"alpha_uncertainty shape {arr.shape} != ({N},) — must be one entry per ticker"
+            f"alpha_uncertainty_epistemic shape {arr.shape} != ({N},) — "
+            "must be one entry per ticker"
         )
-    # Any negative entry is an upstream contract violation. Don't crash the
-    # morning planner — log loud, coerce to 0 (per partial-rollout policy).
+    # A negative entry is an upstream contract violation (an estimation std is
+    # non-negative by construction). Log loud, coerce to 0 — the optimizer is
+    # the wrong place to crash the morning planner over a sizing input.
     if np.any(arr[np.isfinite(arr)] < 0.0):
         n_bad = int(np.sum((arr < 0.0) & np.isfinite(arr)))
         logger.warning(
-            "alpha_uncertainty has %d negative entries — coercing to 0. "
-            "Predictor BayesianRidge posterior is always positive; investigate "
-            "upstream (B.1 #199 wiring).", n_bad,
+            "alpha_uncertainty_epistemic has %d negative entries — coercing to "
+            "0. sqrt(x'Sigma_w x) is non-negative by construction; investigate "
+            "the producer (crucible-predictor decompose_alpha_std).", n_bad,
         )
-    # NaN / inf / negative → 0 → no penalty contribution
+    # NaN / inf / negative → 0 → no penalty contribution for that name.
     arr = np.where(np.isfinite(arr) & (arr >= 0.0), arr, 0.0)
-    omega = arr ** 2
-    used = bool(np.any(omega > 0.0))
-    return omega, used
+    usable = arr[arr > 0.0]
+    meta["alpha_uncertainty_n_usable"] = int(usable.size)
+    if usable.size < 2:
+        meta["alpha_uncertainty_inoperative_reason"] = "epistemic_field_absent"
+        logger.warning(
+            "GUW alpha-uncertainty penalty INOPERATIVE (gamma=%.4g): the "
+            "epistemic vector carries %d usable entries. Not substituting the "
+            "total; see alpha-engine-config-I9452.",
+            gamma, int(usable.size),
+        )
+        return np.zeros(N), False, meta
+
+    cv = float(usable.std() / usable.mean()) if usable.mean() > 0.0 else 0.0
+    meta["alpha_uncertainty_epistemic_cv"] = cv
+    if cv < meta["alpha_uncertainty_min_cv"]:
+        meta["alpha_uncertainty_inoperative_reason"] = "cross_section_below_floor"
+        logger.warning(
+            "GUW alpha-uncertainty penalty INOPERATIVE (gamma=%.4g): the "
+            "epistemic cross-section is flat (CV %.6f < floor %.4f) over %d "
+            "names, median %.6f. Omega would be a uniform ridge — it would "
+            "shrink every name identically and discriminate between nothing. "
+            "This is the signature of a champion whose posterior never left "
+            "its prior (measured on v3.0-meta-2026-08-21-7d3d1cce, "
+            "2026-08-24..28), which a magnitude test cannot see because the "
+            "vector is LARGE as well as flat.",
+            gamma, cv, meta["alpha_uncertainty_min_cv"],
+            int(usable.size), float(np.median(usable)),
+        )
+        return np.zeros(N), False, meta
+
+    return arr ** 2, True, meta
 
 
 @dataclass(frozen=True)
@@ -1512,6 +1648,7 @@ def _build_diagnostics(
     *,
     omega_diag: np.ndarray | None = None,
     alpha_unc_used: bool = False,
+    alpha_unc_meta: dict | None = None,
 ) -> dict:
     # sigma is at horizon H per _estimate_covariance. Annualize:
     # Var_ann = Var_H · (252/H) → vol_ann = √(252/H · Var_H). At default
@@ -1534,6 +1671,11 @@ def _build_diagnostics(
         "expected_alpha": float(weights @ alpha_hat),
         "weight_sum": float(weights.sum()),
         "alpha_uncertainty_penalty_used": alpha_unc_used,
+        # I9452: which vintage of the predictor's uncertainty field built Ω,
+        # and — when it did not — why. Emitted on EVERY solve, including the
+        # infeasible-fallback path: a reason that only appears when the term
+        # engages is indistinguishable from a term that is quietly dead.
+        **(alpha_unc_meta or {}),
     }
     # α̂-uncertainty observability (workstream B.3). Mean σ_α̂ across the
     # active book (omega_diag = σ²) — operator-readable signal for how

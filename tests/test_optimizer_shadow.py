@@ -500,12 +500,19 @@ class TestShadowWiringAndAblation:
     """End-to-end: shadow wrapper threads predicted_alpha_std into the
     optimizer and emits the ablation block when γ > 0."""
 
-    def _inputs_with_std(self, gamma=0.0):
+    def _inputs_with_std(self, gamma=0.0, epistemic=True):
         inputs = _baseline_inputs()
         # Augment predictions with BR std field per B.1
         inputs["predictions_by_ticker"]["AAPL"]["predicted_alpha_std"] = 0.040  # diffuse
         inputs["predictions_by_ticker"]["MSFT"]["predicted_alpha_std"] = 0.005  # confident
         inputs["predictions_by_ticker"]["JNJ"]["predicted_alpha_std"] = 0.020
+        if epistemic:
+            # I9452: the GUW Omega reads the DECOMPOSED estimation-error half,
+            # emitted alongside the total by crucible-predictor PR596. Values
+            # are the total's shape at the measured epistemic scale.
+            inputs["predictions_by_ticker"]["AAPL"]["predicted_alpha_std_epistemic"] = 0.0220
+            inputs["predictions_by_ticker"]["MSFT"]["predicted_alpha_std_epistemic"] = 0.0090
+            inputs["predictions_by_ticker"]["JNJ"]["predicted_alpha_std_epistemic"] = 0.0150
         if gamma > 0:
             inputs["config"] = {
                 **inputs["config"],
@@ -534,6 +541,62 @@ class TestShadowWiringAndAblation:
         assert log["alpha_uncertainty"][tickers.index("AAPL")] == pytest.approx(0.040)
         assert log["alpha_uncertainty"][tickers.index("MSFT")] == pytest.approx(0.005)
         assert log["alpha_uncertainty"][tickers.index("JNJ")] == pytest.approx(0.020)
+
+    def test_shadow_log_carries_the_epistemic_vector_as_its_own_field(self):
+        """CONSUMER CONTRACT on crucible-predictor's `predicted_alpha_std_epistemic`
+        (alpha-engine-config-I9452, M0 cross-repo-artifact rule).
+
+        Two independent obligations are pinned here:
+
+        1. The executor READS the producer's field, per ticker, aligned to the
+           universe, with SPY/CASH as 0.0 sentinels.
+        2. It PERSISTS it on the shadow artifact under its own key, because the
+           daemon's intraday re-solve rebuilds Omega from that artifact. Drop the
+           key and the afternoon re-solve silently sizes the same book on a
+           different Omega than the morning solve did.
+        """
+        inputs = self._inputs_with_std(gamma=0.0)
+        s3 = MagicMock()
+        log = run_shadow_optimizer(s3_client=s3, **inputs)
+        assert log is not None
+        assert "alpha_uncertainty_epistemic" in log, (
+            "the intraday re-solve reads this key off the artifact"
+        )
+        eps = log["alpha_uncertainty_epistemic"]
+        assert len(eps) == log["n_tickers"]
+        tickers = log["tickers"]
+        assert eps[tickers.index("SPY")] == 0.0
+        assert eps[tickers.index("CASH")] == 0.0
+        assert eps[tickers.index("AAPL")] == pytest.approx(0.0220)
+        assert eps[tickers.index("MSFT")] == pytest.approx(0.0090)
+        assert eps[tickers.index("JNJ")] == pytest.approx(0.0150)
+        # And it is a DIFFERENT vector from the total — a wiring mistake that
+        # aliased the two would otherwise pass every other assertion here.
+        assert eps != log["alpha_uncertainty"]
+
+    def test_absent_producer_field_is_reported_not_silently_replaced(self):
+        """A pre-PR596 predictions artifact carries no epistemic field.
+
+        The penalty must go inoperative with a NAMED reason on the artifact,
+        and must NOT fall back to `predicted_alpha_std` — that field is
+        cross-sectionally flat (CV <= 0.008 on every measured session), so the
+        fallback would silently reinstate the uniform ridge this change exists
+        to remove, on a solve whose artifact claimed the penalty was applied.
+        """
+        inputs = self._inputs_with_std(gamma=500.0, epistemic=False)
+        s3 = MagicMock()
+        log = run_shadow_optimizer(s3_client=s3, **inputs)
+        assert log is not None
+        assert log["diagnostics"]["alpha_uncertainty_penalty_used"] is False
+        assert log["diagnostics"]["alpha_uncertainty_inoperative_reason"] == (
+            "epistemic_field_absent"
+        )
+        # The total is still present and still populated — the conviction gate
+        # keeps reading it, and its own diagnostics are still computed.
+        assert any(v for v in log["alpha_uncertainty"] if v)
+        assert "conviction_ir_xs" in log["diagnostics"]
+        # No ablation: there is no penalty to ablate against.
+        assert "uncertainty_ablation" not in log
 
     def test_ablation_skipped_when_gamma_zero(self):
         """Default γ=0 → no ablation block (active solve already IS no-penalty)."""
