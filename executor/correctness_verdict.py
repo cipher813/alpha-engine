@@ -173,7 +173,7 @@ EXECUTOR_PARAMS_KEY = "config/executor_params.json"
 #: The closed vocabulary. ``STALE_BINDING`` is assigned by this module alone
 #: and no producer may ever write it — it is a fact about the RELATIONSHIP
 #: between two artifacts, not about either one of them.
-PASS = "PASS"
+PASS = "PASS"  # noqa: S105 — a verdict value, not a credential
 FAIL = "FAIL"
 UNKNOWN = "UNKNOWN"
 STALE_BINDING = "STALE_BINDING"

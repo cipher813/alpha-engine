@@ -12,6 +12,8 @@ and under every verdict `_execute_exit`'s path is untouched.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from executor import correctness_verdict as cv
@@ -104,12 +106,12 @@ def test_a_PASS_verdict_does_not_stand_in_the_way(monkeypatch):
     reached = []
     monkeypatch.setattr(daemon.logger, "info",
                         lambda *a, **k: reached.append(a))
-    try:
+    # Everything downstream of the gate needs a real sqlite conn and order
+    # book, so execution raises once it is past the gate. Getting far enough to
+    # raise IS the assertion, and the assertion below is what checks it — the
+    # suppression is scoped to this one call, never to the check.
+    with contextlib.suppress(Exception):
         _call_execute_entry(_SpyIBKR())
-    except Exception:
-        # Everything downstream of the gate needs a real sqlite conn and order
-        # book; getting far enough to raise IS the assertion.
-        pass
     assert any("BUY %s" in str(a[0]) for a in reached), (
         "under PASS, execution must proceed past the gate to the BUY path"
     )
@@ -122,10 +124,8 @@ def test_observe_mode_places_the_entry_under_every_bad_verdict(verdict, monkeypa
     _prime(verdict, cv.MODE_OBSERVE)
     reached = []
     monkeypatch.setattr(daemon.logger, "info", lambda *a, **k: reached.append(a))
-    try:
+    with contextlib.suppress(Exception):
         _call_execute_entry(_SpyIBKR())
-    except Exception:
-        pass
     assert any("BUY %s" in str(a[0]) for a in reached), (
         "observe mode must not withhold — that is what makes it observe mode"
     )
