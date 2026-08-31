@@ -46,6 +46,15 @@ and, for the dividend leg, by Polygon's 5-calls-per-minute limiter.
     python -m executor.pnl_measurement_backfill --dry-run      # default
     python -m executor.pnl_measurement_backfill --apply --costs --benchmark
     python -m executor.pnl_measurement_backfill --apply --dividends   # Polygon
+    python -m executor.pnl_measurement_backfill --restate-marks       # plan only
+    python -m executor.pnl_measurement_backfill --restate-marks --apply
+
+THE MARK-RESTATEMENT LEG (``--restate-marks``, alpha-engine-config-I9629) is
+the one leg that rewrites a published NAV. It moves ``portfolio_nav`` off a
+broker mark the reconstruction proves wrong, preserves the original in
+``nav_ib_raw_usd``, and recomputes ``daily_return_pct``/``daily_alpha_pct``
+across BOTH sessions each corrected NAV sits between. Its instrument is weaker
+than the live gate's and every row it writes says so — see section 5.
 
 NOT WIRED INTO THE EOD PATH. ``pnl_backfill.backfill_residual_sleeves`` runs on
 every reconciliation and self-heals its own window, which is the pattern this
@@ -73,6 +82,8 @@ from executor.pnl_integrity import (
     check_residual_bounds,
     check_session_axis_coverage,
     gross_net_returns,
+    mark_materiality_usd,
+    plan_nav_mark_correction,
     session_costs,
     verify_benchmark_chain_closes,
     verify_twr_closes,
@@ -673,6 +684,381 @@ def audit_history(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5. Restating the historical NAV series for reconstructed wrong marks
+#    (alpha-engine-config-I9629)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY. ``plan_nav_mark_correction`` (alpha-engine-config-I9627, PR524) repairs a
+# provably-wrong broker mark on the FORWARD path: NAV stops carrying the broker's
+# number and is moved onto the settled closes the positions were already valued
+# at. The live 2026-08-31 instance (DUOL, 708sh, $152.40 -> $148.36, -$2,860.32)
+# is repaired and its row is restated. The history is not. ``audit_history``
+# reconstructs five more over 989 position-days — AMD 2026-08-04, COIN
+# 2026-07-30, LNTH 2026-06-26, MU 2026-08-26, SPY 2026-06-26 — and every one of
+# them sits inside the published track record a viability threshold is set
+# against.
+#
+# THE INSTRUMENT IS THE RECONSTRUCTION'S, NOT THE LIVE GATE'S, and the written
+# row says so. See ``reconstruct_mark_divergences``: the live gate measures the
+# distance past that day's ArcticDB traded ``[Low, High]``; the traded range is
+# not persisted, so retroactively the only reference is the settled close. A
+# settled close lies inside the traded range by construction, so the
+# reconstructed error is an UPPER BOUND on the range breach — it can over-flag
+# and can never under-flag.
+#
+# THE DISCRIMINATOR CANNOT BE EVALUATED HERE, and that is the honest reason the
+# basis label exists. ``plan_nav_mark_correction`` refuses to move NAV towards a
+# settled close that is itself outside the day's ``[Low, High]``, because then
+# the reference data is what is wrong. Retroactively there is no ``[Low, High]``
+# to test against: ArcticDB is the only source and this is a laptop-run planning
+# pass. Three options were available and two were rejected:
+#
+#   (a) fetch the range from ArcticDB — rejected: it makes a planning pass
+#       depend on an in-region data-repo read, and the run-location rule already
+#       forbids that from a laptop;
+#   (b) invent a plausible range (close +/- some volatility) — rejected
+#       outright: a fabricated bound would let the discriminator return a verdict
+#       it did not measure, which is the exact class of defect this module exists
+#       to remove;
+#   (c) pass the ONLY bound the persisted data justifies — the degenerate range
+#       ``[settled_close, settled_close]`` — and record that the discriminator was
+#       NOT evaluated.
+#
+# (c) is taken. The degenerate range is trivially satisfied, so the
+# discriminator refuses nothing here; the arithmetic, the materiality floor and
+# the ``mark_correction_bound_usd`` refusal are all unchanged and all still the
+# live path's own. Every restated row therefore carries
+# ``basis: "reconstructed"`` and ``discriminator_evaluated: false`` in its
+# ``nav_mark_correction_json``, against ``basis: "live_gate"`` on a row the
+# forward path corrected. A consumer tells the two apart by reading one field.
+#
+# NOT WIRED INTO THE EOD PATH. This is an operator CLI, for the same reason the
+# other legs are: ``eod_reconcile.run`` is what the postclose SF executes, and
+# the pipelines are change-quiet until the clause-1 reliability clock starts.
+MARK_BASIS_RECONSTRUCTED = "reconstructed"
+MARK_BASIS_LIVE = "live_gate"
+
+# A restated return that differs from the stored one by less than this is not
+# reported as moving — it is float noise in a column persisted at REAL precision.
+RETURN_RESTATEMENT_EPSILON_PCT = 1e-9
+
+# How far a row's STORED daily_return_pct may sit from the return its own
+# persisted NAV chain implies before the divergence is named. 0.5bp, the same
+# tolerance ``plan_benchmark_restatement`` uses against the vendor series.
+CHAIN_BASIS_TOLERANCE_PCT = 0.005
+
+
+def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild :func:`plan_nav_mark_correction`'s inputs from a persisted row. PURE.
+
+    Returns ``{"flags", "settled_closes", "day_low", "day_high", "refused"}``.
+
+    ``flags`` carries the same keys ``eod_reconcile._detect_ib_mark_outside_range``
+    produces for the live path — ``ticker`` / ``shares`` / ``ib_mark`` /
+    ``mark_error_usd`` — reconstructed from the ``market_value`` /
+    ``ib_market_value`` / ``shares`` triple, at ``mark_materiality_usd``, the
+    live gate's own floor.
+
+    NOTHING IS SUBSTITUTED AND NOTHING IS ZEROED. A row with no parseable
+    ``positions_snapshot``, and each individual name missing ``ib_market_value``
+    (the pre-schema-2.1 state, which is most of the history) or missing a usable
+    share count, is NAMED in ``refused`` and contributes no flag. A silent skip
+    here would report a session as clean that was never examined.
+    """
+    nav = _f(row.get("portfolio_nav"))
+    date = str(row.get("date"))
+    out: dict[str, Any] = {
+        "date": date,
+        "flags": [],
+        "settled_closes": {},
+        "day_low": {},
+        "day_high": {},
+        "refused": [],
+    }
+    positions = _positions(row)
+    if positions is None:
+        out["refused"].append({
+            "date": date, "ticker": None,
+            "reason": "positions_snapshot absent or unparseable — the session "
+                      "cannot be examined and is NOT reported as clean",
+        })
+        return out
+    if nav is None:
+        out["refused"].append({
+            "date": date, "ticker": None,
+            "reason": "row carries no portfolio_nav — there is nothing to restate "
+                      "and no NAV to size the materiality floor against",
+        })
+        return out
+
+    materiality = mark_materiality_usd(nav)
+    for ticker, pos in sorted(positions.items()):
+        pos = pos or {}
+        settled_mv = _f(pos.get("market_value"))
+        ib_mv = _f(pos.get("ib_market_value"))
+        shares = _f(pos.get("shares"))
+        if ib_mv is None:
+            out["refused"].append({
+                "date": date, "ticker": ticker,
+                "reason": "no ib_market_value on this position (pre-schema-2.1 "
+                          "snapshot) — the broker mark was never persisted, so "
+                          "this name cannot be checked and is not assumed clean",
+            })
+            continue
+        if settled_mv is None:
+            out["refused"].append({
+                "date": date, "ticker": ticker,
+                "reason": "no market_value on this position — there is no settled "
+                          "reference to price the broker mark against",
+            })
+            continue
+        if not shares:
+            out["refused"].append({
+                "date": date, "ticker": ticker,
+                "reason": "share count absent or zero — a per-share mark cannot be "
+                          "reconstructed from the market-value pair without it",
+            })
+            continue
+        divergence = ib_mv - settled_mv
+        if abs(divergence) <= materiality:
+            continue
+        settled_close = settled_mv / shares
+        out["flags"].append({
+            "ticker": ticker,
+            "shares": shares,
+            "ib_mark": ib_mv / shares,
+            "mark_error_usd": divergence,
+            "materiality_usd": materiality,
+        })
+        out["settled_closes"][ticker] = settled_close
+        # See THE DISCRIMINATOR CANNOT BE EVALUATED HERE above: the degenerate
+        # range is the only bound the persisted data justifies.
+        out["day_low"][ticker] = settled_close
+        out["day_high"][ticker] = settled_close
+    return out
+
+
+def _mark_correction_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    """The ``nav_mark_correction_json`` body for a RECONSTRUCTED restatement."""
+    payload = dict(plan)
+    payload["basis"] = MARK_BASIS_RECONSTRUCTED
+    payload["instrument"] = (
+        "settled market value vs broker market value, both reconstructed from "
+        "positions_snapshot — an UPPER BOUND on the traded-range breach the live "
+        "gate measures, never an under-estimate of it"
+    )
+    payload["discriminator_evaluated"] = False
+    payload["discriminator_note"] = (
+        "the day's ArcticDB [Low, High] is not persisted, so the settled close "
+        "could not be tested for lying inside it; day_low/day_high were passed as "
+        "the degenerate range [settled_close, settled_close] and the reference-data "
+        "discriminator refused nothing on this row"
+    )
+    payload["source"] = "executor.pnl_measurement_backfill --restate-marks"
+    payload["tracker"] = "alpha-engine-config-I9629"
+    return payload
+
+
+def plan_historical_mark_restatement(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Plan the NAV restatement AND the return-chain recomputation. PURE.
+
+    ``rows`` is the eod_pnl series OLDEST-first, as :func:`_rows` returns it.
+
+    The NAV leg reuses :func:`executor.pnl_integrity.plan_nav_mark_correction`
+    unchanged — the same function the live path calls — so a restated historical
+    row is corrected by the code that corrects a live one, including its
+    ``mark_correction_bound_usd`` refusal. Only the day-range input differs, and
+    that difference is recorded on every row it touches.
+
+    THE CHAIN, NOT THE ROW. ``daily_return_pct[t] = (nav[t] - nav[t-1])/nav[t-1]``,
+    so moving ``nav[t]`` moves session *t*'s return AND session *t+1*'s, and
+    ``daily_alpha_pct = daily_return_pct - spy_return_pct`` moves with each. Every
+    downstream row is recomputed off the RESTATED NAV series; ``spy_return_pct``
+    is not touched (a separate, deliberately untaken decision).
+
+    IDEMPOTENCE. A row already carrying ``nav_ib_raw_usd`` or
+    ``nav_mark_correction_json`` has been restated — by an earlier run of this
+    pass, or by the live path, which is what makes the 2026-08-31 DUOL row a
+    no-op here. It is reported under ``already_restated`` and left untouched, so
+    a second run writes nothing.
+    """
+    restatements: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+    already: list[dict[str, Any]] = []
+    nav_new: dict[str, float] = {}
+
+    for row in rows:
+        date = str(row.get("date"))
+        nav = _f(row.get("portfolio_nav"))
+        if nav is not None:
+            nav_new[date] = nav
+        if row.get("nav_ib_raw_usd") is not None or row.get("nav_mark_correction_json"):
+            already.append({
+                "date": date,
+                "basis": (MARK_BASIS_LIVE
+                          if row.get("nav_mark_correction_json") and
+                          row.get("nav_ib_raw_usd") is not None
+                          else "unknown"),
+                "reason": "row already carries a mark restatement — left untouched",
+            })
+            continue
+        inputs = reconstruct_mark_correction_inputs(row)
+        refused.extend(inputs["refused"])
+        if not inputs["flags"]:
+            continue
+        plan = plan_nav_mark_correction(
+            inputs["flags"],
+            settled_closes=inputs["settled_closes"],
+            day_low=inputs["day_low"],
+            day_high=inputs["day_high"],
+            nav=nav,
+            run_date=date,
+        )
+        if not plan["applied"]:
+            refused.append({
+                "date": date, "ticker": None,
+                "reason": plan["message"] or "no correction could be proven",
+                "refused_by_bound": bool(plan.get("refused")),
+                "correction_usd": plan.get("correction_usd"),
+                "bound_usd": plan.get("bound_usd"),
+            })
+            continue
+        nav_new[date] = float(plan["nav_corrected"])
+        restatements.append({
+            "date": date,
+            "nav_ib_raw_usd": nav,
+            "portfolio_nav": float(plan["nav_corrected"]),
+            "nav_mark_correction_usd": float(plan["correction_usd"]),
+            "tickers": list(plan["corrected_tickers"]),
+            "corrections": plan["corrections"],
+            "nav_mark_correction_json": _mark_correction_payload(plan),
+        })
+
+    chain, chain_refused, chain_basis_mismatch = _plan_return_chain(rows, nav_new)
+    return {
+        "restatements": restatements,
+        "refused": refused,
+        "already_restated": already,
+        "chain": chain,
+        "chain_refused": chain_refused,
+        "chain_basis_mismatch": chain_basis_mismatch,
+    }
+
+
+def _plan_return_chain(
+    rows: list[dict[str, Any]], nav_new: dict[str, float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Recompute ``daily_return_pct``/``daily_alpha_pct`` off the RESTATED NAVs. PURE.
+
+    Walks the series oldest-first carrying BOTH chains — the persisted NAVs and
+    the restated ones — so a row is reported only when the restatement actually
+    moves its return. Both legs of a moved link are covered: the corrected
+    session and the one after it.
+
+    Two things are named rather than silently absorbed:
+
+    * ``chain_refused`` — a row whose ``daily_return_pct`` moves but whose
+      ``spy_return_pct`` is absent, so ``daily_alpha_pct`` cannot be restated
+      alongside it. Same refusal ``plan_benchmark_restatement`` makes in the
+      mirror direction: correcting one leg alone leaves the row internally
+      inconsistent.
+    * ``chain_basis_mismatch`` — a row whose STORED return already disagreed with
+      its own persisted NAV chain by more than
+      ``CHAIN_BASIS_TOLERANCE_PCT``. Recomputing it from the NAV chain therefore
+      moves it by more than the mark correction alone, and that pre-existing
+      discrepancy is reported so the delta is never read as this pass's doing.
+    """
+    chain: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+    prior_old: float | None = None
+    prior_new: float | None = None
+    for row in rows:
+        date = str(row.get("date"))
+        old_nav = _f(row.get("portfolio_nav"))
+        new_nav = nav_new.get(date, old_nav)
+        if old_nav is None or new_nav is None:
+            prior_old, prior_new = old_nav, new_nav
+            continue
+        if prior_old and prior_new:
+            old_implied = (old_nav - prior_old) / prior_old * 100.0
+            new_return = (new_nav - prior_new) / prior_new * 100.0
+            if abs(new_return - old_implied) > RETURN_RESTATEMENT_EPSILON_PCT:
+                stored = _f(row.get("daily_return_pct"))
+                if stored is not None and abs(stored - old_implied) > CHAIN_BASIS_TOLERANCE_PCT:
+                    mismatches.append({
+                        "date": date,
+                        "stored_daily_return_pct": stored,
+                        "nav_chain_implied_pct": old_implied,
+                        "reason": "stored daily_return_pct already disagreed with "
+                                  "this row's own persisted NAV chain before any "
+                                  "restatement — the recomputed value moves by more "
+                                  "than the mark correction",
+                    })
+                spy = _f(row.get("spy_return_pct"))
+                entry = {
+                    "date": date,
+                    "nav_from": old_nav,
+                    "nav_to": new_nav,
+                    "prior_nav_from": prior_old,
+                    "prior_nav_to": prior_new,
+                    "daily_return_pct_from": stored,
+                    "daily_return_pct_to": new_return,
+                    "daily_alpha_pct_from": _f(row.get("daily_alpha_pct")),
+                    "daily_alpha_pct_to": None,
+                    "spy_return_pct": spy,
+                }
+                if spy is None:
+                    refused.append({
+                        "date": date,
+                        "daily_return_pct_to": new_return,
+                        "reason": "row carries no spy_return_pct, so daily_alpha_pct "
+                                  "cannot be restated alongside daily_return_pct — "
+                                  "correcting one leg alone leaves the row "
+                                  "internally inconsistent",
+                    })
+                else:
+                    entry["daily_alpha_pct_to"] = new_return - spy
+                    chain.append(entry)
+        prior_old, prior_new = old_nav, new_nav
+    return chain, refused, mismatches
+
+
+def apply_historical_mark_restatement(
+    conn: sqlite3.Connection, plan: dict[str, Any],
+) -> dict[str, int]:
+    """Write the planned NAV restatement and the recomputed return chain.
+
+    Idempotent by planning: a row already carrying ``nav_ib_raw_usd`` or
+    ``nav_mark_correction_json`` never reaches here, so a second run plans no
+    restatement, computes no chain movement, and writes nothing.
+
+    ``nav_ib_raw_usd`` holds the pre-restatement ``portfolio_nav``, so the whole
+    restatement is reversible from the ledger alone.
+    """
+    n_nav = 0
+    for r in plan.get("restatements", []):
+        conn.execute(
+            "UPDATE eod_pnl SET portfolio_nav=?, nav_ib_raw_usd=?, "
+            "nav_mark_correction_usd=?, nav_mark_correction_json=? WHERE date=?",
+            (
+                r["portfolio_nav"], r["nav_ib_raw_usd"], r["nav_mark_correction_usd"],
+                json.dumps(r["nav_mark_correction_json"], default=str), r["date"],
+            ),
+        )
+        n_nav += 1
+    n_chain = 0
+    for c in plan.get("chain", []):
+        conn.execute(
+            "UPDATE eod_pnl SET daily_return_pct=?, daily_alpha_pct=? WHERE date=?",
+            (c["daily_return_pct_to"], c["daily_alpha_pct_to"], c["date"]),
+        )
+        n_chain += 1
+    conn.commit()
+    return {"nav_rows_written": n_nav, "chain_rows_written": n_chain}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -756,7 +1142,7 @@ def _fetch_holding_events(tickers: list[str], start: str) -> dict[str, list[dict
     return out
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default="trades.db", help="path to the trades sqlite db")
     ap.add_argument("--apply", action="store_true", help="write (default is dry-run)")
@@ -770,6 +1156,15 @@ def main(argv: list[str] | None = None) -> int:
              "it the restatement is planned and printed but never written.",
     )
     ap.add_argument("--dividends", action="store_true")
+    ap.add_argument(
+        "--restate-marks", action="store_true",
+        help="restate the historical NAV series for broker marks the persisted "
+             "market-value pair proves wrong, and recompute the return chain "
+             "across every session the correction moves. Plans and prints by "
+             "default; writes only with --apply. Never selected by the no-flag "
+             "default — this rewrites a published NAV. "
+             "alpha-engine-config-I9629.",
+    )
     ap.add_argument("--audit", action="store_true", help="run the retroactive gates")
     ap.add_argument(
         "--flag-non-trading-rows", action="store_true",
@@ -779,10 +1174,18 @@ def main(argv: list[str] | None = None) -> int:
              "alpha-engine-config-I9615.",
     )
     ap.add_argument("--json-out", default=None)
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    if not any([args.costs, args.benchmark, args.dividends, args.audit]):
+    # --restate-marks is deliberately absent from this default: it is the only
+    # leg that rewrites an already-published NAV, so it is never turned on by
+    # running the module with no flags.
+    if not any([args.costs, args.benchmark, args.dividends, args.audit,
+                args.restate_marks]):
         args.costs = args.benchmark = args.audit = True
 
     conn = sqlite3.connect(args.db)
@@ -858,6 +1261,41 @@ def main(argv: list[str] | None = None) -> int:
                     "ruled on. Every daily_alpha_pct on those sessions moves.",
                     len(restatement["corrections"]),
                 )
+
+    if args.restate_marks:
+        rows = _rows(conn)  # re-read so the plan sees anything just written
+        mark_plan = plan_historical_mark_restatement(rows)
+        report["mark_restatement"] = {
+            "status": "applied" if args.apply else "planned",
+            "sessions_restated": len(mark_plan["restatements"]),
+            "restatements": mark_plan["restatements"],
+            "downstream_rows_moved": len(mark_plan["chain"]),
+            "chain": mark_plan["chain"],
+            "chain_refused": mark_plan["chain_refused"],
+            "chain_basis_mismatch": mark_plan["chain_basis_mismatch"],
+            "already_restated": mark_plan["already_restated"],
+            "refused": mark_plan["refused"],
+            "n_refused": len(mark_plan["refused"]),
+            "basis": MARK_BASIS_RECONSTRUCTED,
+        }
+        if args.apply:
+            report["mark_restatement"].update(
+                apply_historical_mark_restatement(conn, mark_plan)
+            )
+        elif mark_plan["restatements"]:
+            logger.warning(
+                "%d session(s) planned to restate and %d downstream row(s) to "
+                "recompute, NONE written — rerun with --apply. This is a "
+                "production data-repo write and must run IN-REGION (EC2), never "
+                "from a laptop.",
+                len(mark_plan["restatements"]), len(mark_plan["chain"]),
+            )
+        logger.info(
+            "mark restatement: %d session(s), %d downstream row(s), %d name(s) "
+            "refused, %d row(s) already restated",
+            len(mark_plan["restatements"]), len(mark_plan["chain"]),
+            len(mark_plan["refused"]), len(mark_plan["already_restated"]),
+        )
 
     if args.dividends:
         tickers = [t for r in rows for t in (_positions(r) or {})]
