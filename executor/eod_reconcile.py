@@ -38,6 +38,7 @@ from executor.pnl_integrity import (
     RESIDUAL_CUMULATIVE_WINDOW_SESSIONS,
     check_attribution_closure,
     check_custodian_marks,
+    check_mark_coverage,
     check_residual_bounds,
     gross_net_returns,
     nav_basis_level_usd,
@@ -320,6 +321,21 @@ def _detect_ib_mark_outside_range(
     the flag reaches ``eod_report.json`` via the ``positions`` dict) and
     returns the flag list the hard-gate call site uses to name tickers in
     the alert text and classify the breach.
+
+    **Records negative evidence** (alpha-engine-config-I9637). Every position
+    is stamped with ``ib_mark_range_checked``, and an unchecked one carries
+    ``ib_mark_range_uncheckable_reason``. Before this, a name the check could
+    not evaluate looked exactly like a name that passed: the loop `continue`d
+    and the position dict was left untouched, so ``ib_mark_outside_range``
+    read False for "verified in range" and for "never looked at" alike.
+
+    That is not hypothetical. The ArcticDB ``macro`` library is **Close-only**
+    — measured 2026-08-31, ``XLK``/``SPY``/``GLD``/``VIX`` all return
+    ``cols=['Close']`` — so ``day_low``/``day_high`` are never populated for a
+    macro-routed held name (``price_cache._MACRO_SYMBOLS``: the sector ETFs,
+    GLD, USO, VIX, VIX3M, TNX, IRX). Every one of those marks flows into NAV
+    unverified, and the gate that exists to stop a wrong mark reaching NAV
+    reported nothing at all about them.
     """
     flags: list[dict] = []
     for ticker, pos in positions.items():
@@ -327,10 +343,26 @@ def _detect_ib_mark_outside_range(
         ib_mv = pos.get("ib_market_value")
         lo = day_low.get(ticker)
         hi = day_high.get(ticker)
-        if not shares or ib_mv is None or lo is None or hi is None:
+        reason = None
+        if not shares:
+            reason = "no share count on the position"
+        elif ib_mv is None:
+            reason = "no IB market value (pre-schema-2.1 snapshot)"
+        elif lo is None or hi is None:
+            reason = (
+                "no traded [Low, High] for this ticker on this date — the "
+                "ArcticDB macro library is Close-only, so a macro-routed "
+                "holding cannot be range-checked"
+            )
+        if reason is not None:
+            pos["ib_mark_range_checked"] = False
+            pos["ib_mark_range_uncheckable_reason"] = reason
             continue
+        pos["ib_mark_range_checked"] = True
         ib_mark = ib_mv / shares
         if lo <= ib_mark <= hi:
+            # Explicit negative evidence: checked, and in range.
+            pos["ib_mark_outside_range"] = False
             continue
         mark_error_usd = shares * (ib_mark - lo if ib_mark < lo else ib_mark - hi)
         pos["ib_mark_outside_range"] = True
@@ -1370,6 +1402,24 @@ def run(
             ),
         )
 
+    # Coverage of the check itself (alpha-engine-config-I9637). Computed from
+    # the stamps the detector just left, BEFORE the correction, so the number
+    # describes what the gate could see rather than what it acted on.
+    mark_coverage = check_mark_coverage(positions, nav=nav, run_date=run_date)
+    logger.info(
+        "Custodian-mark check coverage: %d/%d held position(s) range-checked",
+        mark_coverage["checked"], mark_coverage["held"],
+    )
+    for _w in mark_coverage["warnings"]:
+        # An unchecked MATERIAL position means NAV is published on a mark the
+        # gate never saw — ERROR. An immaterial one is a WARNING. Neither
+        # halts: the cause is a Close-only macro library in another repo.
+        if mark_coverage["unchecked_material"]:
+            logger.error("MARK CHECK COVERAGE: %s", _w)
+        else:
+            logger.warning("MARK CHECK COVERAGE: %s", _w)
+        data_warnings.append(_w)
+
     nav_ib_raw = nav
     mark_correction = plan_nav_mark_correction(
         ib_mark_range_flags,
@@ -1965,9 +2015,24 @@ def run(
         # with no ledger trade and would false-mismatch the anchored parity on
         # the ex-date (config#1682). Fetch split ratios for held tickers and
         # rebase the pre-action baselines. Best-effort: no POLYGON_API_KEY or a
-        # fetch error yields {} (un-adjusted), never aborting the audit.
+        # fetch error never aborts the audit — but it no longer reads as
+        # clean either: the unresolved tickers are named and travel to the
+        # artifact as split_check_unresolved (alpha-engine-config-I9630).
         _held_tickers = set(positions or {}) | set(prior_positions or {})
-        _split_ratios = fetch_same_day_split_ratios(_held_tickers, run_date)
+        _split_ratios, _split_unresolved = fetch_same_day_split_ratios(
+            _held_tickers, run_date,
+        )
+        if _split_unresolved:
+            _msg = (
+                f"Same-day split status UNRESOLVED for {len(_split_unresolved)} "
+                f"of {len(_held_tickers)} ticker(s) on {run_date}: "
+                f"{', '.join(sorted(_split_unresolved))}. Their parity in the "
+                "reconciliation audit is unverified, not clean — the audit "
+                "carries split_check_complete=false "
+                "(alpha-engine-config-I9630)."
+            )
+            logger.error("[reconciliation_audit] %s", _msg)
+            data_warnings.append(_msg)
 
         _recon_audit = build_reconciliation_audit(
             conn,
@@ -1980,6 +2045,7 @@ def run(
             run_date=run_date,
             ib_nav=nav,
             corporate_actions=_split_ratios,
+            split_check_unresolved=_split_unresolved,
         )
         _recon_key = write_reconciliation_audit(
             _recon_audit,
@@ -1989,10 +2055,10 @@ def run(
         )
         logger.info(
             "[reconciliation_audit] match_rate=%.3f status=%s positions=%d "
-            "mismatched=%d -> s3://%s/%s",
+            "mismatched=%d split_check_complete=%s -> s3://%s/%s",
             _recon_audit["reconciliation_match_rate"], _recon_audit["status"],
             _recon_audit["n_positions"], _recon_audit["n_mismatched"],
-            trades_bucket, _recon_key,
+            _recon_audit["split_check_complete"], trades_bucket, _recon_key,
         )
     except Exception as _recon_err:  # noqa: BLE001 — secondary observability (see comment above)
         logger.warning(
@@ -2501,6 +2567,7 @@ def run(
             nav_reconciliation=nav_reconciliation,
             integrity_breaches=integrity_breaches,
             nav_mark_correction=mark_correction,
+            mark_check_coverage=mark_coverage,
             twr_closure=twr,
             dividend_accrual_available=dividend_accrual_available,
             position_narratives=position_narratives,

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -250,41 +251,63 @@ def _apply_split_ratios(
 
 def fetch_same_day_split_ratios(
     tickers, run_date: str, *, client: Any | None = None
-) -> dict[str, float]:
+) -> tuple[dict[str, float], list[str]]:
     """I/O wiring helper: fetch same-day split ratios for ``tickers`` via Polygon.
 
     Separate from the pure :func:`build_reconciliation_audit` builder so the
-    latter stays testable without network. Best-effort by contract — any failure
-    (missing ``POLYGON_API_KEY``, rate limit, HTTP error) returns ``{}`` and logs,
-    because a same-day split is rare and the reconciliation audit is secondary
-    observability that must never abort the EOD path. Inject ``client`` (a
-    ``PolygonClient``-shaped object exposing ``get_splits``) in tests.
+    latter stays testable without network. Best-effort by contract — a failure
+    (missing ``POLYGON_API_KEY``, rate limit, HTTP error) never aborts the EOD
+    path, because a same-day split is rare and this audit is secondary
+    observability. Inject ``client`` (a ``PolygonClient``-shaped object exposing
+    ``get_splits``) in tests.
+
+    Returns ``(ratios, unresolved)`` (alpha-engine-config-I9630). ``unresolved``
+    is every ticker whose split status could not be established.
+
+    **Why the return shape changed.** The old contract returned ``{}`` and
+    logged ``"treating as no same-day action"``. That sentence converts
+    UNMEASURED into CLEAN: a ticker whose split we failed to fetch became
+    indistinguishable, on every downstream surface, from one we checked and
+    found no split on — and ``build_reconciliation_audit`` then published
+    ``reconciliation_match_rate`` as though the whole book had been verified.
+    It is not hypothetical: ``eod-2026-08-31-1788206436`` swallowed UAL and
+    QLYS after seven ``429``s and published ``match_rate=1.000``.
+    ``principles.md`` §2.7 — no data is never rendered as green.
+
+    The failure stays non-fatal. What changes is that the gap is now
+    countable and travels to the artifact instead of dying in a log line.
     """
     tickers = [t for t in (tickers or []) if t]
     if not tickers:
-        return {}
+        return {}, []
     try:
         if client is None:
             from polygon_client import PolygonClient  # lazy: optional dep / key
 
             client = PolygonClient()
-        splits_by_ticker: dict[str, list[dict[str, Any]]] = {}
-        for t in tickers:
-            try:
-                splits_by_ticker[t] = client.get_splits(t, start=run_date)
-            except Exception:  # noqa: BLE001 — per-ticker isolation
-                logger.warning(
-                    "[reconciliation_audit] split fetch failed for %s; "
-                    "treating as no same-day action", t, exc_info=True,
-                )
-        return same_day_split_ratios(splits_by_ticker, run_date)
     except Exception:  # noqa: BLE001 — client construction / key absent
-        logger.warning(
+        # EVERY ticker is unresolved, not zero of them. This branch previously
+        # returned {} and the whole book silently read as split-checked.
+        logger.error(
             "[reconciliation_audit] same-day split fetch unavailable "
-            "(no POLYGON_API_KEY or client error); proceeding un-adjusted",
-            exc_info=True,
+            "(no POLYGON_API_KEY or client error) — all %d held ticker(s) are "
+            "UNRESOLVED, not clean", len(tickers), exc_info=True,
         )
-        return {}
+        return {}, list(tickers)
+
+    splits_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    unresolved: list[str] = []
+    for t in tickers:
+        try:
+            splits_by_ticker[t] = client.get_splits(t, start=run_date)
+        except Exception:  # noqa: BLE001 — per-ticker isolation
+            unresolved.append(t)
+            logger.error(
+                "[reconciliation_audit] split fetch failed for %s — its "
+                "split status is UNRESOLVED and is reported as such, not "
+                "assumed absent", t, exc_info=True,
+            )
+    return same_day_split_ratios(splits_by_ticker, run_date), unresolved
 
 
 def _anchored_parity(
@@ -371,6 +394,7 @@ def build_reconciliation_audit(
     ib_nav: float | None = None,
     generated_at: str | None = None,
     corporate_actions: dict[str, float] | None = None,
+    split_check_unresolved: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Build the reconciliation-audit payload (pure — no I/O).
 
@@ -455,13 +479,29 @@ def build_reconciliation_audit(
             "mismatches": mismatches,
         }
 
+    # ── Split-check completeness (alpha-engine-config-I9630) ───────────────
+    # `match_rate` is a parity number computed AFTER same-day corporate actions
+    # were rebased out. When a split status could not be established, the
+    # rebase for that name did not happen and its parity is unverified — so a
+    # 1.000 here means "every ticker matched, given the splits we know about",
+    # which is a different claim from "every ticker matched". The status is
+    # downgraded to say so rather than letting OK carry both meanings.
+    unresolved = sorted(set(split_check_unresolved or ()))
+    split_check_complete = not unresolved
     status = "OK" if match_rate >= 1.0 else "DRIFT"
+    if status == "OK" and not split_check_complete:
+        status = "OK_UNVERIFIED"
     payload: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "date": run_date,
         "generated_at": generated_at or datetime.now(UTC).isoformat(),
         # Headline metric consumed by the evaluator reconciliation_integrity grader.
         "reconciliation_match_rate": match_rate,
+        # Schema 3: the headline above is only as complete as the split check
+        # behind it. A consumer reading match_rate without these two fields is
+        # reading an unverified number as a verified one.
+        "split_check_complete": split_check_complete,
+        "split_check_unresolved": unresolved,
         "anchored": anchored,
         "status": status,
         "n_positions": len(universe),

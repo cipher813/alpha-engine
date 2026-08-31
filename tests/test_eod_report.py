@@ -439,12 +439,14 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_8(self):
-        """2.8 (alpha-engine-config-I9627): the `integrity` block gains
+    def test_schema_version_is_2_9(self):
+        """2.9 (alpha-engine-config-I9637): the `integrity` block gains
+        `mark_check_coverage` — how many held marks the range check could
+        actually evaluate. 2.8 (I9627) added `nav_mark_correction`: the
         `nav_mark_correction` — the raw broker NAV and the repair applied to
         it, so a corrected headline stays traceable to what IB sent.
         Additive only."""
-        assert SCHEMA_VERSION == "2.8"
+        assert SCHEMA_VERSION == "2.9"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -496,7 +498,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.8"
+        assert report["schema_version"] == "2.9"
         # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
         # and the integrity-gate verdict reach the artifact. Before this the
         # only cost figure anywhere in the P&L path was the portfolio
@@ -627,3 +629,35 @@ class TestNavMarkCorrectionIsPublished:
             positions={}, prior_positions={}, conn=_conn(),
         )
         assert report["integrity"]["nav_mark_correction"] is None
+
+
+class TestMarkCheckCoverageIsPublished:
+    """Schema 2.9 (alpha-engine-config-I9637). A NAV built on marks the gate
+    could not evaluate must not read like one whose every mark was checked."""
+
+    def test_coverage_is_carried_into_the_integrity_block(self):
+        coverage = {
+            "held": 3, "checked": 2, "unchecked": 1, "coverage_pct": 66.67,
+            "unchecked_names": [{"ticker": "XLK", "market_value_usd": 51000.0,
+                                 "reason": "macro library is Close-only"}],
+            "unchecked_material": True,
+        }
+        report = build_eod_report(
+            run_date="2026-09-01", nav=1_000_000.0, prior_nav=None,
+            daily_return=None, spy_return=None, alpha=None,
+            positions={}, prior_positions={}, conn=_conn(),
+            mark_check_coverage=coverage,
+        )
+        published = report["integrity"]["mark_check_coverage"]
+        assert published["checked"] == 2
+        assert published["unchecked"] == 1
+        assert published["unchecked_names"][0]["ticker"] == "XLK"
+        assert published["unchecked_material"] is True
+
+    def test_absent_when_not_supplied(self):
+        report = build_eod_report(
+            run_date="2026-09-01", nav=1.0, prior_nav=None,
+            daily_return=None, spy_return=None, alpha=None,
+            positions={}, prior_positions={}, conn=_conn(),
+        )
+        assert report["integrity"]["mark_check_coverage"] is None

@@ -104,7 +104,7 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.8"
+SCHEMA_VERSION = "2.9"
 # 2.7 (alpha-engine-config-I8188, second pass): additive only.
 # ``transaction_costs`` gains ``gross_available`` and
 # ``gross_unavailable_reason``. When IB attaches no commissionReport to any
@@ -134,6 +134,12 @@ SCHEMA_VERSION = "2.8"
 # TWR-closure gate outcomes, dividend-accrual availability, and the explicit
 # declaration that ``spy_return_pct`` is now TOTAL return, not price return).
 # Both are additive; no 2.3 field changed meaning.
+#
+# 2.9 (alpha-engine-config-I9637) adds ``integrity.mark_check_coverage`` and
+# per-position ``ib_mark_range_checked`` — the custodian-mark gate's own
+# coverage. The ArcticDB macro library is Close-only, so a macro-routed
+# holding has no traded range to check against and its mark reached NAV
+# unverified AND unrecorded. Additive.
 #
 # 2.8 (alpha-engine-config-I9627) adds ``integrity.nav_mark_correction``: the
 # broker NAV as received, the per-name repair applied to any provably-wrong
@@ -547,6 +553,7 @@ def build_eod_report(
     nav_reconciliation: dict | None = None,
     integrity_breaches: list | None = None,
     nav_mark_correction: dict | None = None,
+    mark_check_coverage: dict | None = None,
     twr_closure: dict | None = None,
     dividend_accrual_available: bool | None = None,
     position_narratives: dict[str, str] | None = None,
@@ -713,6 +720,11 @@ def build_eod_report(
             # so the artifact must carry the raw broker NAV beside it or the
             # published number cannot be traced to what IB sent.
             "nav_mark_correction": nav_mark_correction,
+            # Schema 2.9 (alpha-engine-config-I9637): how many held marks the
+            # range check could actually evaluate. Without it, a NAV carrying
+            # an unverified broker mark reads identically to one whose every
+            # mark was checked and passed.
+            "mark_check_coverage": mark_check_coverage,
             "twr_closure": twr_closure,
             "dividend_accrual_available": dividend_accrual_available,
             "spy_return_basis": "total_return",

@@ -375,19 +375,55 @@ class TestFetchSameDaySplitRatios:
         client.get_splits.return_value = [
             {"execution_date": "2026-06-18", "split_from": 1, "split_to": 2},
         ]
-        out = fetch_same_day_split_ratios(["AAPL"], "2026-06-18", client=client)
+        out, unresolved = fetch_same_day_split_ratios(
+            ["AAPL"], "2026-06-18", client=client,
+        )
         assert out == {"AAPL": 2.0}
+        assert unresolved == []
         client.get_splits.assert_called_once_with("AAPL", start="2026-06-18")
 
-    def test_per_ticker_error_isolated(self):
+    def test_per_ticker_error_is_reported_unresolved_not_assumed_absent(self):
+        """alpha-engine-config-I9630. The old contract returned {} and logged
+        'treating as no same-day action', which made an unmeasured split
+        indistinguishable from a checked one. The fetch still does not abort
+        the EOD path — but the gap is now named."""
         client = MagicMock()
         client.get_splits.side_effect = RuntimeError("polygon down")
-        # A fetch failure degrades to no-adjustment rather than aborting.
-        assert fetch_same_day_split_ratios(["AAPL"], "2026-06-18", client=client) == {}
+        ratios, unresolved = fetch_same_day_split_ratios(
+            ["AAPL"], "2026-06-18", client=client,
+        )
+        assert ratios == {}
+        assert unresolved == ["AAPL"]
+
+    def test_a_client_that_cannot_be_built_leaves_every_ticker_unresolved(self):
+        # Not zero of them: this branch previously returned {} and the whole
+        # book silently read as split-checked.
+        ratios, unresolved = fetch_same_day_split_ratios(
+            ["AAPL", "MSFT"], "2026-06-18", client=None,
+        )
+        assert ratios == {}
+        assert sorted(unresolved) == ["AAPL", "MSFT"]
+
+    def test_partial_failure_resolves_what_it_can(self):
+        client = MagicMock()
+
+        def _splits(t, start):
+            if t == "BAD":
+                raise RuntimeError("polygon down")
+            return [{"execution_date": start, "split_from": 1, "split_to": 2}]
+
+        client.get_splits.side_effect = _splits
+        ratios, unresolved = fetch_same_day_split_ratios(
+            ["GOOD", "BAD"], "2026-06-18", client=client,
+        )
+        assert ratios == {"GOOD": 2.0}
+        assert unresolved == ["BAD"]
 
     def test_empty_tickers_short_circuits(self):
         client = MagicMock()
-        assert fetch_same_day_split_ratios([], "2026-06-18", client=client) == {}
+        assert fetch_same_day_split_ratios(
+            [], "2026-06-18", client=client,
+        ) == ({}, [])
         client.get_splits.assert_not_called()
 
 
