@@ -311,7 +311,11 @@ class TestDetectIbMarkOutsideRange:
             positions=positions, day_low={"SPY": 440.0}, day_high={"SPY": 460.0},
         )
         assert flags == []
-        assert "ib_mark_outside_range" not in positions["SPY"]
+        # alpha-engine-config-I9637: an in-range mark now records EXPLICIT
+        # negative evidence. Absence used to mean both "checked and fine" and
+        # "never looked at", which is the hole this closes.
+        assert positions["SPY"]["ib_mark_outside_range"] is False
+        assert positions["SPY"]["ib_mark_range_checked"] is True
 
     def test_missing_day_range_or_shares_is_silently_skipped(self):
         """No day range (e.g. macro symbol not in ArcticDB universe) or a

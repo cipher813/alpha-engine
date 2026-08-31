@@ -725,3 +725,78 @@ def test_partial_repair_corrects_one_name_and_holds_the_gate_on_the_other():
         corrected_tickers=plan["corrected_tickers"],
     )
     assert [b["ticker"] for b in breaches] == ["BBB"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Custodian-mark check COVERAGE (alpha-engine-config-I9637)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from executor.pnl_integrity import check_mark_coverage  # noqa: E402
+
+
+def test_full_coverage_reports_no_warning():
+    positions = {
+        "AAA": {"ib_mark_range_checked": True, "market_value": 100_000.0},
+        "BBB": {"ib_mark_range_checked": True, "market_value": 50_000.0},
+    }
+    out = check_mark_coverage(positions, nav=1_000_000.0, run_date="2026-09-01")
+    assert out["held"] == 2 and out["checked"] == 2 and out["unchecked"] == 0
+    assert out["coverage_pct"] == 100.0
+    assert out["warnings"] == []
+    assert out["unchecked_material"] is False
+
+
+def test_an_unchecked_material_position_is_named_and_called_material():
+    # The measured hole: the ArcticDB macro library is Close-only, so a
+    # macro-routed holding has no traded range to check against.
+    positions = {
+        "AAA": {"ib_mark_range_checked": True, "market_value": 100_000.0},
+        "XLK": {"ib_mark_range_checked": False, "market_value": 51_000.0,
+                "ib_mark_range_uncheckable_reason": "macro library is Close-only"},
+    }
+    out = check_mark_coverage(positions, nav=1_000_000.0, run_date="2026-09-01")
+    assert out["checked"] == 1 and out["unchecked"] == 1
+    assert out["coverage_pct"] == 50.0
+    assert out["unchecked_names"][0]["ticker"] == "XLK"
+    assert out["unchecked_names"][0]["reason"] == "macro library is Close-only"
+    assert out["unchecked_market_value_usd"] == 51_000.0
+    assert out["unchecked_material"] is True
+    assert "MATERIAL" in out["warnings"][0]
+    assert "XLK" in out["warnings"][0]
+
+
+def test_an_unchecked_immaterial_position_still_warns_but_is_not_material():
+    positions = {
+        "AAA": {"ib_mark_range_checked": True, "market_value": 100_000.0},
+        "TINY": {"ib_mark_range_checked": False, "market_value": 200.0,
+                 "ib_mark_range_uncheckable_reason": "no share count"},
+    }
+    out = check_mark_coverage(positions, nav=1_000_000.0, run_date="2026-09-01")
+    assert out["unchecked_material"] is False
+    assert len(out["warnings"]) == 1
+    assert "MATERIAL" not in out["warnings"][0]
+
+
+def test_a_position_missing_the_stamp_counts_as_unchecked_not_checked():
+    # Fail-safe direction: an absent stamp is not evidence the check ran.
+    out = check_mark_coverage(
+        {"AAA": {"market_value": 10_000.0}}, nav=1_000_000.0, run_date="2026-09-01",
+    )
+    assert out["unchecked"] == 1 and out["checked"] == 0
+
+
+def test_empty_book_is_not_an_error():
+    out = check_mark_coverage({}, nav=1_000_000.0, run_date="2026-09-01")
+    assert out["held"] == 0 and out["coverage_pct"] is None and out["warnings"] == []
+
+
+def test_the_live_2026_08_31_book_was_fully_covered():
+    # Twelve universe-routed names, zero macro-routed — coverage was 12/12,
+    # but that was a property of the day's holdings, not of the gate.
+    positions = {
+        t: {"ib_mark_range_checked": True, "market_value": 100_000.0}
+        for t in ("ANF CRUS DECK DOCS DUOL HL HOOD MU NBIX PBF QLYS UAL".split())
+    }
+    out = check_mark_coverage(positions, nav=1_017_149.47, run_date="2026-08-31")
+    assert out["held"] == 12 and out["checked"] == 12
+    assert out["coverage_pct"] == 100.0 and out["warnings"] == []

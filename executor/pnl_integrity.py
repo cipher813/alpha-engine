@@ -1071,6 +1071,106 @@ def plan_nav_mark_correction(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 4c. Custodian-mark check COVERAGE (alpha-engine-config-I9637)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY. `check_custodian_marks` and `plan_nav_mark_correction` both act only on
+# what `_detect_ib_mark_outside_range` was ABLE to evaluate. Neither has any way
+# to know what it could not evaluate, and until I9637 nothing did: the detector
+# skipped an uncheckable name silently, so a NAV carrying an unverified broker
+# mark was indistinguishable, on every surface, from a NAV whose every mark had
+# been checked and passed.
+#
+# THE MEASURED HOLE. The ArcticDB `macro` library is Close-only — measured
+# 2026-08-31, `XLK`/`SPY`/`GLD`/`VIX` each return `cols=['Close']`. Every
+# symbol in `price_cache._MACRO_SYMBOLS` (the eleven sector ETFs plus GLD, USO,
+# VIX, VIX3M, TNX, IRX) therefore has no traded [Low, High] to check against.
+# The 2026-08-31 book held twelve universe-routed names and no macro-routed
+# ones, so live coverage was 12/12 — but that was a property of the day's
+# holdings, not of the gate, and no artifact recorded it either way.
+#
+# WHAT THIS DOES AND DELIBERATELY DOES NOT DO. It publishes coverage and warns
+# when an unchecked position is MATERIAL at the same 15bp-of-NAV floor the mark
+# gate itself uses. It does NOT halt: the cause is a schema limitation in a
+# different repo's data library, and halting the trading pipeline on a gap this
+# repo cannot close would be a fail-closed posture pointed at the wrong system.
+# Closing the gap properly means OHLC in the macro library — filed separately.
+# `principles.md` §2.7: no data is never rendered as green. Making the absence
+# countable is what turns it from invisible into a tracked number.
+
+
+def check_mark_coverage(
+    positions: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    nav: float | None,
+    run_date: str = "",
+) -> dict[str, Any]:
+    """Report which held marks the range check could and could not evaluate.
+
+    Reads the ``ib_mark_range_checked`` / ``ib_mark_range_uncheckable_reason``
+    stamps ``eod_reconcile._detect_ib_mark_outside_range`` leaves on every
+    position. Pure; returns a record for the artifact plus any warnings.
+    """
+    out: dict[str, Any] = {
+        "run_date": run_date,
+        "held": 0,
+        "checked": 0,
+        "unchecked": 0,
+        "coverage_pct": None,
+        "unchecked_names": [],
+        "unchecked_market_value_usd": 0.0,
+        "unchecked_material": False,
+        "materiality_usd": (mark_materiality_usd(nav) if nav else None),
+        "warnings": [],
+    }
+    if not positions:
+        return out
+    for ticker, pos in positions.items():
+        out["held"] += 1
+        if pos.get("ib_mark_range_checked"):
+            out["checked"] += 1
+            continue
+        out["unchecked"] += 1
+        try:
+            mv = abs(float(pos.get("market_value") or 0.0))
+        except (TypeError, ValueError):
+            mv = 0.0
+        out["unchecked_market_value_usd"] += mv
+        out["unchecked_names"].append({
+            "ticker": ticker,
+            "market_value_usd": mv,
+            "reason": pos.get("ib_mark_range_uncheckable_reason"),
+        })
+    out["coverage_pct"] = (
+        out["checked"] / out["held"] * 100.0 if out["held"] else None
+    )
+    if not out["unchecked"]:
+        return out
+
+    names = ", ".join(
+        f"{u['ticker']} (${u['market_value_usd']:,.0f})"
+        for u in out["unchecked_names"]
+    )
+    base = (
+        f"Custodian-mark check coverage {out['checked']}/{out['held']} for "
+        f"{run_date}: {out['unchecked']} held position(s) could NOT be "
+        f"range-checked — {names}. Their broker marks reach NAV unverified."
+    )
+    if nav and out["unchecked_market_value_usd"] > mark_materiality_usd(nav):
+        out["unchecked_material"] = True
+        out["warnings"].append(
+            base + f" This is MATERIAL: ${out['unchecked_market_value_usd']:,.0f} "
+            f"of unverified market value exceeds the "
+            f"${mark_materiality_usd(nav):,.0f} materiality floor "
+            f"({MARK_HARD_MATERIALITY_NAV_BPS:.0f}bps of NAV) the mark gate "
+            "itself uses. NAV is published on marks the gate did not see."
+        )
+    else:
+        out["warnings"].append(base)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 5. Attribution closure — the NAV mark-basis LEVEL
 # ─────────────────────────────────────────────────────────────────────────────
 #
