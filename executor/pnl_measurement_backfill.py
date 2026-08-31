@@ -71,6 +71,7 @@ from executor.pnl_integrity import (
     check_benchmark_vendor_anchor,
     check_custodian_marks,
     check_residual_bounds,
+    check_session_axis_coverage,
     gross_net_returns,
     session_costs,
     verify_benchmark_chain_closes,
@@ -492,21 +493,94 @@ def reconstruct_mark_divergences(
     return out
 
 
+def plan_non_trading_day_flags(
+    rows: list[dict[str, Any]], coverage: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Turn ``non_trading_day_row`` breaches into a persisted-flag plan. PURE.
+
+    alpha-engine-config-I9615 deliverable 1: the live 2026-04-03 row (Good
+    Friday) is not a byte-identical duplicate of 2026-04-02 — its
+    ``portfolio_nav`` differs by +$216.77 and its ``created_at`` sits at the
+    same time-of-day as an ordinary postclose run, so the postclose pipeline
+    genuinely executed on a day the market never opened, marking against a
+    carried-forward stale ``spy_close``. Deleting that row would destroy a
+    real (if spurious) measurement; "Retain all archives" applies here too.
+    The remediation is therefore a FLAG, not a delete — merged into the
+    existing ``integrity_breach_json`` column (already written by the live
+    path, see ``eod_reconcile.py``) rather than a new schema column.
+
+    Returns one entry per flagged row: ``{date, breach}`` where ``breach`` is
+    the ``non_trading_day_row`` dict from
+    :func:`executor.pnl_integrity.check_session_axis_coverage`, ready to merge
+    into that row's existing ``integrity_breach_json`` list.
+    """
+    return [
+        {"date": b["date"], "breach": b}
+        for b in coverage.get("breaches", [])
+        if b.get("kind") == "non_trading_day_row"
+    ]
+
+
+def apply_non_trading_day_flags(
+    conn: sqlite3.Connection, plans: list[dict[str, Any]],
+) -> int:
+    """Write the planned flags, MERGING into any existing ``integrity_breach_json``.
+
+    Never overwrites a breach list the live path already wrote for that
+    session — appends this breach if not already present (idempotent: running
+    the audit twice does not duplicate the entry).
+    """
+    n = 0
+    for p in plans:
+        existing_raw = conn.execute(
+            "SELECT integrity_breach_json FROM eod_pnl WHERE date=?", (p["date"],),
+        ).fetchone()
+        existing: list[Any] = []
+        if existing_raw and existing_raw[0]:
+            try:
+                parsed = json.loads(existing_raw[0])
+                if isinstance(parsed, list):
+                    existing = parsed
+            except (TypeError, ValueError):
+                existing = []
+        if any(e.get("kind") == "non_trading_day_row" for e in existing
+               if isinstance(e, dict)):
+            continue  # already flagged — idempotent
+        existing.append(p["breach"])
+        conn.execute(
+            "UPDATE eod_pnl SET integrity_breach_json=? WHERE date=?",
+            (json.dumps(existing, default=str), p["date"]),
+        )
+        n += 1
+    conn.commit()
+    return n
+
+
 def audit_history(
     rows: list[dict[str, Any]],
     *,
     spy_ex_dividends: dict[str, float] | None = None,
     vendor_closes: dict[str, float] | None = None,
     prior_session_of: Any | None = None,
+    is_trading_day: Any | None = None,
+    next_trading_day: Any | None = None,
 ) -> dict[str, Any]:
     """Run the integrity gates over the WHOLE persisted series and report breaches.
 
     The forward path evaluates each gate on the session it is reconciling. None
     of them has ever been evaluated against the history, so a breach that
     happened before the gate existed has never been seen. This runs all of them
-    retroactively — TWR closure, benchmark-chain closure, the per-session and
-    cumulative residual bounds, and the custodian-mark materiality gate — and
-    returns every breach with its session.
+    retroactively — TWR closure, benchmark-chain closure, the session-axis
+    coverage gate, the per-session and cumulative residual bounds, and the
+    custodian-mark materiality gate — and returns every breach with its
+    session.
+
+    ``is_trading_day``/``next_trading_day`` feed
+    :func:`executor.pnl_integrity.check_session_axis_coverage` — see that
+    docstring. Both absent SKIPS the coverage gate (reported as
+    ``session_axis_coverage_status: "NOT EVALUATED"``) rather than reporting a
+    pass; a gate that did not run has not agreed with anything, same
+    convention as the vendor anchor below.
 
     Returns a dict with ``breach_count``; the CLI exits NON-ZERO when it is
     nonzero, so a breach in the history is a failure rather than a paragraph in
@@ -518,6 +592,14 @@ def audit_history(
         ex_dividends=spy_ex_dividends or {},
         prior_session_of=prior_session_of,
     )
+    if is_trading_day is not None and next_trading_day is not None:
+        coverage = check_session_axis_coverage(
+            rows, is_trading_day=is_trading_day, next_trading_day=next_trading_day,
+        )
+        coverage_status = "evaluated"
+    else:
+        coverage = {"status": "n/a", "closes": None, "breaches": []}
+        coverage_status = "NOT EVALUATED — no trading calendar supplied"
     # The vendor anchor is the only leg here that is not built from columns this
     # system wrote. Its ABSENCE is reported as a named degradation rather than
     # as a pass — a gate that could not run has not agreed with anything.
@@ -573,6 +655,7 @@ def audit_history(
         + len(mark_breaches)
         + len(divergence_breaches)
         + len(anchor_breaches)
+        + len(coverage.get("breaches", []))
     )
     return {
         "n_sessions": len(rows),
@@ -580,6 +663,8 @@ def audit_history(
         "benchmark_closure": bench,
         "benchmark_vendor_anchor_status": anchor_status,
         "benchmark_vendor_anchor_breaches": anchor_breaches,
+        "session_axis_coverage_status": coverage_status,
+        "session_axis_coverage": coverage,
         "residual_breaches": residual_breaches,
         "mark_breaches": mark_breaches,
         "mark_divergence_breaches": divergence_breaches,
@@ -635,6 +720,24 @@ def _prior_session_of(date_str: str) -> str:
     return previous_trading_day(_dt.date.fromisoformat(date_str)).isoformat()
 
 
+def _is_trading_day(date_str: str) -> bool:
+    """String-in/bool-out adapter feeding ``check_session_axis_coverage``."""
+    import datetime as _dt
+
+    from krepis.trading_calendar import is_trading_day
+
+    return bool(is_trading_day(_dt.date.fromisoformat(date_str)))
+
+
+def _next_trading_day(date_str: str) -> str:
+    """String-in/string-out adapter feeding ``check_session_axis_coverage``."""
+    import datetime as _dt
+
+    from krepis.trading_calendar import next_trading_day
+
+    return next_trading_day(_dt.date.fromisoformat(date_str)).isoformat()
+
+
 def _fetch_holding_events(tickers: list[str], start: str) -> dict[str, list[dict]]:
     from polygon_client import PolygonClient
 
@@ -668,6 +771,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--dividends", action="store_true")
     ap.add_argument("--audit", action="store_true", help="run the retroactive gates")
+    ap.add_argument(
+        "--flag-non-trading-rows", action="store_true",
+        help="write the session-axis coverage gate's non_trading_day_row "
+             "breaches into integrity_breach_json (merged, never overwritten). "
+             "Requires --audit and --apply. Never deletes a row — "
+             "alpha-engine-config-I9615.",
+    )
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -773,22 +883,44 @@ def main(argv: list[str] | None = None) -> int:
         audit = audit_history(
             rows, spy_ex_dividends=spy_map, vendor_closes=vendor_closes,
             prior_session_of=_prior_session_of,
+            is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
         )
         report["audit"] = audit
         if audit["breach_count"]:
             logger.error(
                 "HISTORICAL INTEGRITY: %d breach(es) over %d sessions — "
                 "TWR closes=%s, benchmark columns agree=%s, vendor anchor=%s "
-                "(%d breach), residual=%d, mark flags=%d, mark divergences=%d",
+                "(%d breach), session axis=%s (%d breach), residual=%d, "
+                "mark flags=%d, mark divergences=%d",
                 audit["breach_count"], audit["n_sessions"],
                 audit["twr_closure"].get("closes"),
                 audit["benchmark_closure"].get("closes"),
                 audit["benchmark_vendor_anchor_status"],
                 len(audit["benchmark_vendor_anchor_breaches"]),
+                audit["session_axis_coverage_status"],
+                len(audit["session_axis_coverage"].get("breaches", [])),
                 len(audit["residual_breaches"]), len(audit["mark_breaches"]),
                 len(audit["mark_divergence_breaches"]),
             )
             exit_code = 1
+
+        if args.flag_non_trading_rows:
+            plans = plan_non_trading_day_flags(rows, audit["session_axis_coverage"])
+            report["non_trading_row_flags"] = {
+                "planned": plans,
+                "n_planned": len(plans),
+            }
+            if args.apply:
+                report["non_trading_row_flags"]["written"] = (
+                    apply_non_trading_day_flags(conn, plans)
+                )
+            elif plans:
+                logger.warning(
+                    "%d non-trading-day row(s) planned to flag and NOT written "
+                    "— rerun with --apply. This is a production data-repo write "
+                    "and must run IN-REGION (EC2), never from a laptop.",
+                    len(plans),
+                )
 
     payload = json.dumps(report, indent=2, default=str)
     if args.json_out:

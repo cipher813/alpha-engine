@@ -14,6 +14,7 @@ from executor.pnl_integrity import (
     TWR_SELF_HEAL_MAX_CORRECTION_PCT,
     check_custodian_marks,
     check_residual_bounds,
+    check_session_axis_coverage,
     gross_net_returns,
     mark_materiality_usd,
     nav_change_implied_returns,
@@ -459,3 +460,111 @@ class TestCustodianMarks:
     def test_absent_nav_cannot_be_graded(self):
         assert check_custodian_marks(
             [_flag("AMD", 479.0, 502.2, 530.13, 225, -5_220.0)], nav=None) == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session-axis coverage — alpha-engine-config-I9615
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A tiny fake calendar over one real week (2026-03-30 Mon → 2026-04-06 Mon),
+# with 2026-04-03 (Good Friday) as its one holiday — the live case the issue
+# measured. Independent of krepis so these tests assert the GATE's logic, not
+# the calendar's.
+import datetime as _dt  # noqa: E402
+
+_FAKE_HOLIDAYS = {"2026-04-03"}
+
+
+def _is_trading_day(date_str: str) -> bool:
+    if date_str in _FAKE_HOLIDAYS:
+        return False
+    return _dt.date.fromisoformat(date_str).weekday() < 5
+
+
+def _next_trading_day(date_str: str) -> str:
+    d = _dt.date.fromisoformat(date_str) + _dt.timedelta(days=1)
+    while not _is_trading_day(d.isoformat()):
+        d += _dt.timedelta(days=1)
+    return d.isoformat()
+
+
+def _axis_rows(*dates: str) -> list[dict]:
+    return [{"date": d} for d in dates]
+
+
+class TestSessionAxisCoverage:
+    def test_a_contiguous_series_closes_clean(self):
+        """2026-04-01, 04-02, 04-06 — Good Friday and the weekend correctly
+        absent."""
+        out = check_session_axis_coverage(
+            _axis_rows("2026-04-01", "2026-04-02", "2026-04-06"),
+            is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        )
+        assert out["closes"] is True
+        assert out["breaches"] == []
+
+    def test_the_live_good_friday_row_is_flagged(self):
+        """The live case: a row exists FOR 2026-04-03, a day the calendar
+        says was never a session."""
+        out = check_session_axis_coverage(
+            _axis_rows("2026-04-02", "2026-04-03", "2026-04-06"),
+            is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        )
+        assert out["closes"] is False
+        kinds = {(b["kind"], b["date"]) for b in out["breaches"]}
+        assert ("non_trading_day_row", "2026-04-03") in kinds
+
+    def test_the_live_missing_session_is_named_by_its_own_date(self):
+        """The live case: 2026-03-12 has no row at all. Named by its own
+        date, not inferred from the pair either side of it."""
+        out = check_session_axis_coverage(
+            _axis_rows("2026-03-30", "2026-03-31", "2026-04-02"),  # 04-01 skipped
+            is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        )
+        assert out["closes"] is False
+        kinds = {(b["kind"], b["date"]) for b in out["breaches"]}
+        assert ("missing_session", "2026-04-01") in kinds
+
+    def test_both_defect_classes_together(self):
+        """A gap AND a spurious row are the SAME defect class — nothing
+        asserts the date axis equals the trading calendar — and both surface
+        from one call."""
+        out = check_session_axis_coverage(
+            _axis_rows("2026-03-30", "2026-04-02", "2026-04-03"),  # 03-31/04-01 missing, 04-03 spurious
+            is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        )
+        kinds = {b["kind"] for b in out["breaches"]}
+        assert "missing_session" in kinds
+        assert "non_trading_day_row" in kinds
+
+    def test_empty_series_is_na_not_pass(self):
+        out = check_session_axis_coverage(
+            [], is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        )
+        assert out["status"] == "n/a"
+        assert out["closes"] is None
+
+    def test_a_single_row_needs_no_walk_but_is_still_checked(self):
+        out = check_session_axis_coverage(
+            _axis_rows("2026-04-01"),
+            is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        )
+        assert out["closes"] is True
+
+        out_holiday = check_session_axis_coverage(
+            _axis_rows("2026-04-03"),
+            is_trading_day=_is_trading_day, next_trading_day=_next_trading_day,
+        )
+        assert out_holiday["closes"] is False
+        assert out_holiday["breaches"][0]["kind"] == "non_trading_day_row"
+
+    def test_a_calendar_lookup_failure_is_its_own_kind_not_a_silent_pass(self):
+        def _boom(_date_str: str) -> bool:
+            raise ValueError("malformed date")
+
+        out = check_session_axis_coverage(
+            _axis_rows("2026-04-01", "2026-04-02"),
+            is_trading_day=_boom, next_trading_day=_next_trading_day,
+        )
+        assert out["closes"] is False
+        assert all(b["kind"] == "calendar_lookup_failed" for b in out["breaches"])
