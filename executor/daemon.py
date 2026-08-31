@@ -41,6 +41,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from nousergon_lib.logging import guard_entrypoint, setup_logging
 
+from executor.correctness_verdict import (
+    evaluate_correctness_verdict,
+    operator_message,
+)
 from executor.daemon_state_logger import get_logger as _get_decision_logger
 from executor.decision_capture import (
     DecisionCaptureWriteError,
@@ -648,6 +652,9 @@ def run_daemon(dry_run: bool = False) -> None:
 
     config = load_config()
     strategy_config = load_strategy_config(config)
+    # sf-pipeline-policy.md 2.3a — establish the correctness verdict for this
+    # session before any order is placed, and log it in both polarities.
+    _prime_correctness_gate(config)
 
     # Preflight: AWS_REGION + S3 bucket reachable. The check_ib_paper_account
     # primitive on the returned preflight instance is reused after IBKRClient
@@ -2128,6 +2135,57 @@ def _execute_exit(
     )
 
 
+#: The §2.3a correctness verdict, evaluated ONCE per daemon process.
+#:
+#: Cached deliberately, mirroring ``main.py``'s ``_executor_params_loaded`` /
+#: ``_executor_params_cache`` pair: the verdict is a property of the weekly
+#: cycle that produced ``config/executor_params.json``, so it cannot change
+#: within a session, and an S3 GET on every entry attempt would put a network
+#: round trip on the intraday hot path for an answer that is already known.
+_correctness_gate_state = None
+_correctness_gate_evaluated = False
+
+
+def _prime_correctness_gate(config: dict):
+    """Evaluate the §2.3a gate once, at daemon start, from the FULL config.
+
+    Primed here rather than lazily at the first entry because the two things
+    the gate needs — ``signals_bucket`` and ``correctness_verdict_gate_mode``
+    — live on the merged ``risk.yaml`` config, and ``_execute_entry`` is only
+    handed ``strategy_config``, which carries neither. Evaluating from the
+    wrong mapping would have read an empty bucket and resolved to a permanent
+    UNKNOWN that looked exactly like a real one.
+
+    Also means the verdict is logged once per session at startup, in both
+    polarities, rather than only when an entry happens to fire — a session
+    with no entries must still say what the verdict was.
+    """
+    global _correctness_gate_state, _correctness_gate_evaluated
+    _correctness_gate_state = evaluate_correctness_verdict(
+        config.get("signals_bucket", ""), config,
+    )
+    _correctness_gate_evaluated = True
+    return _correctness_gate_state
+
+
+def _correctness_gate(strategy_config: dict):
+    """The primed §2.3a gate state — see executor/correctness_verdict.py.
+
+    If :func:`_prime_correctness_gate` never ran (a direct call into
+    ``_execute_entry``, as the unit tests make), this falls back to evaluating
+    from whatever mapping it was given. That fallback reads no bucket and so
+    resolves to UNKNOWN — which BLOCKS under enforce and reports under
+    observe. Fail-closed: an unprimed gate is never an absent gate.
+    """
+    global _correctness_gate_state, _correctness_gate_evaluated
+    if not _correctness_gate_evaluated:
+        _correctness_gate_state = evaluate_correctness_verdict(
+            (strategy_config or {}).get("signals_bucket", ""), strategy_config or {},
+        )
+        _correctness_gate_evaluated = True
+    return _correctness_gate_state
+
+
 def _execute_entry(
     ibkr: IBKRClient,
     conn: sqlite3.Connection,
@@ -2154,6 +2212,24 @@ def _execute_entry(
     current_price = price_state.get("last", 0)
 
     if shares <= 0:
+        return
+
+    # sf-pipeline-policy.md 2.3a rule 4 — the ONE withheld action.
+    #
+    # This is the narrowest point through which every live NEW ENTRY passes, so
+    # it is where the withholding belongs: a gate at plan time would still let
+    # the daemon place from an order book authored by an earlier planner run
+    # (`_reconcile_executing_entries`). Nothing in the EXIT path is gated, and
+    # that is deliberate -- see the module docstring. Blocking an exit would
+    # not withhold a guarantee, it would strip the risk management off a book
+    # sized by exactly the parameters in doubt.
+    #
+    # Ships in OBSERVE mode (2.3a 7a): `blocks_new_entries` is False unless
+    # risk.yaml sets `correctness_verdict_gate_mode: enforce`, so this branch
+    # cannot be taken on the guard's first production run.
+    _gate = _correctness_gate(strategy_config)
+    if _gate.blocks_new_entries:
+        logger.error("ENTRY WITHHELD %s: %s", ticker, operator_message(_gate))
         return
 
     logger.info(
