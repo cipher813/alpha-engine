@@ -8,6 +8,7 @@ that puts a cost line, a dividend line and a total-return benchmark onto the
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -450,3 +451,263 @@ def test_apply_non_trading_day_flags_is_idempotent():
               "breach": {"kind": "non_trading_day_row", "date": "2026-04-03"}}]
     assert B.apply_non_trading_day_flags(conn, plans) == 1
     assert B.apply_non_trading_day_flags(conn, plans) == 0  # already flagged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Restating the historical NAV series — alpha-engine-config-I9629
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The fixture is the measured AMD 2026-08-04 instance: 700 shares, broker MV
+# $116,700 against a settled MV of $107,794, on a $1,036,000 NAV. Materiality is
+# max($500, 15bp) = $1,554 and the correction bound is max($10,000, 100bp) =
+# $10,360, so the -$8,906 correction is material AND inside the bound — the same
+# two verdicts the live path reaches.
+
+_AMD_SNAP = ('{"AMD": {"shares": 700, "market_value": 107794.0, '
+             '"ib_market_value": 116700.0}, '
+             '"OK": {"shares": 100, "market_value": 50000.0, '
+             '"ib_market_value": 50050.0}}')
+_CLEAN_SNAP = ('{"OK": {"shares": 100, "market_value": 50000.0, '
+               '"ib_market_value": 50050.0}}')
+
+_NAV_0, _NAV_1, _NAV_2 = 1_000_000.0, 1_036_000.0, 1_040_000.0
+_CORRECTION = 107_794.0 - 116_700.0          # -8,906.00
+_NAV_1_NEW = _NAV_1 + _CORRECTION            # 1,027,094.00
+
+
+def _mark_conn(path=":memory:"):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE eod_pnl (date TEXT PRIMARY KEY, portfolio_nav REAL, "
+        "daily_return_pct REAL, spy_return_pct REAL, daily_alpha_pct REAL, "
+        "positions_snapshot TEXT, nav_ib_raw_usd REAL, "
+        "nav_mark_correction_usd REAL, nav_mark_correction_json TEXT)"
+    )
+    r1 = (_NAV_1 - _NAV_0) / _NAV_0 * 100.0
+    r2 = (_NAV_2 - _NAV_1) / _NAV_1 * 100.0
+    conn.executemany(
+        "INSERT INTO eod_pnl (date, portfolio_nav, daily_return_pct, "
+        "spy_return_pct, daily_alpha_pct, positions_snapshot) VALUES (?,?,?,?,?,?)",
+        [
+            ("2026-08-03", _NAV_0, None, 0.1, None, _CLEAN_SNAP),
+            ("2026-08-04", _NAV_1, r1, 0.1, r1 - 0.1, _AMD_SNAP),
+            ("2026-08-05", _NAV_2, r2, 0.1, r2 - 0.1, _CLEAN_SNAP),
+        ],
+    )
+    conn.commit()
+    return conn
+
+
+def test_reconstructed_inputs_carry_the_degenerate_range_and_the_live_materiality():
+    """The only bound the persisted data justifies is [close, close] — see §5."""
+    row = {"date": "2026-08-04", "portfolio_nav": _NAV_1,
+           "positions_snapshot": _AMD_SNAP}
+    got = B.reconstruct_mark_correction_inputs(row)
+    assert [f["ticker"] for f in got["flags"]] == ["AMD"]      # OK is immaterial
+    assert got["flags"][0]["ib_mark"] == pytest.approx(116_700.0 / 700)
+    assert got["settled_closes"]["AMD"] == pytest.approx(107_794.0 / 700)
+    assert got["day_low"]["AMD"] == got["day_high"]["AMD"] == pytest.approx(
+        got["settled_closes"]["AMD"]
+    )
+    assert got["flags"][0]["materiality_usd"] == pytest.approx(1_554.0)
+
+
+def test_a_name_without_ib_market_value_is_named_and_skipped_never_zeroed():
+    """Most of the history is pre-schema-2.1. Silence there would read as clean."""
+    row = {"date": "2026-06-02", "portfolio_nav": 1_000_000.0,
+           "positions_snapshot": '{"MU": {"shares": 100, "market_value": 50000.0}}'}
+    got = B.reconstruct_mark_correction_inputs(row)
+    assert got["flags"] == []
+    assert got["refused"][0]["ticker"] == "MU"
+    assert "pre-schema-2.1" in got["refused"][0]["reason"]
+
+
+def test_an_unparseable_snapshot_is_named_and_skipped():
+    row = {"date": "2026-06-02", "portfolio_nav": 1_000_000.0,
+           "positions_snapshot": "{not json"}
+    got = B.reconstruct_mark_correction_inputs(row)
+    assert got["flags"] == []
+    assert got["refused"] == [{
+        "date": "2026-06-02", "ticker": None,
+        "reason": "positions_snapshot absent or unparseable — the session "
+                  "cannot be examined and is NOT reported as clean",
+    }]
+
+
+def test_a_row_without_nav_is_named_and_skipped():
+    row = {"date": "2026-06-02", "portfolio_nav": None,
+           "positions_snapshot": _AMD_SNAP}
+    got = B.reconstruct_mark_correction_inputs(row)
+    assert got["flags"] == []
+    assert "no portfolio_nav" in got["refused"][0]["reason"]
+
+
+def test_plan_restates_the_nav_and_labels_the_basis_reconstructed():
+    plan = B.plan_historical_mark_restatement(B._rows(_mark_conn()))
+    assert len(plan["restatements"]) == 1
+    r = plan["restatements"][0]
+    assert r["date"] == "2026-08-04"
+    assert r["nav_ib_raw_usd"] == pytest.approx(_NAV_1)
+    assert r["portfolio_nav"] == pytest.approx(_NAV_1_NEW)
+    assert r["nav_mark_correction_usd"] == pytest.approx(_CORRECTION)
+    assert r["tickers"] == ["AMD"]
+    payload = r["nav_mark_correction_json"]
+    assert payload["basis"] == B.MARK_BASIS_RECONSTRUCTED
+    assert payload["discriminator_evaluated"] is False
+    assert "UPPER BOUND" in payload["instrument"]
+
+
+def test_the_basis_label_distinguishes_a_restated_row_from_a_live_corrected_one():
+    """A consumer tells the two apart by reading one field, never by guessing."""
+    plan = B.plan_historical_mark_restatement(B._rows(_mark_conn()))
+    assert plan["restatements"][0]["nav_mark_correction_json"]["basis"] == (
+        B.MARK_BASIS_RECONSTRUCTED
+    )
+    assert B.MARK_BASIS_LIVE == "live_gate"
+    assert B.MARK_BASIS_RECONSTRUCTED != B.MARK_BASIS_LIVE
+
+
+def test_the_chain_moves_both_the_corrected_session_and_the_one_after_it():
+    plan = B.plan_historical_mark_restatement(B._rows(_mark_conn()))
+    moved = {c["date"]: c for c in plan["chain"]}
+    assert sorted(moved) == ["2026-08-04", "2026-08-05"]
+    c1, c2 = moved["2026-08-04"], moved["2026-08-05"]
+    assert c1["daily_return_pct_to"] == pytest.approx(
+        (_NAV_1_NEW - _NAV_0) / _NAV_0 * 100.0
+    )
+    assert c1["daily_alpha_pct_to"] == pytest.approx(c1["daily_return_pct_to"] - 0.1)
+    # session t+1's NAV never moved; its return moved because its BASE did
+    assert c2["nav_from"] == c2["nav_to"] == pytest.approx(_NAV_2)
+    assert c2["daily_return_pct_to"] == pytest.approx(
+        (_NAV_2 - _NAV_1_NEW) / _NAV_1_NEW * 100.0
+    )
+    assert c2["daily_alpha_pct_to"] == pytest.approx(c2["daily_return_pct_to"] - 0.1)
+
+
+def test_the_chain_refuses_a_row_whose_alpha_cannot_move_alongside():
+    conn = _mark_conn()
+    conn.execute("UPDATE eod_pnl SET spy_return_pct=NULL WHERE date='2026-08-05'")
+    conn.commit()
+    plan = B.plan_historical_mark_restatement(B._rows(conn))
+    assert [c["date"] for c in plan["chain"]] == ["2026-08-04"]
+    assert plan["chain_refused"][0]["date"] == "2026-08-05"
+    assert "internally inconsistent" in plan["chain_refused"][0]["reason"]
+
+
+def test_a_stored_return_that_already_disagreed_with_its_nav_chain_is_named():
+    conn = _mark_conn()
+    conn.execute("UPDATE eod_pnl SET daily_return_pct=99.0 WHERE date='2026-08-05'")
+    conn.commit()
+    plan = B.plan_historical_mark_restatement(B._rows(conn))
+    assert [m["date"] for m in plan["chain_basis_mismatch"]] == ["2026-08-05"]
+    assert plan["chain_basis_mismatch"][0]["stored_daily_return_pct"] == 99.0
+
+
+def test_a_correction_over_the_bound_is_refused_not_applied():
+    """max($10,000, 100bp) — a disagreement that size is a different book."""
+    conn = _mark_conn()
+    conn.execute(
+        "UPDATE eod_pnl SET positions_snapshot=? WHERE date='2026-08-04'",
+        ('{"AMD": {"shares": 700, "market_value": 100000.0, '
+         '"ib_market_value": 200000.0}}',),
+    )
+    conn.commit()
+    plan = B.plan_historical_mark_restatement(B._rows(conn))
+    assert plan["restatements"] == []
+    assert plan["chain"] == []
+    refused = [r for r in plan["refused"] if r.get("refused_by_bound")]
+    assert refused and "REFUSED" in refused[0]["reason"]
+
+
+def test_a_row_already_restated_by_the_live_path_is_left_alone():
+    """The live 2026-08-31 DUOL row: non-null nav_mark_correction_json → no-op."""
+    conn = _mark_conn()
+    conn.execute(
+        "UPDATE eod_pnl SET nav_ib_raw_usd=?, nav_mark_correction_usd=?, "
+        "nav_mark_correction_json=? WHERE date='2026-08-04'",
+        (_NAV_1, _CORRECTION, '{"basis": "live_gate"}'),
+    )
+    conn.commit()
+    plan = B.plan_historical_mark_restatement(B._rows(conn))
+    assert plan["restatements"] == []
+    assert plan["chain"] == []
+    assert [a["date"] for a in plan["already_restated"]] == ["2026-08-04"]
+    assert plan["already_restated"][0]["basis"] == B.MARK_BASIS_LIVE
+
+
+def test_apply_writes_the_nav_the_original_and_the_chain():
+    conn = _mark_conn()
+    plan = B.plan_historical_mark_restatement(B._rows(conn))
+    assert B.apply_historical_mark_restatement(conn, plan) == {
+        "nav_rows_written": 1, "chain_rows_written": 2,
+    }
+    nav, raw, corr, payload, ret, alpha = conn.execute(
+        "SELECT portfolio_nav, nav_ib_raw_usd, nav_mark_correction_usd, "
+        "nav_mark_correction_json, daily_return_pct, daily_alpha_pct "
+        "FROM eod_pnl WHERE date='2026-08-04'"
+    ).fetchone()
+    assert nav == pytest.approx(_NAV_1_NEW)
+    assert raw == pytest.approx(_NAV_1)          # reversible from the ledger alone
+    assert corr == pytest.approx(_CORRECTION)
+    import json as _json
+    assert _json.loads(payload)["basis"] == B.MARK_BASIS_RECONSTRUCTED
+    assert ret == pytest.approx((_NAV_1_NEW - _NAV_0) / _NAV_0 * 100.0)
+    assert alpha == pytest.approx(ret - 0.1)
+    nxt = conn.execute(
+        "SELECT daily_return_pct FROM eod_pnl WHERE date='2026-08-05'"
+    ).fetchone()[0]
+    assert nxt == pytest.approx((_NAV_2 - _NAV_1_NEW) / _NAV_1_NEW * 100.0)
+
+
+def test_apply_is_idempotent():
+    conn = _mark_conn()
+    B.apply_historical_mark_restatement(
+        conn, B.plan_historical_mark_restatement(B._rows(conn))
+    )
+    second = B.plan_historical_mark_restatement(B._rows(conn))
+    assert second["restatements"] == []
+    assert second["chain"] == []
+    assert B.apply_historical_mark_restatement(conn, second) == {
+        "nav_rows_written": 0, "chain_rows_written": 0,
+    }
+
+
+def _seed_file_db(tmp_path):
+    path = str(tmp_path / "trades.db")
+    _mark_conn(path).close()
+    return path
+
+
+def test_cli_dry_run_is_the_default_and_writes_nothing(tmp_path, capsys):
+    path = _seed_file_db(tmp_path)
+    assert B.main(["--db", path, "--restate-marks"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["applied"] is False
+    assert out["mark_restatement"]["status"] == "planned"
+    assert out["mark_restatement"]["sessions_restated"] == 1
+    assert out["mark_restatement"]["downstream_rows_moved"] == 2
+    conn = sqlite3.connect(path)
+    assert conn.execute(
+        "SELECT portfolio_nav, nav_ib_raw_usd FROM eod_pnl WHERE date='2026-08-04'"
+    ).fetchone() == (pytest.approx(_NAV_1), None)
+
+
+def test_cli_apply_restates_and_a_second_run_is_a_no_op(tmp_path, capsys):
+    path = _seed_file_db(tmp_path)
+    assert B.main(["--db", path, "--restate-marks", "--apply"]) == 0
+    first = json.loads(capsys.readouterr().out)["mark_restatement"]
+    assert first["nav_rows_written"] == 1
+    assert first["chain_rows_written"] == 2
+    assert B.main(["--db", path, "--restate-marks", "--apply"]) == 0
+    second = json.loads(capsys.readouterr().out)["mark_restatement"]
+    assert second["nav_rows_written"] == 0
+    assert second["chain_rows_written"] == 0
+    assert second["sessions_restated"] == 0
+    assert [a["date"] for a in second["already_restated"]] == ["2026-08-04"]
+
+
+def test_cli_no_flags_does_not_select_the_restatement_leg():
+    """The one leg that rewrites a published NAV is never on by default."""
+    assert B._build_parser().parse_args([]).restate_marks is False
+    assert B._build_parser().parse_args(["--restate-marks"]).restate_marks is True
+    assert B._build_parser().parse_args([]).apply is False
