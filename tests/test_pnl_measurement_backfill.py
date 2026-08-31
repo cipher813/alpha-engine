@@ -343,3 +343,110 @@ def test_mark_divergence_needs_both_marks():
     row = {"date": "2026-08-04", "portfolio_nav": 1_000_000.0,
            "positions_snapshot": '{"X": {"market_value": 100000.0}}'}
     assert B.reconstruct_mark_divergences(row) == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session-axis coverage in the retroactive audit — alpha-engine-config-I9615
+# ─────────────────────────────────────────────────────────────────────────────
+
+import datetime as _dt  # noqa: E402
+
+_FAKE_HOLIDAYS = {"2026-04-03"}
+
+
+def _fake_is_trading_day(date_str: str) -> bool:
+    if date_str in _FAKE_HOLIDAYS:
+        return False
+    return _dt.date.fromisoformat(date_str).weekday() < 5
+
+
+def _fake_next_trading_day(date_str: str) -> str:
+    d = _dt.date.fromisoformat(date_str) + _dt.timedelta(days=1)
+    while not _fake_is_trading_day(d.isoformat()):
+        d += _dt.timedelta(days=1)
+    return d.isoformat()
+
+
+def test_audit_history_reports_coverage_not_evaluated_without_a_calendar():
+    """A gate that did not run has not agreed with anything — same convention
+    as the vendor anchor's own NOT EVALUATED status."""
+    audit = B.audit_history(
+        [_row("2026-04-02", 100.0, None), _row("2026-04-03", 100.0, 0.0)],
+    )
+    assert audit["session_axis_coverage_status"].startswith("NOT EVALUATED")
+    assert audit["session_axis_coverage"]["breaches"] == []
+
+
+def test_audit_history_flags_the_live_good_friday_row():
+    audit = B.audit_history(
+        [_row("2026-04-02", 100.0, None), _row("2026-04-03", 100.0, 0.0)],
+        is_trading_day=_fake_is_trading_day, next_trading_day=_fake_next_trading_day,
+    )
+    assert audit["session_axis_coverage_status"] == "evaluated"
+    kinds = {(b["kind"], b["date"]) for b in audit["session_axis_coverage"]["breaches"]}
+    assert ("non_trading_day_row", "2026-04-03") in kinds
+    assert audit["breach_count"] >= 1
+
+
+def test_plan_non_trading_day_flags_only_takes_that_breach_kind():
+    coverage = {
+        "breaches": [
+            {"kind": "non_trading_day_row", "date": "2026-04-03", "message": "x"},
+            {"kind": "missing_session", "date": "2026-03-12", "message": "y"},
+        ],
+    }
+    plans = B.plan_non_trading_day_flags([], coverage)
+    assert [p["date"] for p in plans] == ["2026-04-03"]
+    assert plans[0]["breach"]["kind"] == "non_trading_day_row"
+
+
+def _axis_flag_conn():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE eod_pnl (date TEXT PRIMARY KEY, integrity_breach_json TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO eod_pnl (date, integrity_breach_json) VALUES (?,?)",
+        [("2026-04-03", None), ("2026-08-04", '[{"kind": "residual_breach"}]')],
+    )
+    conn.commit()
+    return conn
+
+
+def test_apply_non_trading_day_flags_writes_a_fresh_breach_list():
+    conn = _axis_flag_conn()
+    plans = [{"date": "2026-04-03",
+              "breach": {"kind": "non_trading_day_row", "date": "2026-04-03"}}]
+    assert B.apply_non_trading_day_flags(conn, plans) == 1
+    import json as _json
+    stored = _json.loads(
+        conn.execute(
+            "SELECT integrity_breach_json FROM eod_pnl WHERE date='2026-04-03'"
+        ).fetchone()[0]
+    )
+    assert stored == [{"kind": "non_trading_day_row", "date": "2026-04-03"}]
+
+
+def test_apply_non_trading_day_flags_merges_never_overwrites():
+    """A session already carrying a residual breach must keep it — this is an
+    ADDITIVE flag, not a replace."""
+    conn = _axis_flag_conn()
+    plans = [{"date": "2026-08-04",
+              "breach": {"kind": "non_trading_day_row", "date": "2026-08-04"}}]
+    assert B.apply_non_trading_day_flags(conn, plans) == 1
+    import json as _json
+    stored = _json.loads(
+        conn.execute(
+            "SELECT integrity_breach_json FROM eod_pnl WHERE date='2026-08-04'"
+        ).fetchone()[0]
+    )
+    kinds = {b["kind"] for b in stored}
+    assert kinds == {"residual_breach", "non_trading_day_row"}
+
+
+def test_apply_non_trading_day_flags_is_idempotent():
+    conn = _axis_flag_conn()
+    plans = [{"date": "2026-04-03",
+              "breach": {"kind": "non_trading_day_row", "date": "2026-04-03"}}]
+    assert B.apply_non_trading_day_flags(conn, plans) == 1
+    assert B.apply_non_trading_day_flags(conn, plans) == 0  # already flagged

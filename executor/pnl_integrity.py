@@ -1663,3 +1663,161 @@ def check_benchmark_vendor_anchor(
                 ),
             })
     return breaches
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Session-axis coverage — the eod_pnl date axis IS the trading calendar
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# alpha-engine-config-I9615. ``benchmark_implied_returns`` above already
+# computes a per-PAIR ``contiguous`` flag and excludes a non-contiguous pair
+# from both benchmark chains — but that check is private to the benchmark
+# gate. ``verify_twr_closes`` and ``verify_nav_change_basis_closes`` chain-link
+# the SAME date axis and check contiguity NOT AT ALL: they would silently
+# chain across the exact three gaps this issue measured (2026-03-12 and
+# 2026-07-27 missing; 2026-04-03 — Good Friday — an extra row) had those gaps
+# happened to move ``daily_return_pct``/``nav_change_usd`` enough to breach
+# tolerance. Per the issue's deliverable 3, this lifts the contiguity test
+# itself into a standalone, NAMED, breachable condition every chained gate can
+# call, rather than each one rediscovering it independently (or not).
+#
+# This is DETECTION ONLY. It never drops, reorders or synthesizes a row — the
+# caller decides what a breach means (see ``pnl_measurement_backfill``'s
+# ``plan_non_trading_day_flags``, which turns a ``non_trading_day_row`` breach
+# into a persisted, reviewable flag rather than a silent delete: "Retain all
+# archives" applies to a spurious row as much as a correct one, and the
+# production write is a manual, in-region call in any case).
+def check_session_axis_coverage(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    is_trading_day: Any,
+    next_trading_day: Any,
+) -> dict[str, Any]:
+    """Assert the persisted ``date`` axis is exactly the NYSE trading calendar.
+
+    ``rows`` is the eod_pnl series in any order; only ``date`` is read. Pass
+    ``krepis.trading_calendar.is_trading_day`` / ``.next_trading_day`` (or
+    ``nousergon_lib.trading_calendar``'s re-export) as string-in/string-or-bool
+    -out callables: ``is_trading_day(date_str) -> bool``,
+    ``next_trading_day(date_str) -> date_str``. This module stays pure — it
+    never imports a calendar itself, matching ``prior_session_of`` elsewhere in
+    this file.
+
+    Two breach kinds, named separately because they are different mistakes:
+
+    ``non_trading_day_row``
+        A persisted row for a date the calendar says was never a session — the
+        live 2026-04-03 case (Good Friday). Every gate that chain-links
+        adjacent rows as adjacent sessions treats it as a real trading day.
+
+    ``missing_session``
+        A trading session between the first and last persisted date with no
+        row at all — the live 2026-03-12 and 2026-07-27 cases. Enumerated by
+        walking ``next_trading_day`` across the full window, so a gap is named
+        by its OWN date rather than inferred from the pair that straddles it.
+
+    A calendar-lookup failure on one row is NOT silently absorbed into either
+    "covered" or "not covered" — it is its own breach kind
+    (``calendar_lookup_failed``) so a malformed date string is visible rather
+    than indistinguishable from a clean session.
+
+    ``status`` is ``"n/a"`` on an empty series (nothing to walk).
+    """
+    dated = sorted({str(r["date"]) for r in rows if r.get("date")})
+    if not dated:
+        return {"status": "n/a", "closes": None, "breaches": []}
+
+    breaches: list[dict[str, Any]] = []
+
+    for d in dated:
+        try:
+            trading = bool(is_trading_day(d))
+        except Exception as exc:  # noqa: BLE001
+            # (a) swallowed: a calendar lookup on a malformed persisted date;
+            # (b) survives: every other date is still checked; (c) recorded:
+            # its own breach kind, never folded into "not a trading day".
+            logger.warning("[session_axis] is_trading_day failed for %s", d)
+            breaches.append({
+                "kind": "calendar_lookup_failed",
+                "date": d,
+                "reason": str(exc),
+                "message": f"Calendar lookup failed for persisted date {d}: {exc}",
+            })
+            continue
+        if not trading:
+            breaches.append({
+                "kind": "non_trading_day_row",
+                "date": d,
+                "message": (
+                    f"eod_pnl carries a row for {d}, which the NYSE trading "
+                    "calendar says was never a session. Every chain-linked "
+                    "gate (TWR closure, nav_change basis, benchmark closure) "
+                    "treats adjacent rows as adjacent sessions unless this row "
+                    "is excluded — it contributes a spurious session to all "
+                    "of them."
+                ),
+            })
+
+    if len(dated) >= 2:
+        cursor = dated[0]
+        present = set(dated)
+        seen = {cursor}
+        while cursor < dated[-1]:
+            try:
+                nxt = str(next_trading_day(cursor))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[session_axis] next_trading_day failed for %s", cursor)
+                breaches.append({
+                    "kind": "calendar_lookup_failed",
+                    "date": cursor,
+                    "reason": str(exc),
+                    "message": f"Calendar lookup failed walking forward from {cursor}: {exc}",
+                })
+                break
+            if nxt in seen:
+                # A calendar that does not advance would spin forever; treat as
+                # a lookup failure rather than looping.
+                breaches.append({
+                    "kind": "calendar_lookup_failed",
+                    "date": nxt,
+                    "reason": "next_trading_day did not advance",
+                    "message": (
+                        f"next_trading_day({cursor}) returned a date already "
+                        "seen while walking the window — refusing to loop."
+                    ),
+                })
+                break
+            cursor = nxt
+            seen.add(cursor)
+            if cursor > dated[-1]:
+                break
+            if cursor not in present:
+                breaches.append({
+                    "kind": "missing_session",
+                    "date": cursor,
+                    "message": (
+                        f"NYSE trading session {cursor} has no eod_pnl row. "
+                        "Every chain-linked gate treats its neighbors as "
+                        "adjacent sessions unless this gap is named — it is "
+                        "what let a two-session close-price move be compared "
+                        "against a one-session stored return."
+                    ),
+                })
+
+    return {
+        "status": "ok",
+        "closes": not breaches,
+        "first_date": dated[0],
+        "last_date": dated[-1],
+        "n_rows": len(dated),
+        "breaches": breaches,
+        "message": (
+            "eod_pnl date axis matches the NYSE trading calendar exactly over "
+            f"{dated[0]} → {dated[-1]} ({len(dated)} sessions)."
+            if not breaches else
+            f"eod_pnl date axis diverges from the NYSE trading calendar over "
+            f"{dated[0]} → {dated[-1]}: {len(breaches)} breach(es) — "
+            + ", ".join(f"{b['kind']}:{b['date']}" for b in breaches[:8])
+            + ("" if len(breaches) <= 8 else f" (+{len(breaches) - 8} more)")
+        ),
+    }
