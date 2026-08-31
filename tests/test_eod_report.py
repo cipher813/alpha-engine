@@ -442,7 +442,7 @@ class TestBuildEodReport:
     def test_schema_version_is_2_6(self):
         """2.6 (alpha-engine-config-I9085): position rows gain
         `mark_basis_usd` + `ib_mark_off_close_pct`. Additive only."""
-        assert SCHEMA_VERSION == "2.6"
+        assert SCHEMA_VERSION == "2.7"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -494,7 +494,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.6"
+        assert report["schema_version"] == "2.7"
         # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
         # and the integrity-gate verdict reach the artifact. Before this the
         # only cost figure anywhere in the P&L path was the portfolio
@@ -503,6 +503,10 @@ class TestBuildEodReport:
             "commission_usd", "commission_available", "slippage_usd",
             "slippage_bps", "traded_notional_usd", "total_cost_usd",
             "daily_return_net_pct", "daily_return_gross_pct",
+            # I8188 second pass: an absent commission suppresses the gross
+            # return rather than publishing one with a $0.00 commission leg,
+            # and the artifact carries WHY it is absent.
+            "gross_available", "gross_unavailable_reason",
         }
         assert report["integrity"]["breaches"] == []
         assert report["integrity"]["spy_return_basis"] == "total_return"

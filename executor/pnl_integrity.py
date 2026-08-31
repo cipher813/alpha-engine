@@ -268,11 +268,20 @@ def session_costs(trades_today: Iterable[Mapping[str, Any]] | None) -> dict[str,
         Gross-of-cost return is therefore explicitly hypothetical and labelled
         as such.
 
-    ``commission_available`` is False when no filled row carried a commission
-    figure — fail loud: a $0 commission line and an ABSENT commission line are
-    different facts and must not render identically. The pre-existing code
-    treated the absence as "paper-account commissions are trivial" and dropped
-    it silently, which is exactly how the cost line came not to exist.
+    ``commission_available`` is False when fills executed and no filled row
+    carried a commission figure — fail loud: a $0 commission line and an ABSENT
+    commission line are different facts and must not render identically. The
+    pre-existing code treated the absence as "paper-account commissions are
+    trivial" and dropped it silently, which is exactly how the cost line came
+    not to exist.
+
+    ``commission_usd`` is therefore ``None`` — never ``0.0`` — on that path
+    (alpha-engine-config-I8188 deliverable 2, second pass). Returning the flag
+    beside a 0.0 was the same defect one layer down: the flag lived only in a
+    ``data_warnings`` string while the PERSISTED column read a measured zero,
+    and it did so on 1 of the first 6 live sessions. A session with NO fills
+    keeps ``0.0``, which is a real measurement: nothing traded, so nothing was
+    charged.
     """
     n_fills = 0
     n_with_commission = 0
@@ -323,8 +332,12 @@ def session_costs(trades_today: Iterable[Mapping[str, Any]] | None) -> dict[str,
         side = 1.0 if action in _BUY_ACTIONS else -1.0
         slippage += side * shares * (fill_price - arrival)
 
+    commission_available = n_fills == 0 or n_with_commission > 0
     return {
-        "commission_usd": commission,
+        # None, not 0.0, when fills executed and IB attached no commission to
+        # any of them. See the docstring: a rendered zero is indistinguishable
+        # from a measured one, which is the defect class this module exists for.
+        "commission_usd": commission if commission_available else None,
         "slippage_usd": slippage,
         "traded_notional_usd": notional,
         "n_fills": n_fills,
@@ -334,7 +347,7 @@ def session_costs(trades_today: Iterable[Mapping[str, Any]] | None) -> dict[str,
         # rather than leaving it absent — the caller surfaces these.
         "n_fills_unclassified_action": n_unclassified,
         "n_fills_without_arrival_price": n_no_arrival,
-        "commission_available": n_fills == 0 or n_with_commission > 0,
+        "commission_available": commission_available,
         "slippage_bps": (slippage / notional * 10_000.0) if notional else None,
     }
 
@@ -343,35 +356,66 @@ def gross_net_returns(
     *,
     nav_change_usd: float | None,
     prior_nav: float | None,
-    commission_usd: float,
+    commission_usd: float | None,
     slippage_usd: float,
-) -> dict[str, float | None]:
+) -> dict[str, Any]:
     """Split the day's return into net-of-cost and gross-of-cost.
 
     ``daily_return_net_pct`` is the return the book actually earned — the
     existing ``daily_return_pct``, restated under a name that says which side
     of costs it is on. Commissions have already debited NAV and fills already
-    happened at the fill price, so the NAV-based number IS net.
+    happened at the fill price, so the NAV-based number IS net. It does NOT
+    depend on the commission being known, and is therefore published whenever
+    there is a prior NAV.
 
     ``daily_return_gross_pct`` adds both cost lines back: the return the same
     decisions would have produced with zero commission and zero implementation
     shortfall. It is a counterfactual, not a second measurement of the book —
     the shortfall leg never touched NAV.
 
-    Both are None when there is no prior NAV (first session).
+    ``commission_usd=None`` means the commission is ABSENT, not zero
+    (``session_costs`` returns None when fills executed and IB attached no
+    commissionReport). Gross is then ``None`` with ``gross_unavailable_reason``
+    set, rather than a gross figure computed as though the missing leg were
+    $0.00 — that number would be a net return wearing a gross label, and would
+    understate the cost of implementation by exactly the amount nobody
+    measured. ``total_cost_usd`` is None on the same path for the same reason.
+
+    Both returns are None when there is no prior NAV (first session).
     """
+    total_cost = (
+        commission_usd + slippage_usd if commission_usd is not None else None
+    )
+    reason = (
+        None if commission_usd is not None
+        else "commission absent (no commissionReport on any fill) — a gross "
+             "return computed with a $0.00 commission leg would be a net "
+             "return wearing a gross label"
+    )
     if nav_change_usd is None or not prior_nav:
         return {
             "daily_return_net_pct": None,
             "daily_return_gross_pct": None,
-            "total_cost_usd": commission_usd + slippage_usd,
+            "total_cost_usd": total_cost,
+            "gross_available": False,
+            "gross_unavailable_reason": reason or "no prior NAV (first session)",
         }
     net = nav_change_usd / prior_nav * 100.0
+    if commission_usd is None:
+        return {
+            "daily_return_net_pct": net,
+            "daily_return_gross_pct": None,
+            "total_cost_usd": None,
+            "gross_available": False,
+            "gross_unavailable_reason": reason,
+        }
     gross = (nav_change_usd + commission_usd + slippage_usd) / prior_nav * 100.0
     return {
         "daily_return_net_pct": net,
         "daily_return_gross_pct": gross,
-        "total_cost_usd": commission_usd + slippage_usd,
+        "total_cost_usd": total_cost,
+        "gross_available": True,
+        "gross_unavailable_reason": None,
     }
 
 
@@ -1068,4 +1112,361 @@ def check_attribution_closure(
             "day-over-day three-way gate and is invisible to it."
         ),
     })
+    return breaches
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. The BENCHMARK leg — the half of alpha nothing verified
+#    (alpha-engine-config-I8188 defects 1 and 3, second pass)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY. Every gate above bounds the PORTFOLIO leg. ``plan_twr_self_heal`` states
+# the exclusion in its own docstring — "``spy_return_pct``/``daily_alpha_pct``
+# are NOT touched". Correct as a self-heal rule (the persisted NAV is not
+# ground truth for the benchmark) and it left the benchmark leg with NO check
+# of any kind. ``daily_alpha_pct`` is ``daily_return_pct − spy_return_pct``, so
+# half of every alpha figure the system publishes came from a series nothing
+# verified against anything.
+#
+# MEASURED 2026-08-31 over the full 120-session ``eod_pnl.csv`` history
+# (2026-03-09 → 2026-08-28), and the two internal columns DISAGREE:
+#
+#     chain-linked stored spy_return_pct      = +15.5242%
+#     persisted spy_close, first → last       = +13.7425%
+#     gap                                     = **178.2bp**
+#
+# — 10.2x defect 4's 17.4bp portfolio TWR drift, on the other leg.
+#
+# THE OBVIOUS FIX WAS WRONG, and this comment records that because the wrong
+# version would have looked right. The gap localises almost entirely to ONE
+# pair, 2026-03-11 → 2026-03-13: stored ``spy_return_pct = −0.5660%`` against a
+# close-implied −2.0759%. That is the exact shape of defect 4 (a stale stored
+# return after an upstream correction), so the first draft of this module made
+# ``spy_close`` ground truth and rewrote the stored return to match. Checked
+# against the vendor before shipping: SPY closed 666.06 on 2026-03-12 and
+# 662.29 on 2026-03-13, i.e. −0.5660%. **The stored return was right.**
+#
+# Two real defects were hiding under it, and neither is a stale value:
+#
+#   (a) A SESSION-COVERAGE GAP. ``eod_pnl`` has no 2026-03-12 row at all, so
+#       the close-implied leg silently spanned two sessions while the stored
+#       leg spanned one. Three such pairs exist over the history — 2026-03-12
+#       and 2026-07-27 are missing sessions, and 2026-04-03 (Good Friday)
+#       carries a row for a day the market never opened. This is I9025's cause
+#       (b) again, on a third pair of series.
+#
+#   (b) THE ``spy_close`` COLUMN IS NOT ONE SERIES. Every persisted close
+#       through 2026-03-19 sits exactly **−0.272%** below the vendor's, and
+#       every close from 2026-03-20 matches it to 0.000%. 0.272% is
+#       $1.797 / $659.80 — SPY's 2026-03-20 distribution. The early rows are
+#       dividend-BACK-ADJUSTED and the later ones are raw: the basis changes
+#       mid-column. A constant offset cancels inside a ratio, which is why 118
+#       of 119 pairs agree to a median of exactly 0.0bp and nothing ever
+#       surfaced it.
+#
+# So neither internal column can be ground truth for the other, and a gate
+# built from the two of them can only ever say that they disagree. The
+# resolution is the one ``check_attribution_closure`` already uses for the NAV:
+# a SECOND, INDEPENDENT measurement. ``check_benchmark_vendor_anchor`` compares
+# both persisted columns against the vendor's own price series and its declared
+# cash distributions, which is a quantity neither column can define into
+# agreement.
+#
+# PROVENANCE of the anchor: Polygon ``/v2/aggs`` daily closes and
+# ``/v3/reference/dividends`` (``ex_dividend_date`` + ``cash_amount``) — the
+# same vendor and the same vendored ``PolygonClient`` the live
+# ``executor.dividends.fetch_ex_dividends`` path already uses for the
+# total-return leg. Two SPY distributions fall in the live window: 2026-03-20
+# at $1.796999 and 2026-06-18 at $1.903516 per share.
+BENCHMARK_CHAIN_TOLERANCE_BPS = 1.0
+# Per-row divergence between a persisted close and the vendor's. 5bp is well
+# inside a real quote difference and well outside the 0.0bp the 112 same-basis
+# rows actually show; the 8 back-adjusted rows sit at 27.2bp.
+BENCHMARK_CLOSE_DIVERGENCE_TOLERANCE_BPS = 5.0
+# Whole-window drift of the chain-linked stored return against the vendor's
+# total-return index. 25bp is ~1.5x the portfolio leg's own historical worst
+# (17.4bp) and 7x below the 178bp this gate was built on.
+BENCHMARK_ANCHOR_TOLERANCE_BPS = 25.0
+
+
+def _f(value: Any) -> float | None:
+    """Float or None — never a silent 0.0 for an absent value."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def benchmark_implied_returns(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    ex_dividends: Mapping[str, float] | None = None,
+    prior_session_of: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Per row: the SPY total return its own persisted closes imply, and whether
+    the pair those closes span is CONTIGUOUS.
+
+    ``rows`` is the eod_pnl series OLDEST-first. ``ex_dividends`` maps a session
+    date to the SPY cash distribution going ex in the interval ending on it, and
+    is consulted only where the row carries no ``spy_dividend_per_share``.
+
+    ``prior_session_of`` is a callable ``(date_str) -> date_str`` naming the
+    trading session that should immediately precede a given one — pass
+    ``krepis.trading_calendar.previous_trading_day``. Without it every adjacent
+    pair is assumed contiguous, which is correct for a synthetic fixture and
+    WRONG for the live series: three pairs there are not (2026-03-12 and
+    2026-07-27 have no row; 2026-04-03 has a row for a market holiday). A
+    non-contiguous pair spans two sessions on the close leg and one on the
+    stored leg, and comparing them is a category error, not a finding.
+    """
+    ex_dividends = ex_dividends or {}
+    out: list[dict[str, Any]] = []
+    prior_close: float | None = None
+    prior_date: str | None = None
+    for r in rows:
+        date = str(r.get("date"))
+        close = _f(r.get("spy_close"))
+        stored = _f(r.get("spy_return_pct"))
+        per_share = _f(r.get("spy_dividend_per_share"))
+        if per_share is None:
+            per_share = float(ex_dividends.get(date, 0.0) or 0.0)
+        contiguous = True
+        if prior_date is not None and prior_session_of is not None:
+            try:
+                contiguous = str(prior_session_of(date)) == prior_date
+            except Exception:  # noqa: BLE001
+                # (a) swallowed: a calendar lookup on a malformed date string;
+                # (b) survives: every other pair is still evaluated; (c) recorded:
+                # the pair is marked NON-contiguous, i.e. EXCLUDED, which is the
+                # conservative direction — an unverifiable pair is never counted
+                # as agreement.
+                logger.warning("[benchmark] calendar lookup failed for %s", date)
+                contiguous = False
+        implied = None
+        if close is not None and prior_close and contiguous:
+            implied = ((close + per_share) / prior_close - 1.0) * 100.0
+        out.append({
+            "date": date,
+            "spy_close": close,
+            "spy_dividend_per_share": per_share,
+            "stored_pct": stored,
+            "implied_pct": implied,
+            "contiguous": contiguous,
+            "delta_pct": (
+                stored - implied
+                if (stored is not None and implied is not None)
+                else None
+            ),
+        })
+        if close is not None:
+            prior_close = close
+        prior_date = date
+    return out
+
+
+def verify_benchmark_chain_closes(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    ex_dividends: Mapping[str, float] | None = None,
+    prior_session_of: Any | None = None,
+    tolerance_bps: float = BENCHMARK_CHAIN_TOLERANCE_BPS,
+) -> dict[str, Any]:
+    """INTERNAL consistency: stored ``spy_return_pct`` vs the persisted closes.
+
+    Chain-links both legs over the SAME pairs — a pair that is non-contiguous,
+    or whose row is missing a close or a stored return, is excluded from BOTH
+    and named in ``excluded_pairs``, never left in one and dropped from the
+    other.
+
+    This gate is DETECTION ONLY and has no self-heal. It says the two internal
+    columns disagree; it cannot say which is wrong, and on the live series it
+    was the close column, not the return column (see the section comment). Use
+    :func:`check_benchmark_vendor_anchor` to resolve a disagreement.
+    """
+    detail = benchmark_implied_returns(
+        rows, ex_dividends=ex_dividends, prior_session_of=prior_session_of,
+    )
+    usable = [
+        d for d in detail[1:]
+        if d["stored_pct"] is not None and d["implied_pct"] is not None
+    ]
+    excluded = [
+        {"date": d["date"],
+         "reason": ("non-contiguous session pair" if not d["contiguous"]
+                    else "row missing spy_close or spy_return_pct")}
+        for d in detail[1:]
+        if d["stored_pct"] is None or d["implied_pct"] is None
+    ]
+    if not usable:
+        return {"status": "n/a", "closes": None, "offenders": [],
+                "excluded_pairs": excluded}
+
+    stored_chain = 1.0
+    implied_chain = 1.0
+    for d in usable:
+        stored_chain *= 1.0 + d["stored_pct"] / 100.0
+        implied_chain *= 1.0 + d["implied_pct"] / 100.0
+    stored_pct = (stored_chain - 1.0) * 100.0
+    implied_pct = (implied_chain - 1.0) * 100.0
+    drift_bps = (stored_pct - implied_pct) * 100.0
+    offenders = sorted(
+        (d for d in usable if abs(d["delta_pct"]) * 100.0 > tolerance_bps),
+        key=lambda d: abs(d["delta_pct"]), reverse=True,
+    )
+    return {
+        "status": "ok",
+        "closes": abs(drift_bps) <= tolerance_bps,
+        "chain_linked_stored_pct": stored_pct,
+        "chain_linked_implied_pct": implied_pct,
+        "drift_bps": drift_bps,
+        "tolerance_bps": tolerance_bps,
+        "n_pairs": len(usable),
+        "excluded_pairs": excluded,
+        "offenders": offenders,
+        "message": (
+            f"Benchmark columns disagree: chain-linked spy_return_pct = "
+            f"{stored_pct:+.4f}% vs {implied_pct:+.4f}% implied by the persisted "
+            f"spy_close series over the same {len(usable)} contiguous pairs — "
+            f"{drift_bps:+.1f}bp against a {tolerance_bps:.0f}bp tolerance. "
+            f"daily_alpha_pct is daily_return_pct MINUS this series. Neither "
+            f"column is ground truth for the other; resolve with the vendor "
+            f"anchor. Disagreeing pair(s): "
+            + ", ".join(
+                f"{o['date']} stored {o['stored_pct']:+.6f}% vs close-implied "
+                f"{o['implied_pct']:+.6f}%"
+                for o in offenders[:5]
+            )
+            + ("" if len(offenders) <= 5 else f" (+{len(offenders) - 5} more)")
+        ),
+    }
+
+
+def check_benchmark_vendor_anchor(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    vendor_closes: Mapping[str, float],
+    vendor_dividends: Mapping[str, float] | None = None,
+    close_tolerance_bps: float = BENCHMARK_CLOSE_DIVERGENCE_TOLERANCE_BPS,
+    anchor_tolerance_bps: float = BENCHMARK_ANCHOR_TOLERANCE_BPS,
+) -> list[dict[str, Any]]:
+    """A SECOND, INDEPENDENT measurement of the benchmark leg. Returns breaches.
+
+    ``vendor_closes`` maps every trading session in the window to that vendor's
+    own close; ``vendor_dividends`` maps an ex-date to the cash distribution
+    per share. Both come from outside this system, which is the entire point:
+    ``spy_close`` and ``spy_return_pct`` are both written by the same producer
+    on the same run, so no equation built from the two of them can fail for the
+    reason that matters — they can be wrong together.
+
+    Two breach kinds:
+
+    ``benchmark_close_divergence``
+        A persisted ``spy_close`` that differs from the vendor's by more than
+        ``close_tolerance_bps``. On the live history this fires on the 8 rows
+        through 2026-03-19, all at 27.2bp and all in the same direction: those
+        closes are dividend-back-adjusted while every later row is raw.
+
+    ``benchmark_anchor_drift``
+        The chain-linked stored ``spy_return_pct`` against the vendor's
+        TOTAL-return index over the same window. The vendor index is built from
+        the vendor's own consecutive sessions, so a session the book failed to
+        persist is included in the benchmark — which is correct, and is the
+        point: a missing trading day does not pause the benchmark, and a
+        comparison that silently drops it flatters or penalises the book by
+        that day's market move.
+
+    ``vendor_closes`` missing a session the book persisted is itself reported,
+    as ``benchmark_vendor_coverage`` — an anchor with holes is not an anchor,
+    and it is never treated as agreement.
+    """
+    vendor_dividends = vendor_dividends or {}
+    breaches: list[dict[str, Any]] = []
+    dated = [r for r in rows if r.get("date")]
+    if not dated or not vendor_closes:
+        return breaches
+
+    missing = [str(r["date"]) for r in dated if str(r["date"]) not in vendor_closes]
+    if missing:
+        breaches.append({
+            "kind": "benchmark_vendor_coverage",
+            "missing_sessions": missing,
+            "n_missing": len(missing),
+            "message": (
+                f"The benchmark anchor does not cover {len(missing)} persisted "
+                f"session(s) ({', '.join(missing[:5])}"
+                + ("" if len(missing) <= 5 else f", +{len(missing) - 5} more")
+                + "). An anchor with holes cannot verify the series it anchors, "
+                "and its silence on those sessions is not agreement."
+            ),
+        })
+
+    for r in dated:
+        date = str(r["date"])
+        persisted = _f(r.get("spy_close"))
+        vendor = _f(vendor_closes.get(date))
+        if persisted is None or not vendor:
+            continue
+        divergence_bps = (persisted / vendor - 1.0) * 10_000.0
+        if abs(divergence_bps) <= close_tolerance_bps:
+            continue
+        breaches.append({
+            "kind": "benchmark_close_divergence",
+            "run_date": date,
+            "persisted_spy_close": persisted,
+            "vendor_spy_close": vendor,
+            "divergence_bps": divergence_bps,
+            "tolerance_bps": close_tolerance_bps,
+            "message": (
+                f"Persisted spy_close on {date} is {persisted:.4f} against the "
+                f"vendor's {vendor:.2f} — {divergence_bps:+.1f}bp, past the "
+                f"{close_tolerance_bps:.0f}bp tolerance. The benchmark leg of "
+                "every alpha figure on this session rests on this number."
+            ),
+        })
+
+    first, last = str(dated[0]["date"]), str(dated[-1]["date"])
+    sessions = sorted(d for d in vendor_closes if first <= d <= last)
+    if len(sessions) >= 2:
+        index = 1.0
+        for a, b in zip(sessions, sessions[1:], strict=False):
+            c0, c1 = _f(vendor_closes[a]), _f(vendor_closes[b])
+            if not c0 or c1 is None:
+                continue
+            index *= (c1 + float(vendor_dividends.get(b, 0.0) or 0.0)) / c0
+        vendor_tr_pct = (index - 1.0) * 100.0
+
+        chain = 1.0
+        n = 0
+        for r in dated[1:]:
+            stored = _f(r.get("spy_return_pct"))
+            if stored is None:
+                continue
+            chain *= 1.0 + stored / 100.0
+            n += 1
+        stored_pct = (chain - 1.0) * 100.0
+        drift_bps = (stored_pct - vendor_tr_pct) * 100.0
+        if abs(drift_bps) > anchor_tolerance_bps:
+            breaches.append({
+                "kind": "benchmark_anchor_drift",
+                "window": [first, last],
+                "chain_linked_stored_pct": stored_pct,
+                "vendor_total_return_pct": vendor_tr_pct,
+                "vendor_sessions": len(sessions),
+                "persisted_sessions": n + 1,
+                "drift_bps": drift_bps,
+                "tolerance_bps": anchor_tolerance_bps,
+                "message": (
+                    f"The published benchmark series drifts from the vendor's "
+                    f"own total return over {first} → {last}: chain-linked "
+                    f"spy_return_pct = {stored_pct:+.4f}% against "
+                    f"{vendor_tr_pct:+.4f}% ({drift_bps:+.0f}bp, tolerance "
+                    f"{anchor_tolerance_bps:.0f}bp). The vendor index spans "
+                    f"{len(sessions)} sessions and the book persisted {n + 1}; "
+                    "a session the book missed still moved the market, so the "
+                    "difference is carried straight into cumulative alpha."
+                ),
+            })
     return breaches

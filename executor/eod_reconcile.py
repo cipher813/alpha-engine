@@ -1673,8 +1673,10 @@ def run(
             data_warnings.append(
                 f"Commission unknown for {run_date}: {costs['n_fills']} fill(s) "
                 "executed and IB attached no commissionReport to any of them. "
-                "The net-of-cost return is therefore missing its commission "
-                "leg — an ABSENT figure, not a measured $0.00."
+                "commission_usd is persisted NULL and daily_return_gross_pct is "
+                "SUPPRESSED — an ABSENT figure, not a measured $0.00. The "
+                "net-of-cost return is unaffected: it comes from NAV, which the "
+                "commission already debited whether or not it was reported."
             )
 
         nav_reconciliation = {
@@ -1696,12 +1698,19 @@ def run(
             "slippage_bps": costs["slippage_bps"],
             "daily_return_net_pct": returns_split["daily_return_net_pct"],
             "daily_return_gross_pct": returns_split["daily_return_gross_pct"],
+            "gross_available": returns_split["gross_available"],
+            "gross_unavailable_reason": returns_split["gross_unavailable_reason"],
             "total_cost_usd": returns_split["total_cost_usd"],
         }
         logger.info(
-            "Costs: commission=$%.2f (available=%s) | slippage=$%+.0f (%s) | "
+            "Costs: commission=%s (available=%s) | slippage=$%+.0f (%s) | "
             "notional=$%.0f | net=%s | gross=%s",
-            costs["commission_usd"], costs["commission_available"],
+            # commission_usd is None — never 0.0 — when fills executed and IB
+            # attached no commissionReport (I8188 deliverable 2). Formatting it
+            # with %.2f would raise here, so it is rendered as the word ABSENT.
+            f"${costs['commission_usd']:.2f}"
+            if costs["commission_usd"] is not None else "ABSENT",
+            costs["commission_available"],
             costs["slippage_usd"],
             f"{costs['slippage_bps']:.1f}bp" if costs["slippage_bps"] is not None else "n/a",
             costs["traded_notional_usd"],

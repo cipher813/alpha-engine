@@ -125,12 +125,19 @@ class TestSessionCosts:
     def test_absent_commission_is_not_a_measured_zero(self):
         """"Paper-account commissions are trivial" is how the cost line came
         not to exist. An absent figure and a reported $0.00 must be
-        distinguishable."""
+        distinguishable.
+
+        Tightened in the I8188 second pass: the flag alone was not enough. It
+        lived in a ``data_warnings`` string while the PERSISTED column read
+        0.0, and it did so on 1 of the first 6 live sessions — so the artifact
+        a reader (or a viability threshold) sees rendered the absence as a
+        measured zero anyway. ``commission_usd`` is now None on that path.
+        """
         absent = session_costs([
             {"action": "BUY", "shares": 100, "fill_price": 10.0,
              "price_at_order": 10.0},
         ])
-        assert absent["commission_usd"] == 0.0
+        assert absent["commission_usd"] is None
         assert absent["commission_available"] is False
 
         reported = session_costs([
