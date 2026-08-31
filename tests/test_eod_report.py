@@ -439,10 +439,12 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_6(self):
-        """2.6 (alpha-engine-config-I9085): position rows gain
-        `mark_basis_usd` + `ib_mark_off_close_pct`. Additive only."""
-        assert SCHEMA_VERSION == "2.7"
+    def test_schema_version_is_2_8(self):
+        """2.8 (alpha-engine-config-I9627): the `integrity` block gains
+        `nav_mark_correction` — the raw broker NAV and the repair applied to
+        it, so a corrected headline stays traceable to what IB sent.
+        Additive only."""
+        assert SCHEMA_VERSION == "2.8"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -494,7 +496,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.7"
+        assert report["schema_version"] == "2.8"
         # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
         # and the integrity-gate verdict reach the artifact. Before this the
         # only cost figure anywhere in the P&L path was the portfolio
@@ -585,3 +587,43 @@ class TestBuildEodReport:
             positions={}, prior_positions=None, conn=conn,
         )
         assert report["alpha_attribution"] is None
+
+
+class TestNavMarkCorrectionIsPublished:
+    """Schema 2.8 (alpha-engine-config-I9627). A corrected headline NAV that
+    does not carry the correction beside it is an untraceable number."""
+
+    def test_integrity_block_carries_the_correction(self):
+        conn = _conn()
+        correction = {
+            "applied": True,
+            "nav_raw": 1_020_009.79,
+            "nav_corrected": 1_017_149.47,
+            "correction_usd": -2860.32,
+            "corrected_tickers": ["DUOL"],
+            "corrections": [{"ticker": "DUOL", "ib_mark": 152.40,
+                             "settled_close": 148.36}],
+        }
+        report = build_eod_report(
+            run_date="2026-08-31",
+            nav=1_017_149.47,
+            prior_nav=1_017_506.0,
+            daily_return=None, spy_return=None, alpha=None,
+            positions={}, prior_positions={}, conn=conn,
+            nav_mark_correction=correction,
+        )
+        published = report["integrity"]["nav_mark_correction"]
+        assert published["applied"] is True
+        assert published["nav_raw"] == 1_020_009.79
+        assert published["corrected_tickers"] == ["DUOL"]
+        # The published headline is the corrected one, and the raw broker NAV
+        # is recoverable from the artifact alone.
+        assert report["summary"]["nav"] == 1_017_149.47
+
+    def test_absent_on_an_ordinary_day(self):
+        report = build_eod_report(
+            run_date="2026-08-28", nav=1.0, prior_nav=None,
+            daily_return=None, spy_return=None, alpha=None,
+            positions={}, prior_positions={}, conn=_conn(),
+        )
+        assert report["integrity"]["nav_mark_correction"] is None
