@@ -104,7 +104,7 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.7"
+SCHEMA_VERSION = "2.8"
 # 2.7 (alpha-engine-config-I8188, second pass): additive only.
 # ``transaction_costs`` gains ``gross_available`` and
 # ``gross_unavailable_reason``. When IB attaches no commissionReport to any
@@ -134,6 +134,12 @@ SCHEMA_VERSION = "2.7"
 # TWR-closure gate outcomes, dividend-accrual availability, and the explicit
 # declaration that ``spy_return_pct`` is now TOTAL return, not price return).
 # Both are additive; no 2.3 field changed meaning.
+#
+# 2.8 (alpha-engine-config-I9627) adds ``integrity.nav_mark_correction``: the
+# broker NAV as received, the per-name repair applied to any provably-wrong
+# mark, and whether the repair was applied or refused. ``summary.nav`` is the
+# CORRECTED figure on a correction day, so without this block the published
+# headline could not be traced back to what IB sent. Additive.
 
 # Sell-side trade actions whose fills realize P&L on shares rotated out today.
 _SELL_ACTIONS = {
@@ -540,6 +546,7 @@ def build_eod_report(
     account_snapshot: dict | None = None,
     nav_reconciliation: dict | None = None,
     integrity_breaches: list | None = None,
+    nav_mark_correction: dict | None = None,
     twr_closure: dict | None = None,
     dividend_accrual_available: bool | None = None,
     position_narratives: dict[str, str] | None = None,
@@ -701,6 +708,11 @@ def build_eod_report(
         # the same verdict the pipeline exit code does.
         "integrity": {
             "breaches": list(integrity_breaches or []),
+            # Schema 2.8 (alpha-engine-config-I9627): the broker-mark repair.
+            # `nav` above is the CORRECTED figure whenever `applied` is true,
+            # so the artifact must carry the raw broker NAV beside it or the
+            # published number cannot be traced to what IB sent.
+            "nav_mark_correction": nav_mark_correction,
             "twr_closure": twr_closure,
             "dividend_accrual_available": dividend_accrual_available,
             "spy_return_basis": "total_return",

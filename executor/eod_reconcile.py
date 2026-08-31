@@ -41,6 +41,7 @@ from executor.pnl_integrity import (
     check_residual_bounds,
     gross_net_returns,
     nav_basis_level_usd,
+    plan_nav_mark_correction,
     plan_twr_self_heal,
     session_costs,
     verify_nav_change_basis_closes,
@@ -1179,12 +1180,6 @@ def run(
     )
     prior_nav = prior_row[1] if prior_row else None
 
-    if prior_nav is None:
-        logger.info("First trading day — no prior NAV, daily return unavailable")
-        daily_return = None
-    else:
-        daily_return = ((nav - prior_nav) / prior_nav * 100)
-
     # Headline gap guard: if the prior eod_pnl row is not the previous trading
     # day, the NAV-level daily return / alpha span more than one session. Per-
     # position returns are gap-corrected from ArcticDB, but the NAV baseline
@@ -1265,21 +1260,12 @@ def run(
         else:
             logger.warning("No prior eod_pnl row — cannot compute SPY return")
 
-    alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
-
     # Same-day EOD reads run_date's SPY close from ArcticDB at ~4:20pm ET,
     # which can still be pre-settlement. Mark the artifact provisional so the
     # console flags it and the T+1 reconcile_audit pass re-finalizes it from
     # the settled close. A re-reconcile of a PAST date (run_date earlier than
     # today's trading_day) is by definition post-settlement → final.
     spy_close_provisional = run_date == today_trading_day
-
-    logger.info(
-        f"NAV=${nav:,.2f} | daily={daily_return:.2f}% | "
-        f"SPY={spy_return:.2f}% | alpha={alpha:.2f}%"
-        if all(x is not None for x in [daily_return, spy_return, alpha])
-        else f"NAV=${nav:,.2f} | prior_nav={prior_nav}"
-    )
 
     # ── Load closing prices from ArcticDB ──────────────────────────────────
     # Hard-fails on any miss: EOD reconcile must reconcile against an
@@ -1357,6 +1343,101 @@ def run(
         len(closing_prices), len(positions), run_date,
     )
 
+    # ── Broker-mark repair, BEFORE any NAV-derived figure is computed ───────
+    # (alpha-engine-config-I9627.) The IB reference mark is captured here
+    # rather than inside the positions loop below, because the correction has
+    # to land before `daily_return`, `alpha` and every position weight are
+    # derived from NAV — a correction applied after them would leave the
+    # headline and the components on different prices, which is the defect
+    # being fixed, one layer up.
+    for _tkr, _pos in positions.items():
+        _pos["ib_market_value"] = _pos.get("market_value")
+
+    # IB mark-outside-range detection (config#6349/#6818) — flags positions,
+    # used below to name culprits in the hard-gate alert and classify a
+    # fully-explained breach as broker data quality rather than a defect.
+    ib_mark_range_flags = _detect_ib_mark_outside_range(
+        positions=positions, day_low=day_low, day_high=day_high,
+    )
+    if ib_mark_range_flags:
+        logger.warning(
+            "IB mark outside day's traded range for %d ticker(s): %s",
+            len(ib_mark_range_flags),
+            ", ".join(
+                f"{f['ticker']} mark=${f['ib_mark']:.2f} range=[${f['day_low']:.2f},"
+                f" ${f['day_high']:.2f}] error=${f['mark_error_usd']:+,.0f}"
+                for f in ib_mark_range_flags
+            ),
+        )
+
+    nav_ib_raw = nav
+    mark_correction = plan_nav_mark_correction(
+        ib_mark_range_flags,
+        settled_closes=closing_prices,
+        day_low=day_low,
+        day_high=day_high,
+        nav=nav,
+        run_date=run_date,
+    )
+    if mark_correction["applied"]:
+        nav = mark_correction["nav_corrected"]
+        # ERROR, not WARNING: the broker sent a provably wrong number and the
+        # book was repaired around it. That the pipeline no longer halts does
+        # not make it a routine event, and the alert names every ticker.
+        logger.error("NAV MARK CORRECTION: %s", mark_correction["message"])
+        data_warnings.append(mark_correction["message"])
+        # Verify the action worked, rather than assuming it. A settled close
+        # lies inside the day's own traded range by construction, so a repaired
+        # mark cannot still be out of range; if one is, the correction did not
+        # do what it claims and the run must not proceed on it.
+        residual_flags = [
+            f["ticker"] for f in _detect_ib_mark_outside_range(
+                positions={
+                    c["ticker"]: {
+                        "shares": c["shares"],
+                        "ib_market_value": c["shares"] * c["settled_close"],
+                    }
+                    for c in mark_correction["corrections"]
+                },
+                day_low=day_low,
+                day_high=day_high,
+            )
+        ]
+        if residual_flags:
+            raise RuntimeError(
+                f"NAV mark correction did not converge for {run_date}: "
+                f"{residual_flags} remain outside the day's traded range after "
+                "being repriced to their settled closes. The correction is "
+                "unsound on this data; NAV is not published."
+            )
+    elif mark_correction["refused"] or mark_correction["unrepairable"]:
+        if mark_correction["message"]:
+            logger.error("NAV MARK CORRECTION: %s", mark_correction["message"])
+            data_warnings.append(mark_correction["message"])
+        for _u in mark_correction["unrepairable"]:
+            _msg = (
+                f"Broker mark for {_u['ticker']} on {run_date} is NOT repairable: "
+                f"{_u['why']}. The custodian gate still holds for this name."
+            )
+            logger.error("NAV MARK CORRECTION: %s", _msg)
+            data_warnings.append(_msg)
+
+    # ── NAV-derived headline figures (computed on the CORRECTED NAV) ────────
+    if prior_nav is None:
+        logger.info("First trading day — no prior NAV, daily return unavailable")
+        daily_return = None
+    else:
+        daily_return = ((nav - prior_nav) / prior_nav * 100)
+
+    alpha = (daily_return - spy_return) if (daily_return is not None and spy_return is not None) else None
+
+    logger.info(
+        f"NAV=${nav:,.2f} | daily={daily_return:.2f}% | "
+        f"SPY={spy_return:.2f}% | alpha={alpha:.2f}%"
+        if all(x is not None for x in [daily_return, spy_return, alpha])
+        else f"NAV=${nav:,.2f} | prior_nav={prior_nav}"
+    )
+
     # ── Per-position daily return & alpha contribution ──────────────────────
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
     prior_snapshot_row = conn.execute(
@@ -1394,12 +1475,11 @@ def run(
         mv = pos.get("market_value", 0)
         current_price = mv / shares if shares else 0
 
-        # Preserve IB's raw mark-to-market BEFORE the settled-close override, so
-        # the pricing&timing reconciliation can quantify the IB-mark-vs-settled
-        # difference per name (and so a future per-name pricing attribution is
-        # possible). The settled close is the canonical valuation; this is only
-        # the IB reference mark.
-        pos["ib_market_value"] = mv
+        # ``ib_market_value`` — IB's raw mark-to-market before the settled-close
+        # override — was already captured above the mark-correction block, which
+        # must run before NAV is consumed. It is deliberately NOT re-read here:
+        # the pricing&timing term and the mark flags must both describe the mark
+        # the broker actually sent.
 
         # Prefer closing price from daily_closes over IB Gateway's delayed data
         if ticker in closing_prices:
@@ -1463,23 +1543,6 @@ def run(
         pos_spy = spy_return if spy_return is not None else 0
         pos["alpha_contribution_pct"] = weight * (pos["daily_return_pct"] - pos_spy)
         pos["alpha_contribution_usd"] = pos["alpha_contribution_pct"] / 100 * nav if nav else 0
-
-    # IB mark-outside-range detection (config#6349/#6818) — flags positions,
-    # used below to name culprits in the hard-gate alert and classify a
-    # fully-explained breach as broker data quality rather than a defect.
-    ib_mark_range_flags = _detect_ib_mark_outside_range(
-        positions=positions, day_low=day_low, day_high=day_high,
-    )
-    if ib_mark_range_flags:
-        logger.warning(
-            "IB mark outside day's traded range for %d ticker(s): %s",
-            len(ib_mark_range_flags),
-            ", ".join(
-                f"{f['ticker']} mark=${f['ib_mark']:.2f} range=[${f['day_low']:.2f},"
-                f" ${f['day_high']:.2f}] error=${f['mark_error_usd']:+,.0f}"
-                for f in ib_mark_range_flags
-            ),
-        )
 
     # Per-position mark-basis diagnostics (alpha-engine-config-I9085). The
     # `[Low, High]` flag is a strict SUBSET of "the IB mark is not the close":
@@ -2071,7 +2134,10 @@ def run(
     # Custodian marks: promoted from flag to failure. The soft
     # ib_mark_outside_range flag is unchanged and still populates.
     mark_breaches = check_custodian_marks(
-        ib_mark_range_flags, nav=nav, run_date=run_date,
+        ib_mark_range_flags,
+        nav=nav,
+        run_date=run_date,
+        corrected_tickers=mark_correction["corrected_tickers"],
     )
     for breach in mark_breaches:
         logger.error("CUSTODIAN MARK BREACH: %s", breach["message"])
@@ -2111,6 +2177,19 @@ def run(
         "dividend_receivable_usd": dividend_receivable,
         "integrity_breach_json": (
             json.dumps(integrity_breaches) if integrity_breaches else None
+        ),
+        # The broker NAV as received, and the repair applied to it. Persisted
+        # unconditionally on a correction day so the published NAV can always be
+        # traced back to what IB actually sent (alpha-engine-config-I9627).
+        "nav_ib_raw_usd": nav_ib_raw,
+        "nav_mark_correction_usd": (
+            mark_correction["correction_usd"] if mark_correction["applied"] else None
+        ),
+        "nav_mark_correction_json": (
+            json.dumps(mark_correction)
+            if (mark_correction["applied"] or mark_correction["refused"]
+                or mark_correction["unrepairable"])
+            else None
         ),
     })
 
@@ -2421,6 +2500,7 @@ def run(
             account_snapshot=account,
             nav_reconciliation=nav_reconciliation,
             integrity_breaches=integrity_breaches,
+            nav_mark_correction=mark_correction,
             twr_closure=twr,
             dividend_accrual_available=dividend_accrual_available,
             position_narratives=position_narratives,
