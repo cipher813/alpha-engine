@@ -252,30 +252,40 @@ def _apply_split_ratios(
 def fetch_same_day_split_ratios(
     tickers, run_date: str, *, client: Any | None = None
 ) -> tuple[dict[str, float], list[str]]:
-    """I/O wiring helper: fetch same-day split ratios for ``tickers`` via Polygon.
+    """I/O wiring helper: establish same-day split status for ``tickers``.
 
-    Separate from the pure :func:`build_reconciliation_audit` builder so the
-    latter stays testable without network. Best-effort by contract — a failure
-    (missing ``POLYGON_API_KEY``, rate limit, HTTP error) never aborts the EOD
-    path, because a same-day split is rare and this audit is secondary
-    observability. Inject ``client`` (a ``PolygonClient``-shaped object exposing
-    ``get_splits``) in tests.
+    ONE date-filtered Polygon query (``/v3/reference/splits?execution_date=
+    <run_date>``) returns every split executing that day across all tickers;
+    the held book is intersected against it locally. Inject ``client`` (a
+    ``PolygonClient``-shaped object exposing ``get_splits_for_date``) in tests.
 
     Returns ``(ratios, unresolved)`` (alpha-engine-config-I9630). ``unresolved``
-    is every ticker whose split status could not be established.
+    is every ticker whose split status could not be established, and it is
+    now ALL-OR-NOTHING: the single query either succeeded, in which case every
+    held name is resolved (present in the result = split, absent = genuinely no
+    split), or it failed, in which case no name is. That is more honest than
+    the old partial mixture and it costs one call instead of N.
 
-    **Why the return shape changed.** The old contract returned ``{}`` and
-    logged ``"treating as no same-day action"``. That sentence converts
-    UNMEASURED into CLEAN: a ticker whose split we failed to fetch became
-    indistinguishable, on every downstream surface, from one we checked and
-    found no split on — and ``build_reconciliation_audit`` then published
-    ``reconciliation_match_rate`` as though the whole book had been verified.
-    It is not hypothetical: ``eod-2026-08-31-1788206436`` swallowed UAL and
-    QLYS after seven ``429``s and published ``match_rate=1.000``.
+    **Why the per-ticker loop is gone** (alpha-engine-config-I9646). The client
+    is constructed with ``calls_per_min=5`` (Polygon free tier) and the loop
+    issued one ``get_splits`` per held ticker — twelve on 2026-08-31 — which
+    cannot complete inside that budget. Three consecutive EOD runs that day
+    raised ``PolygonRateLimitError`` and left a different 1-2 names unresolved
+    each time; the varying names are the signature of a rate limiter, not of a
+    per-ticker data problem. Raising the retry count only moves the wall.
+
+    **Why absence is now a measurement.** The old code fetched per ticker and,
+    on failure, could not distinguish "no split" from "not checked". The
+    date-filtered query establishes the whole day's split set in one shot, so a
+    held ticker's absence from that set is a POSITIVE finding of no split —
+    the case the previous implementation assumed and could not establish.
+
+    The failure stays non-fatal — a same-day split is rare and this audit is
+    secondary observability that must not abort the EOD path — but it is never
+    rendered as clean: (a) swallowed: split-status fetch failure; (c) recording
+    surface: the ERROR log below, ``split_check_unresolved`` in
+    ``reconciliation_audit.json``, and the ``OK_UNVERIFIED`` status it forces.
     ``principles.md`` §2.7 — no data is never rendered as green.
-
-    The failure stays non-fatal. What changes is that the gap is now
-    countable and travels to the artifact instead of dying in a log line.
     """
     tickers = [t for t in (tickers or []) if t]
     if not tickers:
@@ -285,29 +295,27 @@ def fetch_same_day_split_ratios(
             from polygon_client import PolygonClient  # lazy: optional dep / key
 
             client = PolygonClient()
-    except Exception:  # noqa: BLE001 — client construction / key absent
-        # EVERY ticker is unresolved, not zero of them. This branch previously
-        # returned {} and the whole book silently read as split-checked.
+        day_splits = client.get_splits_for_date(run_date)
+    except Exception:  # noqa: BLE001 — see the recording surface in the docstring
+        # EVERY ticker is unresolved, not zero of them. One query covers the
+        # whole book, so its failure leaves the whole book unmeasured.
         logger.error(
-            "[reconciliation_audit] same-day split fetch unavailable "
-            "(no POLYGON_API_KEY or client error) — all %d held ticker(s) are "
-            "UNRESOLVED, not clean", len(tickers), exc_info=True,
+            "[reconciliation_audit] same-day split query failed for %s "
+            "(no POLYGON_API_KEY, rate limit, or HTTP error) — all %d held "
+            "ticker(s) are UNRESOLVED, not clean", run_date, len(tickers),
+            exc_info=True,
         )
-        return {}, list(tickers)
+        return {}, sorted(tickers)
 
+    held = set(tickers)
     splits_by_ticker: dict[str, list[dict[str, Any]]] = {}
-    unresolved: list[str] = []
-    for t in tickers:
-        try:
-            splits_by_ticker[t] = client.get_splits(t, start=run_date)
-        except Exception:  # noqa: BLE001 — per-ticker isolation
-            unresolved.append(t)
-            logger.error(
-                "[reconciliation_audit] split fetch failed for %s — its "
-                "split status is UNRESOLVED and is reported as such, not "
-                "assumed absent", t, exc_info=True,
-            )
-    return same_day_split_ratios(splits_by_ticker, run_date), unresolved
+    for row in day_splits or []:
+        t = row.get("ticker")
+        if t in held:
+            splits_by_ticker.setdefault(t, []).append(row)
+    # The query succeeded, so every held name is resolved: it is either in the
+    # day's split set or positively established as having no split.
+    return same_day_split_ratios(splits_by_ticker, run_date), []
 
 
 def _anchored_parity(

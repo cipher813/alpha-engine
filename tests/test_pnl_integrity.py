@@ -800,3 +800,66 @@ def test_the_live_2026_08_31_book_was_fully_covered():
     out = check_mark_coverage(positions, nav=1_017_149.47, run_date="2026-08-31")
     assert out["held"] == 12 and out["checked"] == 12
     assert out["coverage_pct"] == 100.0 and out["warnings"] == []
+
+
+class TestMacroRoutedHoldingIsDeclaredUncheckable:
+    """alpha-engine-config-I9637 — the exclusion is a DECLARED property of the
+    data plane, not an accident of the writer.
+
+    I9637's closes-when asks for a test asserting the mark check EVALUATES a
+    macro-routed holding. That cannot be written truthfully today: the ArcticDB
+    `macro` library is Close-only (measured 2026-08-31 — XLK/SPY/GLD/VIX all
+    return cols == ['Close']), so there is no [Low, High] to evaluate against.
+    What is written instead is the honest inverse — the gap is NAMED on the
+    coverage surface rather than rendered as a pass — plus a lock on the
+    declared holdable set. When the data-plane fix lands (moving the holdable
+    symbols into `universe`, per alpha-engine-data #245's SPY precedent), the
+    first test here is what must be inverted, and its failure is the signal
+    that I9637 is genuinely closed.
+    """
+
+    def test_a_macro_routed_holding_is_reported_unchecked_and_named(self):
+        from executor.eod_reconcile import _detect_ib_mark_outside_range
+        from executor.pnl_integrity import check_mark_coverage
+
+        positions = {
+            # universe-routed: has a traded range, gets checked.
+            "AAPL": {"shares": 100, "ib_market_value": 20_000.0,
+                     "market_value": 20_000.0},
+            # macro-routed sector ETF: Close-only, no [Low, High] exists.
+            "XLK": {"shares": 500, "ib_market_value": 100_000.0,
+                    "market_value": 100_000.0},
+        }
+        _detect_ib_mark_outside_range(
+            positions=positions,
+            day_low={"AAPL": 195.0},
+            day_high={"AAPL": 205.0},
+        )
+        cov = check_mark_coverage(positions, nav=1_000_000.0,
+                                  run_date="2026-08-31")
+
+        assert cov["held"] == 2
+        assert cov["checked"] == 1
+        assert cov["unchecked"] == 1
+        names = [u["ticker"] for u in cov["unchecked_names"]]
+        assert names == ["XLK"]
+        # The reason travels with it — "unchecked" must never be silent.
+        assert "Close-only" in cov["unchecked_names"][0]["reason"]
+        # $100k against a $1M NAV is far past the 15bp materiality floor, so
+        # this is an ERROR-grade gap, not a footnote.
+        assert cov["unchecked_material"] is True
+        assert cov["warnings"]
+
+    def test_holdable_macro_set_is_a_declared_subset(self):
+        from executor.price_cache import (
+            _MACRO_SYMBOLS,
+            MACRO_HOLDABLE_SYMBOLS,
+        )
+
+        assert MACRO_HOLDABLE_SYMBOLS <= _MACRO_SYMBOLS
+        # Index LEVELS are not holdable and need no mark check. If one of these
+        # ever becomes holdable, it joins the unverified-mark set and this
+        # assertion is the thing that says so.
+        assert MACRO_HOLDABLE_SYMBOLS.isdisjoint({"VIX", "VIX3M", "TNX", "IRX"})
+        # Every sector ETF the optimizer can hold is in the declared set.
+        assert {"XLK", "XLE", "XLF", "GLD", "USO"} <= MACRO_HOLDABLE_SYMBOLS

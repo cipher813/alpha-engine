@@ -46,8 +46,46 @@ _ATR_MAX_STALENESS_TRADING_DAYS = 1
 # macro-routed because they have no `universe` counterpart and their
 # use cases (sector-relative exit veto + macro features) consume Close
 # only.
+#
+# DECLARED EXCLUSION — no macro-routed symbol can be range-checked
+# (alpha-engine-config-I9637, deliverable 3). The `macro` library stores
+# Close ONLY; measured 2026-08-31 against s3://alpha-engine-research, every
+# one of XLK/SPY/GLD/VIX returned cols == ['Close']. `eod_reconcile` therefore
+# populates day_low/day_high only for `universe`-routed names, and the
+# custodian-mark gate SKIPS every holding routed here: its broker mark reaches
+# NetLiquidation — and so NAV, daily_return_pct and daily_alpha_pct — with no
+# traded-range verification. The gap is recorded, not hidden: it is published
+# as eod_report.json `integrity.mark_check_coverage`, and an unchecked holding
+# whose market value exceeds the gate's own 15bp-of-NAV materiality floor logs
+# at ERROR.
+#
+# The exclusion is only material for the HOLDABLE members — the XL* sector
+# ETFs, GLD and USO, which the optimizer can put in the book. VIX/VIX3M/TNX/IRX
+# are index levels, are not holdable, and need no mark check.
+#
+# DO NOT close this gap by defaulting an absent High/Low to 0.0.
+# `load_price_histories` documents that behaviour for its own consumers, and if
+# that convention reached `eod_reconcile` every macro-routed mark would land
+# outside [0.0, 0.0], be flagged, be unrepairable (the settled close is not
+# inside [0, 0] either) and HALT the postclose pipeline every single day.
+# Absent must stay absent. The fix belongs in the data plane: move the holdable
+# symbols into the `universe` library, which already carries OHLCV — the same
+# move alpha-engine-data #245 made for SPY. Tracked in I9637.
 _MACRO_SYMBOLS = frozenset({
-    "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    # Not holdable — index levels. No mark check needed.
+    "VIX", "VIX3M", "TNX", "IRX",
+    # HOLDABLE and Close-only: unverifiable broker marks (I9637).
+    "GLD", "USO",
+    "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
+    "XLP", "XLRE", "XLU", "XLV", "XLY",
+})
+
+# The subset of _MACRO_SYMBOLS the optimizer can actually HOLD, and therefore
+# the exact set whose broker marks reach NAV unverified today (I9637). Named
+# rather than inlined so the mark-coverage surface and any future data-plane
+# migration test the same list instead of two drifting ones.
+MACRO_HOLDABLE_SYMBOLS = frozenset({
+    "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
 })
