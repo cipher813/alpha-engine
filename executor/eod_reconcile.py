@@ -2013,23 +2013,25 @@ def run(
 
         # Same-day corporate actions (splits/spinoffs) change IB's share count
         # with no ledger trade and would false-mismatch the anchored parity on
-        # the ex-date (config#1682). Fetch split ratios for held tickers and
-        # rebase the pre-action baselines. Best-effort: no POLYGON_API_KEY or a
-        # fetch error never aborts the audit — but it no longer reads as
-        # clean either: the unresolved tickers are named and travel to the
-        # artifact as split_check_unresolved (alpha-engine-config-I9630).
+        # the ex-date (config#1682). ONE date-filtered Polygon query resolves
+        # the whole day's split set and the held book is intersected against it
+        # locally (alpha-engine-config-I9646) — the per-ticker loop could not
+        # fit inside the 5-calls/min free tier and rate-limited on every run.
+        # Best-effort: no POLYGON_API_KEY or a query failure never aborts the
+        # audit — but it no longer reads as clean either. Because one query
+        # covers the whole book, unresolved is all-or-nothing.
         _held_tickers = set(positions or {}) | set(prior_positions or {})
         _split_ratios, _split_unresolved = fetch_same_day_split_ratios(
             _held_tickers, run_date,
         )
         if _split_unresolved:
             _msg = (
-                f"Same-day split status UNRESOLVED for {len(_split_unresolved)} "
-                f"of {len(_held_tickers)} ticker(s) on {run_date}: "
-                f"{', '.join(sorted(_split_unresolved))}. Their parity in the "
-                "reconciliation audit is unverified, not clean — the audit "
-                "carries split_check_complete=false "
-                "(alpha-engine-config-I9630)."
+                f"Same-day split status UNRESOLVED for all "
+                f"{len(_split_unresolved)} held ticker(s) on {run_date}: "
+                f"{', '.join(sorted(_split_unresolved))}. The single "
+                "date-filtered split query failed, so no held name's parity in "
+                "the reconciliation audit is verified — the audit carries "
+                "split_check_complete=false (alpha-engine-config-I9630)."
             )
             logger.error("[reconciliation_audit] %s", _msg)
             data_warnings.append(_msg)

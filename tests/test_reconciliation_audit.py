@@ -20,6 +20,7 @@ from executor.reconciliation_audit import (
     same_day_split_ratios,
     write_reconciliation_audit,
 )
+from polygon_client import PolygonClient, PolygonRateLimitError
 
 
 def _conn(rows: list[dict]) -> sqlite3.Connection:
@@ -370,25 +371,67 @@ class TestCorporateActionAdjustment:
 
 
 class TestFetchSameDaySplitRatios:
-    def test_uses_injected_client(self):
+    """alpha-engine-config-I9646 — ONE date-filtered query, not N per-ticker ones."""
+
+    def test_one_query_resolves_the_whole_book(self):
         client = MagicMock()
-        client.get_splits.return_value = [
-            {"execution_date": "2026-06-18", "split_from": 1, "split_to": 2},
+        client.get_splits_for_date.return_value = [
+            {"ticker": "AAPL", "execution_date": "2026-06-18",
+             "split_from": 1, "split_to": 2},
+            # A split on a name we do not hold — must not leak into the result.
+            {"ticker": "WZRD", "execution_date": "2026-06-18",
+             "split_from": 15, "split_to": 1},
+        ]
+        out, unresolved = fetch_same_day_split_ratios(
+            ["AAPL", "MSFT"], "2026-06-18", client=client,
+        )
+        assert out == {"AAPL": 2.0}
+        # MSFT's absence from the day's split set is a POSITIVE finding of no
+        # split, not an unmeasured one — that is the whole point of I9646.
+        assert unresolved == []
+        client.get_splits_for_date.assert_called_once_with("2026-06-18")
+
+    def test_call_count_does_not_scale_with_the_book(self):
+        """The defect was N calls against a 5/min budget. One query, always."""
+        client = MagicMock()
+        client.get_splits_for_date.return_value = []
+        _, unresolved = fetch_same_day_split_ratios(
+            [f"T{i}" for i in range(50)], "2026-06-18", client=client,
+        )
+        assert client.get_splits_for_date.call_count == 1
+        assert unresolved == []
+
+    def test_a_split_dated_another_day_is_not_applied(self):
+        client = MagicMock()
+        client.get_splits_for_date.return_value = [
+            {"ticker": "AAPL", "execution_date": "2026-06-17",
+             "split_from": 1, "split_to": 2},
         ]
         out, unresolved = fetch_same_day_split_ratios(
             ["AAPL"], "2026-06-18", client=client,
         )
-        assert out == {"AAPL": 2.0}
+        assert out == {}
         assert unresolved == []
-        client.get_splits.assert_called_once_with("AAPL", start="2026-06-18")
 
-    def test_per_ticker_error_is_reported_unresolved_not_assumed_absent(self):
-        """alpha-engine-config-I9630. The old contract returned {} and logged
-        'treating as no same-day action', which made an unmeasured split
-        indistinguishable from a checked one. The fetch still does not abort
-        the EOD path — but the gap is now named."""
+    def test_query_failure_leaves_every_ticker_unresolved(self):
+        """One query covers the whole book, so its failure leaves the whole
+        book unmeasured — all-or-nothing, never a silent partial clean."""
         client = MagicMock()
-        client.get_splits.side_effect = RuntimeError("polygon down")
+        client.get_splits_for_date.side_effect = RuntimeError("polygon down")
+        ratios, unresolved = fetch_same_day_split_ratios(
+            ["AAPL", "MSFT"], "2026-06-18", client=client,
+        )
+        assert ratios == {}
+        assert unresolved == ["AAPL", "MSFT"]
+
+    def test_rate_limit_is_reported_unresolved_not_assumed_absent(self):
+        """alpha-engine-config-I9630/I9641. The pre-I9630 contract returned {}
+        and logged 'treating as no same-day action', which made an unmeasured
+        split indistinguishable from a checked one."""
+        client = MagicMock()
+        client.get_splits_for_date.side_effect = PolygonRateLimitError(
+            "Rate limited after 3 retries"
+        )
         ratios, unresolved = fetch_same_day_split_ratios(
             ["AAPL"], "2026-06-18", client=client,
         )
@@ -396,7 +439,7 @@ class TestFetchSameDaySplitRatios:
         assert unresolved == ["AAPL"]
 
     def test_a_client_that_cannot_be_built_leaves_every_ticker_unresolved(self):
-        # Not zero of them: this branch previously returned {} and the whole
+        # Not zero of them: this branch pre-I9630 returned {} and the whole
         # book silently read as split-checked.
         ratios, unresolved = fetch_same_day_split_ratios(
             ["AAPL", "MSFT"], "2026-06-18", client=None,
@@ -404,27 +447,53 @@ class TestFetchSameDaySplitRatios:
         assert ratios == {}
         assert sorted(unresolved) == ["AAPL", "MSFT"]
 
-    def test_partial_failure_resolves_what_it_can(self):
-        client = MagicMock()
-
-        def _splits(t, start):
-            if t == "BAD":
-                raise RuntimeError("polygon down")
-            return [{"execution_date": start, "split_from": 1, "split_to": 2}]
-
-        client.get_splits.side_effect = _splits
-        ratios, unresolved = fetch_same_day_split_ratios(
-            ["GOOD", "BAD"], "2026-06-18", client=client,
-        )
-        assert ratios == {"GOOD": 2.0}
-        assert unresolved == ["BAD"]
-
     def test_empty_tickers_short_circuits(self):
         client = MagicMock()
         assert fetch_same_day_split_ratios(
             [], "2026-06-18", client=client,
         ) == ({}, [])
-        client.get_splits.assert_not_called()
+        client.get_splits_for_date.assert_not_called()
+
+
+class TestGetSplitsForDate:
+    """The client method behind the single query (alpha-engine-config-I9646)."""
+
+    def _client(self):
+        c = PolygonClient.__new__(PolygonClient)  # bypass __init__ (needs a key)
+        return c
+
+    def test_exact_date_filter_not_a_gte_cursor(self):
+        """The gotcha in I9646: `start`/`execution_date.gte` is a cursor BOUND,
+        `execution_date` is an exact-match filter. A wrong parameter here fails
+        OPEN into 'no splits found', which is the silent-clean failure I9630
+        closed."""
+        c = self._client()
+        c._get = MagicMock(return_value={"results": []})
+        c.get_splits_for_date("2026-08-31")
+        path, kwargs = c._get.call_args[0][0], c._get.call_args[1]
+        assert path == "/v3/reference/splits"
+        assert kwargs["params"]["execution_date"] == "2026-08-31"
+        assert "execution_date.gte" not in kwargs["params"]
+        assert "ticker" not in kwargs["params"]
+
+    def test_paginates_on_next_url(self):
+        c = self._client()
+        c._get = MagicMock(return_value={
+            "results": [{"ticker": "A"}], "next_url": "https://x/page2",
+        })
+        c._get_raw_url = MagicMock(side_effect=[
+            {"results": [{"ticker": "B"}], "next_url": "https://x/page3"},
+            {"results": [{"ticker": "C"}]},
+        ])
+        rows = c.get_splits_for_date("2026-08-31")
+        assert [r["ticker"] for r in rows] == ["A", "B", "C"]
+        assert c._get_raw_url.call_count == 2
+
+    def test_raises_rather_than_reporting_an_unmeasured_day_as_empty(self):
+        c = self._client()
+        c._get = MagicMock(side_effect=PolygonRateLimitError("rate limited"))
+        with pytest.raises(PolygonRateLimitError):
+            c.get_splits_for_date("2026-08-31")
 
 
 class TestWrite:

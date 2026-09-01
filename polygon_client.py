@@ -221,6 +221,40 @@ class PolygonClient:
 
         return all_splits
 
+    def get_splits_for_date(self, execution_date: str, limit: int = 1000) -> list[dict]:
+        """Fetch EVERY split executing on ``execution_date``, across all tickers.
+
+        One ``/v3/reference/splits?execution_date=<d>`` call (plus any
+        ``next_url`` pages) rather than one call per held ticker. Returns the
+        raw Polygon rows — ``ticker``, ``execution_date``, ``split_from``,
+        ``split_to`` — with the same semantics as :meth:`get_splits`.
+
+        **Why this exists** (alpha-engine-config-I9646). The per-ticker loop
+        issued N calls against a 5-calls/min free-tier budget; on 2026-08-31 a
+        twelve-name book hit ``PolygonRateLimitError`` on three consecutive EOD
+        runs, leaving 1-2 names' split status unestablished each time. The book
+        is intersected against this result locally, so the cost is one call
+        regardless of how many positions are held.
+
+        ``execution_date`` is an EXACT-match filter, not the ``execution_date.gte``
+        cursor bound :meth:`get_splits` uses. Verified live against Polygon
+        2026-08-31: ``execution_date=2026-08-31`` returned 14 rows, every one
+        carrying that exact ``execution_date``, in a single page.
+
+        Raises on failure (``PolygonRateLimitError``, HTTP error). The caller
+        decides what an unestablished split status means; this method never
+        reports an empty day it could not measure as a clean one.
+        """
+        params: dict = {"execution_date": execution_date, "limit": limit}
+        data = self._get("/v3/reference/splits", params=params)
+        all_splits: list[dict] = list(data.get("results", []))
+        next_url: str | None = data.get("next_url")
+        while next_url:
+            resp = self._get_raw_url(next_url)
+            all_splits.extend(resp.get("results", []))
+            next_url = resp.get("next_url")
+        return all_splits
+
     def _get_raw_url(self, url: str) -> dict:
         """GET a full URL (for pagination next_url)."""
         self._wait_for_slot()
