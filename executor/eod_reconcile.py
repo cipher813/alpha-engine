@@ -33,6 +33,7 @@ from executor.dividends import (
 )
 from executor.eod_emailer import send_eod_email
 from executor.eod_report import build_eod_report, write_eod_report
+from executor.market_hours import is_trading_day
 from executor.pnl_backfill import backfill_residual_sleeves
 from executor.pnl_integrity import (
     RESIDUAL_CUMULATIVE_WINDOW_SESSIONS,
@@ -1004,6 +1005,47 @@ def run(
                 f"(run_audit=False)."
             )
         logger.info("EOD reconciliation | date=%s (explicit)", run_date)
+
+    # ── Session-axis gate: eod_pnl rows are SESSIONS (I9615) ───────────────
+    # Every chain-linked measurement over eod_pnl treats adjacent rows as
+    # adjacent sessions. A row keyed to a day the market never opened is not a
+    # session, and it silently contributes a spurious link to every chained
+    # series computed on top.
+    #
+    # This is not hypothetical. `eod_pnl` carries a row for Good Friday
+    # 2026-04-03, written by a live EOD run at 2026-04-03T20:20:21Z. Measured
+    # from the live artifact: it is NOT a duplicate of 2026-04-02 — the same
+    # three names (CVX/NVT/TER) at the same share counts carry DIFFERENT market
+    # values (CVX 69,049.53 -> 69,118.93), so IB holiday quotes moved the book
+    # by +$216.77 (+0.0216%), while `spy_close` was carried forward unchanged
+    # (655.830017 on both rows) making `spy_return_pct` exactly 0.000000. The
+    # row therefore injects +2.16bp of fabricated alpha into every chained
+    # series that crosses it.
+    #
+    # The LIVE path can no longer key a row this way: `now_dual().trading_day`
+    # is `last_closed_trading_day(now)` and returns 2026-04-02 on Good Friday
+    # (measured), and the axis guard above pins an explicit run_date to it. The
+    # hole that remains is this one — the `run_audit=False` correction/backfill
+    # path accepts an arbitrary run_date with no session check at all.
+    #
+    # RAISE rather than warn. There is no legitimate non-trading-day eod_pnl
+    # row: the value is definitionally absent, not merely unmeasured, so a
+    # producer that writes one is stating something false. `pnl_integrity`'s
+    # session-axis gate (I9615 deliverable 3) DETECTS such a row after the
+    # fact; this refuses to create one. Detector and producer are the same
+    # invariant expressed at two ends, and only this end can prevent it.
+    #
+    # This gate does NOT touch the existing 2026-04-03 row. Repairing the
+    # historical series is a separate, RESERVED decision (I9629 / I9613).
+    if not is_trading_day(date.fromisoformat(run_date)):
+        raise RuntimeError(
+            f"EOD reconcile refusing to write an eod_pnl row for {run_date}: "
+            f"it is not an NYSE trading session. An eod_pnl row IS a session — "
+            f"every chain-linked series over this table treats adjacent rows as "
+            f"adjacent sessions — so a non-trading-day row is a fabricated link, "
+            f"not a missing one (alpha-engine-config-I9615). If a real session "
+            f"is missing, backfill that session; do not reconcile a holiday."
+        )
 
     # ── T+1 self-heal, run BEFORE today's own reconcile (config#6349) ───────
     # This used to fire at the tail of `run()`, AFTER the NAV three-way

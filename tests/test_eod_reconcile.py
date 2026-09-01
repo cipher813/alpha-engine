@@ -479,6 +479,12 @@ class TestPnLMath:
 # must exist for run_date" instead of "run_date must equal today."
 
 
+# NOTE (alpha-engine-config-I9615): the dates below are 2026-04-24, a real NYSE
+# session, not the 2026-04-25 Saturday they used to be. `eod_reconcile.run` now
+# refuses any run_date that is not a trading session — an eod_pnl row IS a
+# session — so a fixture using an arbitrary weekend date stops at that gate
+# before reaching the contract it means to exercise. The contract under test is
+# unchanged: a HISTORICAL run_date on the correction path.
 class TestSnapshotContract:
     def test_default_resolves_to_now_dual_trading_day(self):
         """run() with no run_date resolves via now_dual().trading_day, not
@@ -511,7 +517,7 @@ class TestSnapshotContract:
             )
             mock_cfg.side_effect = RuntimeError("expected_test_sentinel")
             with pytest.raises(RuntimeError, match="expected_test_sentinel"):
-                run(run_date="2026-04-25", run_audit=False)
+                run(run_date="2026-04-24", run_audit=False)
 
     def test_live_run_refuses_mismatched_date(self):
         """The LIVE daily path (run_audit=True) must refuse a run_date that
@@ -525,7 +531,7 @@ class TestSnapshotContract:
                 trading_day="2026-04-28", calendar_date="2026-04-28"
             )
             with pytest.raises(RuntimeError, match="refusing live run"):
-                run(run_date="2026-04-25", run_audit=True)
+                run(run_date="2026-04-24", run_audit=True)
 
     def test_run_raises_when_snapshot_missing(self):
         """If no snapshot exists at s3://...trades/snapshots/{run_date}.json,
@@ -575,9 +581,9 @@ class TestSnapshotContract:
             mock_db.return_value = MagicMock()
             mock_load.return_value = None
             with pytest.raises(RuntimeError) as exc:
-                run(run_date="2026-04-25", run_audit=False)
+                run(run_date="2026-04-24", run_audit=False)
             msg = str(exc.value)
-            assert "2026-04-25" in msg
+            assert "2026-04-24" in msg
             assert "snapshot_capturer.py" in msg
             assert "trades/snapshots/" in msg
 
@@ -658,7 +664,7 @@ class TestSelfHealOrdering:
             mock_db.return_value = MagicMock()
             mock_load.return_value = None
             with pytest.raises(RuntimeError, match="No snapshot at s3://"):
-                run(run_date="2026-04-25", run_audit=False)
+                run(run_date="2026-04-24", run_audit=False)
         mock_audit.assert_not_called()
 
     def test_eod_no_longer_imports_ibkrclient(self):
@@ -674,14 +680,14 @@ class TestSelfHealOrdering:
 
     def test_cli_date_flag_forwards_to_run(self):
         """`python eod_reconcile.py --date YYYY-MM-DD` invokes run(run_date=...)."""
-        argv = ["eod_reconcile.py", "--date", "2026-04-25"]
+        argv = ["eod_reconcile.py", "--date", "2026-04-24"]
         with patch.object(sys, "argv", argv):
             import argparse
 
             parser = argparse.ArgumentParser()
             parser.add_argument("--date", default=None)
             args = parser.parse_args(argv[1:])
-            assert args.date == "2026-04-25"
+            assert args.date == "2026-04-24"
 
     def test_cli_no_args_passes_none(self):
         """No --date passes None, which run() resolves via now_dual."""
