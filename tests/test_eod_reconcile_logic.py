@@ -922,3 +922,56 @@ class TestHardGateWiringIsNotTautological:
         mb, _result = self._wire(today, prior, pricing_timing_usd=500.1)
         assert mb["explained_usd"] != pytest.approx(mb["covered_usd"])
         assert mb["explained_usd"] == pytest.approx(500.0)
+
+
+class TestEodPnlSessionAxisGate:
+    """alpha-engine-config-I9615 — an eod_pnl row IS a session.
+
+    `eod_pnl` carries a row for Good Friday 2026-04-03. Measured from the live
+    artifact, it is NOT a duplicate of 2026-04-02: the same three names
+    (CVX/NVT/TER) at the same share counts carry different market values
+    (CVX 69,049.53 -> 69,118.93), so IB holiday quotes moved the book by
+    +$216.77 (+0.0216%) while `spy_close` was carried forward unchanged
+    (655.830017 on both rows), making `spy_return_pct` exactly 0.000000 —
+    +2.16bp of fabricated alpha in every chained series crossing it.
+
+    `pnl_integrity`'s session-axis gate DETECTS such a row after the fact.
+    This asserts the producer REFUSES to create one.
+    """
+
+    def test_refuses_to_reconcile_a_market_holiday(self):
+        import pytest
+
+        from executor.eod_reconcile import run
+
+        # Good Friday 2026. run_audit=False is the correction/backfill path —
+        # the one that accepts an arbitrary run_date, and the only remaining
+        # way a non-trading-day row could be produced.
+        with pytest.raises(RuntimeError, match="not an NYSE trading session"):
+            run(run_date="2026-04-03", send_email=False, run_audit=False)
+
+    def test_the_refusal_names_the_date_and_the_reason(self):
+        import pytest
+
+        from executor.eod_reconcile import run
+
+        with pytest.raises(RuntimeError) as exc:
+            run(run_date="2026-12-25", send_email=False, run_audit=False)
+        msg = str(exc.value)
+        assert "2026-12-25" in msg
+        # A silent refusal is as bad as a silent write: the message has to say
+        # what to do instead, or an operator "fixes" it by removing the gate.
+        assert "backfill that session" in msg
+
+    def test_a_real_trading_day_is_not_refused_by_this_gate(self):
+        """The gate must not become a reason a legitimate correction pass
+        cannot run — it fails PAST this check for a real session."""
+        import pytest
+
+        from executor.eod_reconcile import run
+
+        # 2026-03-12 IS an NYSE session (it is one of I9615's two genuinely
+        # missing rows). Whatever this raises, it must not be the session gate.
+        with pytest.raises(Exception) as exc:  # noqa: B017 — any downstream failure is fine
+            run(run_date="2026-03-12", send_email=False, run_audit=False)
+        assert "not an NYSE trading session" not in str(exc.value)
