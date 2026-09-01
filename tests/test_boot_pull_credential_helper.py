@@ -50,7 +50,7 @@ def test_netrc_is_unconditionally_removed_every_run():
     installed and never consulted (measured on the dashboard box, I9739)."""
     src = _src()
     assert f'NETRC="{_NETRC_LITERAL}"' in src
-    assert f'rm -f "$NETRC"' in src
+    assert 'rm -f "$NETRC"' in src
     # Must be unconditional at the shell level: only gated on the file
     # existing (so `rm -f` doesn't spuriously log every boot), never gated on
     # whether a fresh token could be minted, an SSM read succeeded, or any
@@ -102,8 +102,8 @@ def test_credential_helper_check_failure_is_fail_loud():
     App installation lost read on this repo, or the instance role lost
     ssm:GetParameter) must also increment the same failure accumulator."""
     src = _src()
-    assert f'"$HELPER" --check alpha-engine-config' in src
-    check_branch = src[src.index(f'"$HELPER" --check alpha-engine-config') :]
+    assert '"$HELPER" --check alpha-engine-config' in src
+    check_branch = src[src.index('"$HELPER" --check alpha-engine-config') :]
     check_branch = check_branch[: check_branch.index("else")]
     assert 'log "FAIL' in check_branch
     assert "PULL_FAILURES=$((PULL_FAILURES + 1))" in check_branch
