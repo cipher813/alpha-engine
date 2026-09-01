@@ -177,46 +177,60 @@ fi
 
 log "=== boot-pull started ==="
 
-# ── Refresh the GitHub PAT in ~/.netrc from SSM ────────────────────────────
-# alpha-engine-config is the only PRIVATE repo pulled below; git authenticates
-# to it over HTTPS via the fine-grained PAT in ~/.netrc (libcurl reads ~/.netrc
-# by default — see this repo's CLAUDE.md "GitHub access on EC2"). That token
-# used to be hand-copied onto each box, so a PAT rotation silently broke every
-# box's private-repo pull until someone re-pasted it. 2026-06-03 incident: the
-# executor PAT was rotated; the sibling dashboard box's stale ~/.netrc started
-# returning 401 and its boot-pull FAILed on alpha-engine-config.
+# Accumulate pull/pip/credential failures so we can surface them LOUD at the
+# end (per ~/Development/CLAUDE.md item 3 — fail-loud). Declared here (moved
+# up from below the REPOS loop, alpha-engine-config-I9739) because the
+# credential-helper assertion below is now the FIRST possible failure source
+# in this script, and it must be able to increment the same counter/array
+# every later failure uses rather than inventing a second mechanism.
+PULL_FAILURES=0
+FAILED_REPOS=()
+
+# ── Refuse the long-lived PAT; assert the credential helper instead ────────
+# alpha-engine-config-I9739 deliverable 3. This block used to hydrate the
+# netrc file on every boot from /alpha-engine/GITHUB_TOKEN (a fine-grained
+# PAT) so libcurl could authenticate git's HTTPS calls to GitHub — see this
+# repo's git history for that block. It is gone, not merely disabled behind a
+# flag, for the reason measured 2026-09-01 (alpha-engine-config-I9739):
 #
-# /alpha-engine/GITHUB_TOKEN (SecureString) is now the single source of truth.
-# Hydrating ~/.netrc from it on every run means a future rotation only needs an
-# SSM update — it auto-propagates to every box within one boot cycle. Mirrors
-# the dashboard repo's boot-pull.sh (alpha-engine-dashboard/infrastructure/).
+# git sets CURLOPT_NETRC to CURL_NETRC_OPTIONAL unconditionally, so libcurl
+# answers GitHub's 401 challenge from the netrc file BEFORE git ever consults
+# a configured credential helper. The netrc file does not compete with
+# `/usr/local/bin/git-credential-nousergon-app` (alpha-engine-config-I9628,
+# nous-ergon-ops-PR962) — it outranks it categorically. A box that still has
+# one from any earlier boot is a box where the helper is installed, provably
+# able to mint, and NEVER consulted — proven inert on the dashboard box for
+# every merge since the 2026-08-31 token rotation. `--check` passing is not
+# evidence the helper is actually used; only removing the netrc file is.
 #
-# Best-effort by design (per ~/Development/CLAUDE.md item 3 — fail-loud): a
-# refresh failure here is WARN-only and MUST NOT clobber a working ~/.netrc,
-# because the on-disk token may still be valid and we only overwrite when SSM
-# hands back a non-empty token (a transient SSM blip can never wipe valid
-# creds). NOTE: this script only WARN-logs a private-repo fetch failure to
-# /var/log/boot-pull.log (no flow-doctor report like the dashboard box has) —
-# tracked as a follow-up to add symmetric failure surfacing.
-GH_USER="cipher813"
+# So every boot removes it unconditionally (not just when refreshing it),
+# rather than leaving it in place until the next SSM read happens to fail.
 NETRC="/home/ec2-user/.netrc"
-if GH_TOKEN=$(aws ssm get-parameter --name /alpha-engine/GITHUB_TOKEN \
-        --with-decryption --query "Parameter.Value" --output text 2>>"$LOG") \
-        && [ -n "$GH_TOKEN" ] && [ "$GH_TOKEN" != "None" ]; then
-    NEW_NETRC="machine github.com login ${GH_USER} password ${GH_TOKEN}"
-    if [ ! -f "$NETRC" ] || [ "$NEW_NETRC" != "$(cat "$NETRC" 2>/dev/null)" ]; then
-        # umask 077 + atomic tmp→mv so the token never lands in a
-        # world-readable or half-written file.
-        ( umask 077; printf '%s\n' "$NEW_NETRC" > "${NETRC}.tmp.$$" )
-        mv "${NETRC}.tmp.$$" "$NETRC"
-        chmod 600 "$NETRC"
-        log "OK   ~/.netrc refreshed from SSM /alpha-engine/GITHUB_TOKEN"
-    else
-        log "OK   ~/.netrc unchanged from SSM"
-    fi
-    unset GH_TOKEN NEW_NETRC
+if [ -e "$NETRC" ]; then
+    rm -f "$NETRC"
+    log "OK   removed the netrc file — the credential helper (git-credential-nousergon-app) is the only authentication path now"
+fi
+
+# The helper mints a per-use, short-lived GitHub App installation token from
+# this box's own instance role (alpha-engine-executor-role already reads
+# /alpha-engine/groom/github_app_* via alpha-engine-ssm-read — no IAM change,
+# no operator step). A box with neither the helper nor the netrc file cannot
+# authenticate at all, and that must not pass silently: the private-repo pull
+# below (alpha-engine-config) would otherwise fail with an opaque 403 deep in
+# the git-sync retry logic instead of a named, attributable cause here.
+# `--check` mints and discards a real token and prints only its LENGTH, never
+# the token itself, so this is safe to log in full.
+HELPER="/usr/local/bin/git-credential-nousergon-app"
+if [ ! -x "$HELPER" ]; then
+    log "FAIL git credential helper missing/not executable at $HELPER — this box cannot authenticate to GitHub for private-repo pulls (netrc file removed above, no fallback by design)"
+    PULL_FAILURES=$((PULL_FAILURES + 1))
+    FAILED_REPOS+=("git-credential-helper (missing)")
+elif ! "$HELPER" --check alpha-engine-config >> "$LOG" 2>&1; then
+    log "FAIL git credential helper present but --check alpha-engine-config failed — this box cannot authenticate to GitHub for private-repo pulls"
+    PULL_FAILURES=$((PULL_FAILURES + 1))
+    FAILED_REPOS+=("git-credential-helper (check failed)")
 else
-    log "WARN ~/.netrc refresh skipped — SSM /alpha-engine/GITHUB_TOKEN unreadable/empty; keeping existing ~/.netrc (private-repo pull will WARN below if the on-disk token is also stale)"
+    log "OK   git credential helper verified (--check alpha-engine-config)"
 fi
 
 # Weekday/EOD SF only SSM-invokes executor + data on this box; dashboard and
@@ -226,16 +240,6 @@ REPOS=(
     /home/ec2-user/alpha-engine
     /home/ec2-user/alpha-engine-data
 )
-
-# Accumulate pull/pip failures so we can surface them LOUD at the end (per
-# ~/Development/CLAUDE.md item 3 — fail-loud). Previously this script only
-# WARN-logged a fetch/reset failure to /var/log/boot-pull.log and continued,
-# so a private-repo auth break (e.g. the 2026-06-03 PAT-rotation incident,
-# which silently failed THIS box's alpha-engine-config pull at 12:45 UTC with
-# no badge/email) was invisible. The sibling dashboard box already reported via
-# flow-doctor; this closes the asymmetry (ROADMAP L4490).
-PULL_FAILURES=0
-FAILED_REPOS=()
 
 for repo in "${REPOS[@]}"; do
     if [ ! -d "$repo/.git" ]; then
