@@ -41,6 +41,23 @@ def _src() -> str:
     return _BOOT_PULL.read_text()
 
 
+def _gitconfig_branch(src: str) -> str:
+    """The loop body that scans the gitconfig files for a token literal."""
+    start = src.index("for GITCONFIG in ")
+    return src[start : src.index("\ndone\n", start) + 6]
+
+
+def test_gitconfig_probe_reads_both_gitconfig_files() -> None:
+    """The 2026-09-02 sweep found the same token literal in ec2-user's
+    gitconfig AND in root's. boot-pull runs as root and reaches git through
+    sudo in several places, so a probe reading one of the two reports a box
+    clean while it is not — the same shape as the --check defect, one file
+    down."""
+    branch = _gitconfig_branch(_src())
+    assert "/home/ec2-user/.gitconfig" in branch
+    assert "/root/.gitconfig" in branch
+
+
 def test_credential_assertion_probes_the_consumer_path_not_only_minting():
     """A probe of the path the repo loop actually uses, against the one
     private repo, before any repo is pulled."""
@@ -92,8 +109,7 @@ def test_new_probes_are_observe_only_on_merge():
         "the ls-remote probe is enforcing on merge, violating §7a observe-first"
     )
 
-    gc_branch = src[src.index("GITCONFIG="):]
-    gc_branch = gc_branch[: gc_branch.index("\nfi\n") + 4]
+    gc_branch = _gitconfig_branch(src)
     assert "PULL_FAILURES=$((PULL_FAILURES + 1))" not in gc_branch, (
         "the .gitconfig probe is enforcing on merge; the condition it detects "
         "is live on the box today (I9835), so this would be a self-inflicted red"
@@ -112,9 +128,7 @@ def test_observe_mode_probes_carry_a_promotion_criterion():
 def test_gitconfig_probe_never_echoes_the_matched_secret():
     """The finding is the file and the line number. The value is a live
     credential and this log is read by agents."""
-    src = _src()
-    gc_branch = src[src.index("GITCONFIG="):]
-    gc_branch = gc_branch[: gc_branch.index("\nfi\n") + 4]
+    gc_branch = _gitconfig_branch(_src())
     assert "cut -d: -f1" in gc_branch, (
         "the .gitconfig probe must reduce grep -n output to line numbers only"
     )

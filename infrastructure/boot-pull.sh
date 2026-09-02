@@ -281,16 +281,20 @@ fi
 # rung-5 property this box is supposed to hold is "no long-lived GitHub
 # secret on disk", and checking one of the several places such a secret can
 # live reports a box clean while it is not.
-GITCONFIG="/home/ec2-user/.gitconfig"
-if [ -f "$GITCONFIG" ] && grep -qE '(gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}' "$GITCONFIG" 2>/dev/null; then
+# Both files, not one. The 2026-09-02 sweep found the same token literal in
+# ec2-user's gitconfig AND in root's. boot-pull runs as root and reaches git
+# through sudo in several places, so root's copy is equally load-bearing and
+# equally invisible. A probe reading one of the two reports a box clean while
+# it is not - the same shape as the --check defect above, one file down.
+for GITCONFIG in /home/ec2-user/.gitconfig /root/.gitconfig; do
+    [ -f "$GITCONFIG" ] || continue
+    grep -qE '(gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}' "$GITCONFIG" 2>/dev/null || continue
     # Never echo the match. The finding is the file and the line number; the
     # value is a live credential and this log is read by agents.
     _gc_lines=$(grep -nE '(gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}' "$GITCONFIG" 2>/dev/null | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')
-    # OBSERVE-ONLY on merge — see the promotion criterion above. The condition
-    # this detects is present on the trading box TODAY (I9835), so promoting it
-    # on merge would fail boot-pull on every boot for a tracked, known finding.
+    # OBSERVE-ONLY on merge - see the promotion criterion above.
     log "OBSERVE a long-lived GitHub token literal is present in $GITCONFIG (line(s) ${_gc_lines}) — it outranks the credential helper for any URL it matches and survives the dotfile removal above. Tracked as alpha-engine-config-I9835; this probe is in observe mode and is NOT failing the run."
-fi
+done
 
 # Weekday/EOD SF only SSM-invokes executor + data on this box; dashboard and
 # backtester live on ae-dashboard / Saturday spots (see config#1767).
