@@ -229,8 +229,67 @@ elif ! "$HELPER" --check alpha-engine-config >> "$LOG" 2>&1; then
     log "FAIL git credential helper present but --check alpha-engine-config failed — this box cannot authenticate to GitHub for private-repo pulls"
     PULL_FAILURES=$((PULL_FAILURES + 1))
     FAILED_REPOS+=("git-credential-helper (check failed)")
+elif ! sudo -u ec2-user -H git ls-remote --quiet \
+        https://github.com/nousergon/alpha-engine-config.git HEAD >> "$LOG" 2>&1; then
+    # OBSERVE-ONLY (sf-pipeline-policy.md §7a / SFP-7a-new-guard-observes-first).
+    # Deliberately does NOT increment PULL_FAILURES yet — see the promotion
+    # criterion below.
+    log "OBSERVE git credential helper mints a token, but git itself cannot reach nousergon/alpha-engine-config — something is answering GitHub ahead of the helper (a credential dotfile, a url.insteadOf rewrite in .gitconfig, or an embedded credential in a remote URL). This probe is in observe mode and is NOT failing the run; the repo loop below is still the enforcing path."
 else
-    log "OK   git credential helper verified (--check alpha-engine-config)"
+    log "OK   git credential helper verified — mints (--check) AND git ls-remote reaches alpha-engine-config"
+fi
+
+# ── Promotion criterion for the two observe-mode probes in this block ─────
+# sf-pipeline-policy.md §7a requires a newly added check whose verdict can
+# halt a scheduled-pipeline stage to observe first, to carry its promotion
+# criterion in its own module, and to be loud while observing. Both probes
+# added by alpha-engine-config-I9829 are therefore OBSERVE-only on merge.
+#
+#   Promote both to FAIL (increment PULL_FAILURES, append to FAILED_REPOS)
+#   when BOTH hold:
+#     1. Ten consecutive trading-day boots have logged the probe's OK line
+#        with no OBSERVE line, proving it does not false-positive on a
+#        healthy box (the ls-remote probe reaches the network early in boot,
+#        which is exactly where a transient failure would live).
+#     2. alpha-engine-config-I9835 is CLOSED — the .gitconfig token literal
+#        is gone from every box carrying the helper. Promoting the gitconfig
+#        probe before then would fail boot-pull on every boot for a condition
+#        already tracked and already known, which is a self-inflicted red
+#        rather than a detection.
+#
+# Re-exam: 2026-09-16. If neither has promoted by then, the probes are
+# either wrong or unowned; decide which rather than leaving them observing.
+
+# ── The helper minting is not evidence the helper is USED ─────────────────
+# alpha-engine-config-I9829. On 2026-09-02 `--check` passed on every boot
+# while every real fetch of alpha-engine-config returned 403. The helper was
+# installed, configured and provably able to mint a token whose installation
+# covers exactly that repo — and GIT_TRACE showed git never invoked it once.
+# git sets CURLOPT_NETRC unconditionally, so libcurl answered from the
+# credential dotfile first; that credential is VALID but unpermitted, so
+# GitHub replied 403 rather than 401, and with no 401 challenge git had no
+# reason to consult a helper at all. A minting probe and the consumer path
+# can therefore disagree indefinitely, and the minting probe is the one that
+# looks healthy. Hence the ls-remote above: it exercises the path the repo
+# loop actually uses, against the one private repo, before any repo is pulled.
+#
+# The same reasoning extends past the dotfile. A token embedded in a
+# `url.<...>.insteadOf` rewrite in .gitconfig, or in a remote URL, outranks
+# the helper the same way and survives the dotfile removal above untouched —
+# measured on this box 2026-09-02 (alpha-engine-config-I9835), where a live
+# fine-grained PAT sits in ~/.gitconfig for a personal-account repo. The
+# rung-5 property this box is supposed to hold is "no long-lived GitHub
+# secret on disk", and checking one of the several places such a secret can
+# live reports a box clean while it is not.
+GITCONFIG="/home/ec2-user/.gitconfig"
+if [ -f "$GITCONFIG" ] && grep -qE '(gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}' "$GITCONFIG" 2>/dev/null; then
+    # Never echo the match. The finding is the file and the line number; the
+    # value is a live credential and this log is read by agents.
+    _gc_lines=$(grep -nE '(gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}' "$GITCONFIG" 2>/dev/null | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')
+    # OBSERVE-ONLY on merge — see the promotion criterion above. The condition
+    # this detects is present on the trading box TODAY (I9835), so promoting it
+    # on merge would fail boot-pull on every boot for a tracked, known finding.
+    log "OBSERVE a long-lived GitHub token literal is present in $GITCONFIG (line(s) ${_gc_lines}) — it outranks the credential helper for any URL it matches and survives the dotfile removal above. Tracked as alpha-engine-config-I9835; this probe is in observe mode and is NOT failing the run."
 fi
 
 # Weekday/EOD SF only SSM-invokes executor + data on this box; dashboard and
@@ -810,7 +869,25 @@ if [ "$PULL_FAILURES" -gt 0 ]; then
     # own secrets, so there is no hydration list here to drift.
     ALERT_PY="/home/ec2-user/alpha-engine/.venv/bin/python"
     if [ -x "$ALERT_PY" ]; then
-        _dkey="boot-pull-trading-$(printf '%s' "${FAILED_REPOS[*]}" | tr ' /' '__' | cut -c1-72)"
+        # The key carries the UTC date. alpha-engine-config-I9829: without it,
+        # a failure that recurs at the box's once-a-day boot cadence collides
+        # with its own previous publish inside the 1440-minute window and is
+        # suppressed. Measured — boot-pull failed on every boot from 08-31
+        # 22:14 onward, and the alert published on 09-02 only:
+        #
+        #   08-31 22:14  dedup_skipped=True
+        #   08-31 22:29  dedup_skipped=True
+        #   09-01 12:16  dedup_skipped=True   <- the day preopen lost a session
+        #   09-02 12:16  sns.ok=True          <- first and only publish
+        #
+        # A 24-hour window against a 24-hour cadence is a coin flip on clock
+        # drift, and it lands on "suppress" exactly when the failure is
+        # persistent rather than transient — the case the operator most needs
+        # to see. Dating the key states the intent the window was standing in
+        # for: at most one alert per distinct failure per day, however many
+        # times the box boots, and never a day of silence because yesterday
+        # already reported it.
+        _dkey="boot-pull-trading-$(date -u +%Y-%m-%d)-$(printf '%s' "${FAILED_REPOS[*]}" | tr ' /' '__' | cut -c1-72)"
         "$ALERT_PY" -m krepis.alerts publish \
             --message "boot-pull FAILED on the TRADING box: ${PULL_FAILURES} repo(s) could not be updated — ${FAILED_REPOS[*]}. The executor may be running stale code for today's session. See /var/log/boot-pull.log." \
             --severity error \
