@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -529,6 +530,7 @@ def test_an_unparseable_snapshot_is_named_and_skipped():
     assert got["flags"] == []
     assert got["refused"] == [{
         "date": "2026-06-02", "ticker": None,
+        "verdict": B.VERDICT_REFUSED_NOT_RECONSTRUCTIBLE,
         "reason": "positions_snapshot absent or unparseable — the session "
                   "cannot be examined and is NOT reported as clean",
     }]
@@ -711,3 +713,325 @@ def test_cli_no_flags_does_not_select_the_restatement_leg():
     assert B._build_parser().parse_args([]).restate_marks is False
     assert B._build_parser().parse_args(["--restate-marks"]).restate_marks is True
     assert B._build_parser().parse_args([]).apply is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The range discriminator, evaluated in-region — alpha-engine-config-I9629
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Fixtures are the two measured candidate sessions the in-region PLAN pass
+# reported on 2026-09-04:
+#
+#   2026-08-04  AMD  225 sh, broker mark $479.00 vs settled close $518.58
+#                    → +$8,906 correction
+#   2026-08-26  MU   108 sh, broker mark $956.57 vs settled close $938.40
+#                    → −$1,962 correction
+#
+# On a $1,036,000 NAV the materiality floor is max($500, 15bp) = $1,554 and the
+# correction bound is max($10,000, 100bp) = $10,360, so both are material and
+# both sit inside the bound. What separates them is the day's traded range, and
+# that is exactly the input the degenerate range could not supply.
+
+_R_NAV_0, _R_NAV_1, _R_NAV_2 = 1_000_000.0, 1_036_000.0, 1_040_000.0
+
+_AMD_SHARES, _AMD_IB_MARK, _AMD_CLOSE = 225.0, 479.00, 518.58
+_MU_SHARES, _MU_IB_MARK, _MU_CLOSE = 108.0, 956.57, 938.40
+
+_AMD_CORRECTION = _AMD_SHARES * (_AMD_CLOSE - _AMD_IB_MARK)   # +8,905.50
+_MU_CORRECTION = _MU_SHARES * (_MU_CLOSE - _MU_IB_MARK)       # −1,962.36
+
+
+def _snap(ticker, shares, ib_mark, close):
+    return json.dumps({ticker: {"shares": shares,
+                                "market_value": shares * close,
+                                "ib_market_value": shares * ib_mark}})
+
+
+class _FakeArcticLib:
+    """Same shape the live gate consumes: ``lib.read(ticker).data`` → DataFrame."""
+
+    def __init__(self, frames):
+        self._frames = frames
+        self.reads = []
+
+    def read(self, ticker):
+        self.reads.append(ticker)
+        if ticker not in self._frames:
+            raise KeyError(f"NoSuchVersionException: {ticker}")
+        return SimpleNamespace(data=self._frames[ticker])
+
+
+def _ohlc(rows):
+    """``{date: (low, high, close)}`` → the DataFrame ArcticDB returns."""
+    import pandas as pd
+
+    idx = pd.DatetimeIndex([pd.Timestamp(d) for d in rows])
+    return pd.DataFrame(
+        {
+            "Low": [v[0] for v in rows.values()],
+            "High": [v[1] for v in rows.values()],
+            "Close": [v[2] for v in rows.values()],
+        },
+        index=idx,
+    )
+
+
+def _ranged_source(frames):
+    return B.ArcticDBDayRangeSource(universe_lib=_FakeArcticLib(frames))
+
+
+def _amd_conn(path=":memory:"):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE eod_pnl (date TEXT PRIMARY KEY, portfolio_nav REAL, "
+        "daily_return_pct REAL, spy_return_pct REAL, daily_alpha_pct REAL, "
+        "positions_snapshot TEXT, nav_ib_raw_usd REAL, "
+        "nav_mark_correction_usd REAL, nav_mark_correction_json TEXT)"
+    )
+    r1 = (_R_NAV_1 - _R_NAV_0) / _R_NAV_0 * 100.0
+    r2 = (_R_NAV_2 - _R_NAV_1) / _R_NAV_1 * 100.0
+    amd = _snap("AMD", _AMD_SHARES, _AMD_IB_MARK, _AMD_CLOSE)
+    conn.executemany(
+        "INSERT INTO eod_pnl (date, portfolio_nav, daily_return_pct, "
+        "spy_return_pct, daily_alpha_pct, positions_snapshot) VALUES (?,?,?,?,?,?)",
+        [
+            ("2026-08-03", _R_NAV_0, None, 0.1, None, _CLEAN_SNAP),
+            ("2026-08-04", _R_NAV_1, r1, 0.1, r1 - 0.1, amd),
+            ("2026-08-05", _R_NAV_2, r2, 0.1, r2 - 0.1, _CLEAN_SNAP),
+        ],
+    )
+    conn.commit()
+    return conn
+
+
+def _mu_conn(path=":memory:"):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE eod_pnl (date TEXT PRIMARY KEY, portfolio_nav REAL, "
+        "daily_return_pct REAL, spy_return_pct REAL, daily_alpha_pct REAL, "
+        "positions_snapshot TEXT, nav_ib_raw_usd REAL, "
+        "nav_mark_correction_usd REAL, nav_mark_correction_json TEXT)"
+    )
+    mu = _snap("MU", _MU_SHARES, _MU_IB_MARK, _MU_CLOSE)
+    conn.executemany(
+        "INSERT INTO eod_pnl (date, portfolio_nav, daily_return_pct, "
+        "spy_return_pct, daily_alpha_pct, positions_snapshot) VALUES (?,?,?,?,?,?)",
+        [
+            ("2026-08-25", _R_NAV_0, None, 0.1, None, _CLEAN_SNAP),
+            ("2026-08-26", _R_NAV_1, 3.6, 0.1, 3.5, mu),
+            ("2026-08-27", _R_NAV_2, 0.38, 0.1, 0.28, _CLEAN_SNAP),
+        ],
+    )
+    conn.commit()
+    return conn
+
+
+# ── (i) a mark OUTSIDE the range is restated, discriminator EVALUATED ────────
+
+def test_a_mark_outside_the_fetched_range_is_restated_with_the_discriminator_on():
+    """AMD 2026-08-04: $479.00 below a [$500.00, $525.00] traded range."""
+    src = _ranged_source(
+        {"AMD": _ohlc({"2026-08-04": (500.00, 525.00, _AMD_CLOSE)})}
+    )
+    plan = B.plan_historical_mark_restatement(B._rows(_amd_conn()), range_source=src)
+    assert len(plan["restatements"]) == 1
+    r = plan["restatements"][0]
+    assert r["date"] == "2026-08-04"
+    assert r["nav_mark_correction_usd"] == pytest.approx(_AMD_CORRECTION)
+    assert r["portfolio_nav"] == pytest.approx(_R_NAV_1 + _AMD_CORRECTION)
+    payload = r["nav_mark_correction_json"]
+    assert payload["discriminator_evaluated"] is True
+    assert payload["basis"] == B.MARK_BASIS_RECONSTRUCTED_RANGED
+    assert payload["range_source"] == B.RANGE_SOURCE_ARCTICDB
+    assert payload["day_ranges"]["AMD"] == [500.00, 525.00]
+    # The range that was actually tested is on the correction itself.
+    assert r["corrections"][0]["day_low"] == 500.00
+    assert r["corrections"][0]["day_high"] == 525.00
+    assert plan["verdict_counts"] == {B.VERDICT_RESTATED: 1}
+    assert plan["session_verdicts"][0]["verdict"] == B.VERDICT_RESTATED
+    assert plan["discriminator_evaluated"] is True
+
+
+# ── (ii) a mark INSIDE the range is refused ──────────────────────────────────
+
+def test_a_mark_inside_the_fetched_range_is_refused_by_name():
+    """MU 2026-08-26: $956.57 sits inside [$930.00, $960.00] — not provably wrong."""
+    src = _ranged_source(
+        {"MU": _ohlc({"2026-08-26": (930.00, 960.00, _MU_CLOSE)})}
+    )
+    plan = B.plan_historical_mark_restatement(B._rows(_mu_conn()), range_source=src)
+    assert plan["restatements"] == []
+    assert plan["chain"] == []
+    refused = [r for r in plan["refused"] if r["ticker"] == "MU"]
+    assert len(refused) == 1
+    assert refused[0]["verdict"] == B.VERDICT_REFUSED_INSIDE_RANGE
+    assert refused[0]["ib_mark"] == pytest.approx(_MU_IB_MARK)
+    assert refused[0]["day_low"] == 930.00
+    assert refused[0]["day_high"] == 960.00
+    assert "INSIDE the day's traded range" in refused[0]["reason"]
+    assert "I9638" in refused[0]["reason"]
+    assert plan["verdict_counts"] == {B.VERDICT_REFUSED_INSIDE_RANGE: 1}
+
+
+def test_a_session_whose_every_material_name_is_refused_is_not_restated():
+    src = _ranged_source(
+        {"MU": _ohlc({"2026-08-26": (930.00, 960.00, _MU_CLOSE)})}
+    )
+    plan = B.plan_historical_mark_restatement(B._rows(_mu_conn()), range_source=src)
+    verdict = plan["session_verdicts"][0]
+    assert verdict["date"] == "2026-08-26"
+    assert verdict["verdict"] == B.VERDICT_REFUSED_INSIDE_RANGE
+    assert verdict["names_restated"] == []
+    assert [n["ticker"] for n in verdict["names_refused"]] == ["MU"]
+
+
+# ── (iii) no range → refused, NEVER a silent degenerate fallback ─────────────
+
+def test_a_name_with_no_row_for_the_date_is_refused_not_degenerately_restated():
+    """The range exists for another session — the mark is still not checkable."""
+    src = _ranged_source(
+        {"AMD": _ohlc({"2026-08-03": (500.00, 525.00, 510.00)})}
+    )
+    plan = B.plan_historical_mark_restatement(B._rows(_amd_conn()), range_source=src)
+    assert plan["restatements"] == []
+    refused = [r for r in plan["refused"] if r["ticker"] == "AMD"]
+    assert refused[0]["verdict"] == B.VERDICT_REFUSED_NO_RANGE
+    assert "no row for AMD on 2026-08-04" in refused[0]["reason"]
+    assert plan["verdict_counts"] == {B.VERDICT_REFUSED_NO_RANGE: 1}
+
+
+def test_a_ticker_arcticdb_cannot_read_is_refused_with_the_exception_named():
+    src = _ranged_source({})  # AMD absent → the fake lib raises
+    plan = B.plan_historical_mark_restatement(B._rows(_amd_conn()), range_source=src)
+    assert plan["restatements"] == []
+    refused = [r for r in plan["refused"] if r["ticker"] == "AMD"]
+    assert refused[0]["verdict"] == B.VERDICT_REFUSED_NO_RANGE
+    assert "ArcticDB read failed for AMD" in refused[0]["reason"]
+    assert "KeyError" in refused[0]["reason"]
+
+
+def test_a_close_only_row_is_refused_rather_than_range_checked():
+    """The macro library is Close-only for some holdable symbols (I9637)."""
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {"Close": [_AMD_CLOSE]}, index=pd.DatetimeIndex([pd.Timestamp("2026-08-04")])
+    )
+    plan = B.plan_historical_mark_restatement(
+        B._rows(_amd_conn()), range_source=_ranged_source({"AMD": frame})
+    )
+    assert plan["restatements"] == []
+    refused = [r for r in plan["refused"] if r["ticker"] == "AMD"]
+    assert refused[0]["verdict"] == B.VERDICT_REFUSED_NO_RANGE
+    assert "no Low/High columns" in refused[0]["reason"]
+
+
+# ── (iv) a settled close OUTSIDE the range → the reference data is wrong ─────
+
+def test_a_settled_close_outside_the_range_is_refused_as_wrong_reference_data():
+    """Both marks are outside [$400, $450]; NAV is not moved towards the close."""
+    src = _ranged_source(
+        {"AMD": _ohlc({"2026-08-04": (400.00, 450.00, 420.00)})}
+    )
+    plan = B.plan_historical_mark_restatement(B._rows(_amd_conn()), range_source=src)
+    assert plan["restatements"] == []
+    named = [r for r in plan["refused"] if r["ticker"] == "AMD"]
+    assert len(named) == 1
+    assert named[0]["verdict"] == B.VERDICT_REFUSED_CLOSE_OUTSIDE_RANGE
+    assert named[0]["settled_close"] == pytest.approx(_AMD_CLOSE)
+    assert named[0]["day_low"] == 400.00
+    assert named[0]["day_high"] == 450.00
+    assert "is itself outside the day's" in named[0]["reason"]
+    assert plan["session_verdicts"][0]["verdict"] == (
+        B.VERDICT_REFUSED_CLOSE_OUTSIDE_RANGE
+    )
+
+
+# ── the default path is untouched ────────────────────────────────────────────
+
+def test_the_default_path_keeps_the_degenerate_range_and_says_so():
+    plan = B.plan_historical_mark_restatement(B._rows(_amd_conn()))
+    assert plan["range_source"] == B.RANGE_SOURCE_NONE
+    assert plan["discriminator_evaluated"] is False
+    payload = plan["restatements"][0]["nav_mark_correction_json"]
+    assert payload["discriminator_evaluated"] is False
+    assert payload["basis"] == B.MARK_BASIS_RECONSTRUCTED
+    assert "day_ranges" not in payload
+    c = plan["restatements"][0]["corrections"][0]
+    assert c["day_low"] == c["day_high"] == pytest.approx(_AMD_CLOSE)
+
+
+def test_the_default_path_restates_a_name_the_range_would_have_refused():
+    """MU is restated degenerately and refused with the range — the whole point."""
+    degenerate = B.plan_historical_mark_restatement(B._rows(_mu_conn()))
+    assert len(degenerate["restatements"]) == 1
+    assert degenerate["restatements"][0]["nav_mark_correction_usd"] == pytest.approx(
+        _MU_CORRECTION
+    )
+    src = _ranged_source({"MU": _ohlc({"2026-08-26": (930.00, 960.00, _MU_CLOSE)})})
+    ranged = B.plan_historical_mark_restatement(B._rows(_mu_conn()), range_source=src)
+    assert ranged["restatements"] == []
+
+
+def test_reconstruct_inputs_records_which_instrument_it_used():
+    row = {"date": "2026-08-04", "portfolio_nav": _R_NAV_1,
+           "positions_snapshot": _snap("AMD", _AMD_SHARES, _AMD_IB_MARK, _AMD_CLOSE)}
+    assert B.reconstruct_mark_correction_inputs(row)["range_evaluated"] is False
+    src = _ranged_source({"AMD": _ohlc({"2026-08-04": (500.0, 525.0, _AMD_CLOSE)})})
+    got = B.reconstruct_mark_correction_inputs(row, range_source=src)
+    assert got["range_evaluated"] is True
+    assert got["range_source"] == B.RANGE_SOURCE_ARCTICDB
+    assert (got["day_low"]["AMD"], got["day_high"]["AMD"]) == (500.0, 525.0)
+
+
+def test_the_per_ticker_frame_is_read_once_across_sessions():
+    lib = _FakeArcticLib({"AMD": _ohlc({"2026-08-04": (500.0, 525.0, _AMD_CLOSE)})})
+    src = B.ArcticDBDayRangeSource(universe_lib=lib)
+    assert src.range_for("AMD", "2026-08-04") == (500.0, 525.0)
+    assert src.range_for("AMD", "2026-08-04") == (500.0, 525.0)
+    assert lib.reads == ["AMD"]
+
+
+def test_a_failed_read_is_not_retried_per_session():
+    lib = _FakeArcticLib({})
+    src = B.ArcticDBDayRangeSource(universe_lib=lib)
+    for _ in range(3):
+        with pytest.raises(B.RangeUnavailable):
+            src.range_for("AMD", "2026-08-04")
+    assert lib.reads == ["AMD"]
+
+
+# ── the CLI surface ──────────────────────────────────────────────────────────
+
+def test_cli_range_source_defaults_to_the_degenerate_range():
+    args = B._build_parser().parse_args([])
+    assert args.range_source == B.RANGE_SOURCE_NONE
+    assert args.trades_bucket == B.DEFAULT_TRADES_BUCKET
+    assert B.build_range_source(B.RANGE_SOURCE_NONE) is None
+
+
+def test_cli_range_source_arcticdb_builds_the_live_gates_reader():
+    args = B._build_parser().parse_args(
+        ["--restate-marks", "--range-source", "arcticdb"]
+    )
+    assert args.range_source == B.RANGE_SOURCE_ARCTICDB
+    src = B.build_range_source(B.RANGE_SOURCE_ARCTICDB)
+    assert isinstance(src, B.ArcticDBDayRangeSource)
+    assert src.name == B.RANGE_SOURCE_ARCTICDB
+    with pytest.raises(ValueError):
+        B.build_range_source("made-up")
+
+
+def test_cli_json_reports_the_verdict_per_candidate_session(tmp_path, capsys):
+    path = str(tmp_path / "t.db")
+    _amd_conn(path).close()
+    assert B.main(["--db", path, "--restate-marks"]) == 0
+    out = json.loads(capsys.readouterr().out)["mark_restatement"]
+    assert out["range_source"] == B.RANGE_SOURCE_NONE
+    assert out["discriminator_evaluated"] is False
+    assert out["basis"] == B.MARK_BASIS_RECONSTRUCTED
+    assert out["verdict_counts"] == {B.VERDICT_RESTATED: 1}
+    assert [v["date"] for v in out["session_verdicts"]] == ["2026-08-04"]
+    assert out["session_verdicts"][0]["correction_usd"] == pytest.approx(
+        _AMD_CORRECTION
+    )
