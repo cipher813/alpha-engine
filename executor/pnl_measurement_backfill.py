@@ -48,13 +48,18 @@ and, for the dividend leg, by Polygon's 5-calls-per-minute limiter.
     python -m executor.pnl_measurement_backfill --apply --dividends   # Polygon
     python -m executor.pnl_measurement_backfill --restate-marks       # plan only
     python -m executor.pnl_measurement_backfill --restate-marks --apply
+    # IN-REGION only — the range discriminator reads ArcticDB:
+    python -m executor.pnl_measurement_backfill --restate-marks \
+        --range-source arcticdb
 
 THE MARK-RESTATEMENT LEG (``--restate-marks``, alpha-engine-config-I9629) is
 the one leg that rewrites a published NAV. It moves ``portfolio_nav`` off a
 broker mark the reconstruction proves wrong, preserves the original in
 ``nav_ib_raw_usd``, and recomputes ``daily_return_pct``/``daily_alpha_pct``
-across BOTH sessions each corrected NAV sits between. Its instrument is weaker
-than the live gate's and every row it writes says so — see section 5.
+across BOTH sessions each corrected NAV sits between. With ``--range-source
+arcticdb`` its instrument IS the live gate's — the day's traded ``[Low, High]``,
+read through the same loader ``eod_reconcile`` uses. Without it the instrument
+is an upper bound and every row it writes says so — see section 5.
 
 NOT WIRED INTO THE EOD PATH. ``pnl_backfill.backfill_residual_sleeves`` runs on
 every reconciliation and self-heals its own window, which is the pattern this
@@ -72,6 +77,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sqlite3
 from typing import Any
 
@@ -715,24 +721,30 @@ def audit_history(
 # them sits inside the published track record a viability threshold is set
 # against.
 #
-# THE INSTRUMENT IS THE RECONSTRUCTION'S, NOT THE LIVE GATE'S, and the written
-# row says so. See ``reconstruct_mark_divergences``: the live gate measures the
-# distance past that day's ArcticDB traded ``[Low, High]``; the traded range is
-# not persisted, so retroactively the only reference is the settled close. A
-# settled close lies inside the traded range by construction, so the
-# reconstructed error is an UPPER BOUND on the range breach — it can over-flag
-# and can never under-flag.
+# WHICH INSTRUMENT THE ROW CARRIES DEPENDS ON WHERE THE PASS RUNS, and the
+# written row says which one it got. See ``reconstruct_mark_divergences``: the
+# live gate measures the distance past that day's ArcticDB traded
+# ``[Low, High]``; the traded range is not persisted on the eod_pnl row, so from
+# the persisted data alone the only reference is the settled close. A settled
+# close lies inside the traded range by construction, so a reconstruction that
+# has only the close produces an UPPER BOUND on the range breach — it can
+# over-flag and can never under-flag.
 #
-# THE DISCRIMINATOR CANNOT BE EVALUATED HERE, and that is the honest reason the
-# basis label exists. ``plan_nav_mark_correction`` refuses to move NAV towards a
-# settled close that is itself outside the day's ``[Low, High]``, because then
-# the reference data is what is wrong. Retroactively there is no ``[Low, High]``
-# to test against: ArcticDB is the only source and this is a laptop-run planning
-# pass. Three options were available and two were rejected:
+# THE DISCRIMINATOR, AND WHEN IT CAN BE EVALUATED.
+# ``plan_nav_mark_correction`` refuses to move NAV towards a settled close that
+# is itself outside the day's ``[Low, High]``, because then the reference data
+# is what is wrong. Three options were available:
 #
-#   (a) fetch the range from ArcticDB — rejected: it makes a planning pass
-#       depend on an in-region data-repo read, and the run-location rule already
-#       forbids that from a laptop;
+#   (a) fetch the range from ArcticDB — TAKEN, and only in-region
+#       (``--range-source arcticdb``). It was originally rejected on the premise
+#       that the planning pass runs on a laptop, where ``alpha-engine-data`` is
+#       unreadable. That premise does not hold for the restatement itself: this
+#       is a production data-repo write, so the run-location rule already
+#       requires ``--apply`` to run IN-REGION on EC2 — exactly where the live
+#       gate reads its own range. The read reuses ``price_cache``'s
+#       ``_open_universe_library``/``_open_macro_library`` and the
+#       ``_MACRO_SYMBOLS`` dispatch, so the historical pass and
+#       ``eod_reconcile`` share one ArcticDB reader, never two;
 #   (b) invent a plausible range (close +/- some volatility) — rejected
 #       outright: a fabricated bound would let the discriminator return a verdict
 #       it did not measure, which is the exact class of defect this module exists
@@ -741,19 +753,58 @@ def audit_history(
 #       ``[settled_close, settled_close]`` — and record that the discriminator was
 #       NOT evaluated.
 #
-# (c) is taken. The degenerate range is trivially satisfied, so the
-# discriminator refuses nothing here; the arithmetic, the materiality floor and
-# the ``mark_correction_bound_usd`` refusal are all unchanged and all still the
-# live path's own. Every restated row therefore carries
-# ``basis: "reconstructed"`` and ``discriminator_evaluated: false`` in its
-# ``nav_mark_correction_json``, against ``basis: "live_gate"`` on a row the
-# forward path corrected. A consumer tells the two apart by reading one field.
+# (c) REMAINS THE DEFAULT, so a laptop planning pass still works and its
+# behaviour is unchanged: the degenerate range is trivially satisfied, the
+# discriminator refuses nothing, and the row carries ``basis: "reconstructed"``
+# with ``discriminator_evaluated: false``.
+#
+# (a) IS WHAT THE OPERATOR RUNS IN-REGION, and it buys two refusals the
+# degenerate range structurally could not make:
+#
+#   * a broker mark that lies INSIDE the day's traded range is NOT provably
+#     wrong and is refused — the settled-close cut-over (I9638) is where that
+#     basis question belongs, not a NAV restatement;
+#   * a settled close that is itself OUTSIDE the range means the reference data
+#     is wrong, and NAV is not moved towards it. This is
+#     ``plan_nav_mark_correction``'s own refusal, reached by the live path's own
+#     code — the historical pass only surfaces it per name.
+#
+# A name whose range cannot be fetched is REFUSED for that session with the
+# reason naming why; it NEVER silently falls back to the degenerate range, which
+# would mix two instruments inside one restated NAV. A session where every
+# material name is refused is not restated at all.
+#
+# Rows restated that way carry ``basis: "reconstructed_ranged"`` and
+# ``discriminator_evaluated: true``, against ``basis: "reconstructed"`` for the
+# degenerate default and ``basis: "live_gate"`` for a row the forward path
+# corrected. A consumer tells all three apart by reading one field.
+#
+# RUN LOCATION. ``--range-source arcticdb`` requires an in-region reader
+# (ArcticDB is unreadable from the laptop), which is the same constraint
+# ``--apply`` already carries. Planning WITHOUT the flag stays laptop-runnable.
 #
 # NOT WIRED INTO THE EOD PATH. This is an operator CLI, for the same reason the
 # other legs are: ``eod_reconcile.run`` is what the postclose SF executes, and
 # the pipelines are change-quiet until the clause-1 reliability clock starts.
 MARK_BASIS_RECONSTRUCTED = "reconstructed"
+MARK_BASIS_RECONSTRUCTED_RANGED = "reconstructed_ranged"
 MARK_BASIS_LIVE = "live_gate"
+
+# Per-name and per-session verdicts. The operator reads these before --apply.
+VERDICT_RESTATED = "restated"
+VERDICT_REFUSED_INSIDE_RANGE = "refused-inside-range"
+VERDICT_REFUSED_NO_RANGE = "refused-no-range"
+VERDICT_REFUSED_CLOSE_OUTSIDE_RANGE = "refused-close-outside-range"
+VERDICT_REFUSED_NOT_RECONSTRUCTIBLE = "refused-not-reconstructible"
+VERDICT_REFUSED_BY_BOUND = "refused-by-bound"
+VERDICT_REFUSED_MIXED = "refused-mixed"
+VERDICT_ALREADY_RESTATED = "already-restated"
+
+RANGE_SOURCE_NONE = "none"
+RANGE_SOURCE_ARCTICDB = "arcticdb"
+
+# Mirrors ``eod_reconcile``'s own default (``config["trades_bucket"]``).
+DEFAULT_TRADES_BUCKET = "alpha-engine-research"
 
 # A restated return that differs from the stored one by less than this is not
 # reported as moving — it is float noise in a column persisted at REAL precision.
@@ -765,10 +816,147 @@ RETURN_RESTATEMENT_EPSILON_PCT = 1e-9
 CHAIN_BASIS_TOLERANCE_PCT = 0.005
 
 
-def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
+class RangeUnavailable(Exception):
+    """The day's traded ``[Low, High]`` could not be fetched for one name.
+
+    Carries the reason verbatim into the refusal row. Never caught into a
+    fallback: a name whose range is unavailable is refused, not repriced
+    against the degenerate range.
+    """
+
+
+class ArcticDBDayRangeSource:
+    """The day's traded ``[Low, High]`` per (ticker, session), from ArcticDB.
+
+    THE LIVE GATE'S OWN READER. ``eod_reconcile.run`` loads the same range with
+    ``_open_universe_library`` / ``_open_macro_library`` and the
+    ``_MACRO_SYMBOLS`` dispatch from :mod:`executor.price_cache`; this class
+    calls those same helpers rather than opening a second ArcticDB path. The
+    per-ticker frame is read once and cached, because the historical pass asks
+    for many sessions of the same name.
+
+    IN-REGION ONLY. ``alpha-engine-data`` is unreadable from a laptop, so this
+    is constructed only for ``--range-source arcticdb``, which the CLI documents
+    as an EC2-only option.
+
+    ``universe_lib`` / ``macro_lib`` exist so a test can inject a library object
+    of the same shape (``lib.read(ticker).data`` → a DataFrame indexed by date
+    with ``Low``/``High`` columns) without an ArcticDB connection.
+    """
+
+    name = RANGE_SOURCE_ARCTICDB
+
+    def __init__(
+        self,
+        trades_bucket: str = DEFAULT_TRADES_BUCKET,
+        *,
+        universe_lib: Any = None,
+        macro_lib: Any = None,
+    ) -> None:
+        self._bucket = trades_bucket
+        self._universe = universe_lib
+        self._macro = macro_lib
+        self._frames: dict[str, Any] = {}
+        self._read_failures: dict[str, str] = {}
+
+    def _library(self, ticker: str) -> Any:
+        from executor.price_cache import (
+            _MACRO_SYMBOLS,
+            _open_macro_library,
+            _open_universe_library,
+        )
+
+        if ticker in _MACRO_SYMBOLS:
+            if self._macro is None:
+                self._macro = _open_macro_library(self._bucket)
+            return self._macro
+        if self._universe is None:
+            self._universe = _open_universe_library(self._bucket)
+        return self._universe
+
+    def _frame(self, ticker: str) -> Any:
+        if ticker in self._frames:
+            return self._frames[ticker]
+        if ticker in self._read_failures:
+            raise RangeUnavailable(self._read_failures[ticker])
+        try:
+            df = self._library(ticker).read(ticker).data
+        except Exception as exc:  # noqa: BLE001 — re-raised as a NAMED refusal
+            # (a) swallowed: nothing. The ArcticDB read failure for ONE ticker
+            # is converted into a refusal that names the exception class and
+            # message; (b) the primary deliverable — every other name's
+            # verdict — survives; (c) recorded: the refusal row in the plan
+            # JSON and the log summary, both read before --apply.
+            reason = (
+                f"ArcticDB read failed for {ticker} "
+                f"({exc.__class__.__name__}: {exc}) — the day's traded range "
+                "cannot be fetched, so this name is refused rather than "
+                "repriced against the degenerate range"
+            )
+            self._read_failures[ticker] = reason
+            raise RangeUnavailable(reason) from exc
+        self._frames[ticker] = df
+        return df
+
+    def range_for(self, ticker: str, date: str) -> tuple[float, float]:
+        """``(low, high)`` for ``ticker`` on ``date``, or raise RangeUnavailable."""
+        import pandas as pd
+
+        df = self._frame(ticker)
+        if df is None or getattr(df, "empty", True):
+            raise RangeUnavailable(
+                f"ArcticDB holds an empty frame for {ticker} — no traded range "
+                f"exists for {date}"
+            )
+        idx = df.index.normalize() if hasattr(df.index, "normalize") else df.index
+        match = df[idx == pd.Timestamp(date).normalize()]
+        if match.empty:
+            raise RangeUnavailable(
+                f"ArcticDB carries no row for {ticker} on {date} — the day's "
+                "traded range is unknown and the mark cannot be tested against it"
+            )
+        if "Low" not in match.columns or "High" not in match.columns:
+            raise RangeUnavailable(
+                f"ArcticDB row for {ticker} on {date} has no Low/High columns "
+                "(the macro library is Close-only for some symbols, "
+                "alpha-engine-config-I9637) — the mark is not range-checkable"
+            )
+        low = float(match["Low"].iloc[-1])
+        high = float(match["High"].iloc[-1])
+        if not math.isfinite(low) or not math.isfinite(high) or high < low:
+            raise RangeUnavailable(
+                f"ArcticDB row for {ticker} on {date} carries an unusable "
+                f"traded range [{low}, {high}] — the mark is not range-checkable"
+            )
+        return low, high
+
+
+def build_range_source(
+    name: str, *, trades_bucket: str = DEFAULT_TRADES_BUCKET,
+) -> Any | None:
+    """``None`` for the degenerate default, a live reader for ``arcticdb``."""
+    if name == RANGE_SOURCE_NONE:
+        return None
+    if name == RANGE_SOURCE_ARCTICDB:
+        return ArcticDBDayRangeSource(trades_bucket)
+    raise ValueError(f"unknown range source {name!r}")
+
+
+def reconstruct_mark_correction_inputs(
+    row: dict[str, Any], *, range_source: Any = None,
+) -> dict[str, Any]:
     """Rebuild :func:`plan_nav_mark_correction`'s inputs from a persisted row. PURE.
 
-    Returns ``{"flags", "settled_closes", "day_low", "day_high", "refused"}``.
+    Returns ``{"flags", "settled_closes", "day_low", "day_high", "refused",
+    "range_evaluated", "range_source"}``.
+
+    ``range_source`` is ``None`` (the default) for the degenerate range
+    ``[settled_close, settled_close]``, behaviour unchanged. Given a source with
+    a ``range_for(ticker, date) -> (low, high)`` method — see
+    :class:`ArcticDBDayRangeSource` — the day's real traded range is fetched per
+    name and the discriminator becomes evaluable: a mark INSIDE the range is
+    refused (not provably wrong), and a name whose range cannot be fetched is
+    refused rather than falling back to the degenerate range.
 
     ``flags`` carries the same keys ``eod_reconcile._detect_ib_mark_outside_range``
     produces for the live path — ``ticker`` / ``shares`` / ``ib_mark`` /
@@ -791,11 +979,14 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
         "day_low": {},
         "day_high": {},
         "refused": [],
+        "range_evaluated": range_source is not None,
+        "range_source": getattr(range_source, "name", RANGE_SOURCE_NONE),
     }
     positions = _positions(row)
     if positions is None:
         out["refused"].append({
             "date": date, "ticker": None,
+            "verdict": VERDICT_REFUSED_NOT_RECONSTRUCTIBLE,
             "reason": "positions_snapshot absent or unparseable — the session "
                       "cannot be examined and is NOT reported as clean",
         })
@@ -803,6 +994,7 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
     if nav is None:
         out["refused"].append({
             "date": date, "ticker": None,
+            "verdict": VERDICT_REFUSED_NOT_RECONSTRUCTIBLE,
             "reason": "row carries no portfolio_nav — there is nothing to restate "
                       "and no NAV to size the materiality floor against",
         })
@@ -824,6 +1016,7 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
             # restatement is due; it is NAMED rather than silently skipped.
             out["refused"].append({
                 "date": date, "ticker": ticker,
+                "verdict": VERDICT_ALREADY_RESTATED,
                 "reason": "the broker mark for this name was already corrected "
                           "in-session (alpha-engine-config-I9627) and the row's "
                           "portfolio_nav already excludes the error — no "
@@ -835,6 +1028,7 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
         if ib_mv is None:
             out["refused"].append({
                 "date": date, "ticker": ticker,
+                "verdict": VERDICT_REFUSED_NOT_RECONSTRUCTIBLE,
                 "reason": "no ib_market_value on this position (pre-schema-2.1 "
                           "snapshot) — the broker mark was never persisted, so "
                           "this name cannot be checked and is not assumed clean",
@@ -843,6 +1037,7 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
         if settled_mv is None:
             out["refused"].append({
                 "date": date, "ticker": ticker,
+                "verdict": VERDICT_REFUSED_NOT_RECONSTRUCTIBLE,
                 "reason": "no market_value on this position — there is no settled "
                           "reference to price the broker mark against",
             })
@@ -850,6 +1045,7 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
         if not shares:
             out["refused"].append({
                 "date": date, "ticker": ticker,
+                "verdict": VERDICT_REFUSED_NOT_RECONSTRUCTIBLE,
                 "reason": "share count absent or zero — a per-share mark cannot be "
                           "reconstructed from the market-value pair without it",
             })
@@ -858,43 +1054,127 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
         if abs(divergence) <= materiality:
             continue
         settled_close = settled_mv / shares
+        ib_mark = ib_mv / shares
+        if range_source is None:
+            # See §5 option (c): the degenerate range is the only bound the
+            # persisted data alone justifies, and the row records that the
+            # discriminator was NOT evaluated.
+            low, high = settled_close, settled_close
+        else:
+            try:
+                low, high = range_source.range_for(ticker, date)
+            except RangeUnavailable as exc:
+                out["refused"].append({
+                    "date": date, "ticker": ticker,
+                    "verdict": VERDICT_REFUSED_NO_RANGE,
+                    "ib_mark": ib_mark,
+                    "settled_close": settled_close,
+                    "mark_error_usd": divergence,
+                    "reason": str(exc),
+                })
+                continue
+            if low <= ib_mark <= high:
+                # The refusal the degenerate range structurally could not make:
+                # the broker priced this name somewhere it actually traded, so
+                # the mark is not PROVABLY wrong and NAV is not moved off it.
+                # The settled-close cut-over (alpha-engine-config-I9638) is
+                # where a mark-basis preference belongs — not a NAV restatement.
+                out["refused"].append({
+                    "date": date, "ticker": ticker,
+                    "verdict": VERDICT_REFUSED_INSIDE_RANGE,
+                    "ib_mark": ib_mark,
+                    "settled_close": settled_close,
+                    "day_low": low, "day_high": high,
+                    "mark_error_usd": divergence,
+                    "reason": (
+                        f"broker mark ${ib_mark:,.2f} lies INSIDE the day's "
+                        f"traded range [${low:,.2f}, ${high:,.2f}] — the name "
+                        f"diverges from the settled close by ${divergence:+,.0f} "
+                        "but the mark is not provably wrong, so NAV is not "
+                        "restated off it (the settled-close cut-over, "
+                        "alpha-engine-config-I9638, is where that basis "
+                        "question belongs)"
+                    ),
+                })
+                continue
         out["flags"].append({
             "ticker": ticker,
             "shares": shares,
-            "ib_mark": ib_mv / shares,
+            "ib_mark": ib_mark,
             "mark_error_usd": divergence,
             "materiality_usd": materiality,
         })
         out["settled_closes"][ticker] = settled_close
-        # See THE DISCRIMINATOR CANNOT BE EVALUATED HERE above: the degenerate
-        # range is the only bound the persisted data justifies.
-        out["day_low"][ticker] = settled_close
-        out["day_high"][ticker] = settled_close
+        out["day_low"][ticker] = low
+        out["day_high"][ticker] = high
     return out
 
 
-def _mark_correction_payload(plan: dict[str, Any]) -> dict[str, Any]:
-    """The ``nav_mark_correction_json`` body for a RECONSTRUCTED restatement."""
+def _mark_correction_payload(
+    plan: dict[str, Any], *, inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ``nav_mark_correction_json`` body for a RECONSTRUCTED restatement.
+
+    The ``basis`` field is the one field a consumer reads to tell the three
+    provenances apart — ``live_gate`` (forward path), ``reconstructed_ranged``
+    (this pass, in-region, the live gate's own instrument) and ``reconstructed``
+    (this pass, degenerate range, an upper bound). ``corrections`` already
+    carries the ``day_low``/``day_high`` actually used per name, written by
+    ``plan_nav_mark_correction`` itself.
+    """
+    inputs = inputs or {}
+    ranged = bool(inputs.get("range_evaluated"))
     payload = dict(plan)
-    payload["basis"] = MARK_BASIS_RECONSTRUCTED
-    payload["instrument"] = (
-        "settled market value vs broker market value, both reconstructed from "
-        "positions_snapshot — an UPPER BOUND on the traded-range breach the live "
-        "gate measures, never an under-estimate of it"
+    payload["basis"] = (
+        MARK_BASIS_RECONSTRUCTED_RANGED if ranged else MARK_BASIS_RECONSTRUCTED
     )
-    payload["discriminator_evaluated"] = False
-    payload["discriminator_note"] = (
-        "the day's ArcticDB [Low, High] is not persisted, so the settled close "
-        "could not be tested for lying inside it; day_low/day_high were passed as "
-        "the degenerate range [settled_close, settled_close] and the reference-data "
-        "discriminator refused nothing on this row"
-    )
+    payload["range_source"] = inputs.get("range_source", RANGE_SOURCE_NONE)
+    payload["discriminator_evaluated"] = ranged
+    if ranged:
+        payload["instrument"] = (
+            "broker mark vs the day's traded [Low, High] read from ArcticDB "
+            "through the SAME loader executor.eod_reconcile uses — the live "
+            "gate's own instrument, not an upper bound on it"
+        )
+        payload["discriminator_note"] = (
+            "the day's traded range was fetched per name; a mark lying inside "
+            "it was refused as not provably wrong, and plan_nav_mark_correction "
+            "tested each settled close for lying inside the same range before "
+            "NAV was moved towards it"
+        )
+        payload["day_ranges"] = {
+            t: [inputs.get("day_low", {}).get(t), inputs.get("day_high", {}).get(t)]
+            for t in plan.get("corrected_tickers", [])
+        }
+    else:
+        payload["instrument"] = (
+            "settled market value vs broker market value, both reconstructed from "
+            "positions_snapshot — an UPPER BOUND on the traded-range breach the live "
+            "gate measures, never an under-estimate of it"
+        )
+        payload["discriminator_note"] = (
+            "the day's ArcticDB [Low, High] was not fetched (--range-source none), "
+            "so the settled close could not be tested for lying inside it; "
+            "day_low/day_high were passed as the degenerate range "
+            "[settled_close, settled_close] and the reference-data discriminator "
+            "refused nothing on this row"
+        )
     payload["source"] = "executor.pnl_measurement_backfill --restate-marks"
     payload["tracker"] = "alpha-engine-config-I9629"
     return payload
 
 
-def plan_historical_mark_restatement(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _session_verdict(names_refused: list[dict[str, Any]]) -> str:
+    """One verdict for a session no name could be restated on."""
+    kinds = {r.get("verdict") for r in names_refused if r.get("verdict")}
+    if len(kinds) == 1:
+        return kinds.pop()
+    return VERDICT_REFUSED_MIXED
+
+
+def plan_historical_mark_restatement(
+    rows: list[dict[str, Any]], *, range_source: Any = None,
+) -> dict[str, Any]:
     """Plan the NAV restatement AND the return-chain recomputation. PURE.
 
     ``rows`` is the eod_pnl series OLDEST-first, as :func:`_rows` returns it.
@@ -916,10 +1196,21 @@ def plan_historical_mark_restatement(rows: list[dict[str, Any]]) -> dict[str, An
     pass, or by the live path, which is what makes the 2026-08-31 DUOL row a
     no-op here. It is reported under ``already_restated`` and left untouched, so
     a second run writes nothing.
+
+    THE VERDICT PER CANDIDATE SESSION is reported in ``session_verdicts`` —
+    ``restated``, ``refused-inside-range``, ``refused-no-range``,
+    ``refused-close-outside-range``, ``refused-by-bound`` or ``refused-mixed``,
+    each carrying the numbers behind it. That is what the operator reads before
+    ``--apply``. A session where every material name is refused produces a
+    refusal verdict and is not restated.
+
+    ``range_source`` is threaded to :func:`reconstruct_mark_correction_inputs`;
+    ``None`` keeps the degenerate range and the unchanged default behaviour.
     """
     restatements: list[dict[str, Any]] = []
     refused: list[dict[str, Any]] = []
     already: list[dict[str, Any]] = []
+    verdicts: list[dict[str, Any]] = []
     nav_new: dict[str, float] = {}
 
     for row in rows:
@@ -937,9 +1228,20 @@ def plan_historical_mark_restatement(rows: list[dict[str, Any]]) -> dict[str, An
                 "reason": "row already carries a mark restatement — left untouched",
             })
             continue
-        inputs = reconstruct_mark_correction_inputs(row)
+        inputs = reconstruct_mark_correction_inputs(row, range_source=range_source)
+        session_refused = list(inputs["refused"])
         refused.extend(inputs["refused"])
         if not inputs["flags"]:
+            if session_refused:
+                verdicts.append({
+                    "date": date,
+                    "verdict": _session_verdict(session_refused),
+                    "range_source": inputs["range_source"],
+                    "discriminator_evaluated": inputs["range_evaluated"],
+                    "portfolio_nav": nav,
+                    "names_restated": [],
+                    "names_refused": session_refused,
+                })
             continue
         plan = plan_nav_mark_correction(
             inputs["flags"],
@@ -949,13 +1251,49 @@ def plan_historical_mark_restatement(rows: list[dict[str, Any]]) -> dict[str, An
             nav=nav,
             run_date=date,
         )
+        # Per-name refusals the LIVE PATH's own code made. The one that only
+        # exists with a real range is the settled close lying outside it —
+        # classified here from the same [low, high] that was passed in, never
+        # by matching on the message text.
+        for u in plan.get("unrepairable", []):
+            tkr = u.get("ticker")
+            close = inputs["settled_closes"].get(tkr)
+            lo = inputs["day_low"].get(tkr)
+            hi = inputs["day_high"].get(tkr)
+            outside = (
+                close is not None and lo is not None and hi is not None
+                and not (lo <= close <= hi)
+            )
+            entry = {
+                "date": date, "ticker": tkr,
+                "verdict": (VERDICT_REFUSED_CLOSE_OUTSIDE_RANGE if outside
+                            else VERDICT_REFUSED_NOT_RECONSTRUCTIBLE),
+                "settled_close": close, "day_low": lo, "day_high": hi,
+                "reason": u.get("why"),
+            }
+            session_refused.append(entry)
+            refused.append(entry)
         if not plan["applied"]:
-            refused.append({
+            entry = {
                 "date": date, "ticker": None,
+                "verdict": (VERDICT_REFUSED_BY_BOUND if plan.get("refused")
+                            else _session_verdict(session_refused)),
                 "reason": plan["message"] or "no correction could be proven",
                 "refused_by_bound": bool(plan.get("refused")),
                 "correction_usd": plan.get("correction_usd"),
                 "bound_usd": plan.get("bound_usd"),
+            }
+            refused.append(entry)
+            verdicts.append({
+                "date": date,
+                "verdict": entry["verdict"],
+                "range_source": inputs["range_source"],
+                "discriminator_evaluated": inputs["range_evaluated"],
+                "portfolio_nav": nav,
+                "correction_usd": plan.get("correction_usd"),
+                "bound_usd": plan.get("bound_usd"),
+                "names_restated": [],
+                "names_refused": session_refused,
             })
             continue
         nav_new[date] = float(plan["nav_corrected"])
@@ -966,7 +1304,21 @@ def plan_historical_mark_restatement(rows: list[dict[str, Any]]) -> dict[str, An
             "nav_mark_correction_usd": float(plan["correction_usd"]),
             "tickers": list(plan["corrected_tickers"]),
             "corrections": plan["corrections"],
-            "nav_mark_correction_json": _mark_correction_payload(plan),
+            "nav_mark_correction_json": _mark_correction_payload(
+                plan, inputs=inputs
+            ),
+        })
+        verdicts.append({
+            "date": date,
+            "verdict": VERDICT_RESTATED,
+            "range_source": inputs["range_source"],
+            "discriminator_evaluated": inputs["range_evaluated"],
+            "portfolio_nav": nav,
+            "portfolio_nav_restated": float(plan["nav_corrected"]),
+            "correction_usd": float(plan["correction_usd"]),
+            "bound_usd": plan.get("bound_usd"),
+            "names_restated": plan["corrections"],
+            "names_refused": session_refused,
         })
 
     chain, chain_refused, chain_basis_mismatch = _plan_return_chain(rows, nav_new)
@@ -974,10 +1326,22 @@ def plan_historical_mark_restatement(rows: list[dict[str, Any]]) -> dict[str, An
         "restatements": restatements,
         "refused": refused,
         "already_restated": already,
+        "session_verdicts": verdicts,
+        "verdict_counts": _verdict_counts(verdicts),
+        "range_source": getattr(range_source, "name", RANGE_SOURCE_NONE),
+        "discriminator_evaluated": range_source is not None,
         "chain": chain,
         "chain_refused": chain_refused,
         "chain_basis_mismatch": chain_basis_mismatch,
     }
+
+
+def _verdict_counts(verdicts: list[dict[str, Any]]) -> dict[str, int]:
+    """Sessions per verdict. Absent verdicts are absent, never rendered zero."""
+    counts: dict[str, int] = {}
+    for v in verdicts:
+        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+    return counts
 
 
 def _plan_return_chain(
@@ -1200,6 +1564,21 @@ def _build_parser() -> argparse.ArgumentParser:
              "default — this rewrites a published NAV. "
              "alpha-engine-config-I9629.",
     )
+    ap.add_argument(
+        "--range-source", choices=[RANGE_SOURCE_NONE, RANGE_SOURCE_ARCTICDB],
+        default=RANGE_SOURCE_NONE,
+        help="where --restate-marks gets each name's day traded [Low, High]. "
+             "'none' (default) passes the degenerate range [settled_close, "
+             "settled_close] and records discriminator_evaluated=false — the "
+             "laptop-runnable planning default. 'arcticdb' reads the real range "
+             "through the same loader eod_reconcile uses, so a mark INSIDE the "
+             "range and a settled close OUTSIDE it are both refused by name. "
+             "IN-REGION ONLY: alpha-engine-data is unreadable from a laptop.",
+    )
+    ap.add_argument(
+        "--trades-bucket", default=DEFAULT_TRADES_BUCKET,
+        help="bucket backing the ArcticDB libraries for --range-source arcticdb",
+    )
     ap.add_argument("--audit", action="store_true", help="run the retroactive gates")
     ap.add_argument(
         "--flag-non-trading-rows", action="store_true",
@@ -1299,7 +1678,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.restate_marks:
         rows = _rows(conn)  # re-read so the plan sees anything just written
-        mark_plan = plan_historical_mark_restatement(rows)
+        range_source = build_range_source(
+            args.range_source, trades_bucket=args.trades_bucket
+        )
+        mark_plan = plan_historical_mark_restatement(
+            rows, range_source=range_source
+        )
         report["mark_restatement"] = {
             "status": "applied" if args.apply else "planned",
             "sessions_restated": len(mark_plan["restatements"]),
@@ -1311,7 +1695,13 @@ def main(argv: list[str] | None = None) -> int:
             "already_restated": mark_plan["already_restated"],
             "refused": mark_plan["refused"],
             "n_refused": len(mark_plan["refused"]),
-            "basis": MARK_BASIS_RECONSTRUCTED,
+            "range_source": mark_plan["range_source"],
+            "discriminator_evaluated": mark_plan["discriminator_evaluated"],
+            "session_verdicts": mark_plan["session_verdicts"],
+            "verdict_counts": mark_plan["verdict_counts"],
+            "basis": (MARK_BASIS_RECONSTRUCTED_RANGED
+                      if mark_plan["discriminator_evaluated"]
+                      else MARK_BASIS_RECONSTRUCTED),
         }
         if args.apply:
             report["mark_restatement"].update(
@@ -1327,10 +1717,27 @@ def main(argv: list[str] | None = None) -> int:
             )
         logger.info(
             "mark restatement: %d session(s), %d downstream row(s), %d name(s) "
-            "refused, %d row(s) already restated",
+            "refused, %d row(s) already restated — range source %s, "
+            "discriminator evaluated=%s, session verdicts %s",
             len(mark_plan["restatements"]), len(mark_plan["chain"]),
             len(mark_plan["refused"]), len(mark_plan["already_restated"]),
+            mark_plan["range_source"], mark_plan["discriminator_evaluated"],
+            json.dumps(mark_plan["verdict_counts"], sort_keys=True),
         )
+        # One line per candidate session, with the numbers. This is what the
+        # operator reads before --apply; the JSON carries the same verdicts.
+        for v in mark_plan["session_verdicts"]:
+            logger.info(
+                "  %s %s: nav %s, correction %s, %d name(s) restated, "
+                "%d name(s) refused%s",
+                v["date"], v["verdict"], v.get("portfolio_nav"),
+                v.get("correction_usd"), len(v.get("names_restated") or []),
+                len(v.get("names_refused") or []),
+                "".join(
+                    f"\n      REFUSED {r.get('ticker')}: {r.get('reason')}"
+                    for r in (v.get("names_refused") or [])
+                ),
+            )
 
     if args.dividends:
         tickers = [t for r in rows for t in (_positions(r) or {})]
