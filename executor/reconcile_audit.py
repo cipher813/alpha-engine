@@ -63,7 +63,7 @@ from nousergon_lib.trading_calendar import previous_trading_day
 
 from executor.accepted_gaps import load_accepted_gaps
 from executor.config_loader import load_config
-from executor.eod_reconcile import _spy_close
+from executor.eod_reconcile import _log_paged, _spy_close
 from executor.eod_reconcile import run as eod_run
 from executor.trade_logger import init_db
 
@@ -409,7 +409,7 @@ def audit_window(
         try:
             eod_run(d, send_email=send_email, run_audit=False)
         except Exception as e:  # noqa: BLE001 — per-date isolation: one bad day must not abort the sweep
-            logger.error("[reconcile_audit] correction FAILED for %s: %s", d, e)
+            _log_paged("[reconcile_audit] correction FAILED for %s: %s", d, e)
             if fd:
                 fd.report(e, severity="error", context={"site": "reconcile_audit_apply", "run_date": d})
             skipped.append({"date": d, "reason": f"apply_failed: {e.__class__.__name__}"})

@@ -92,6 +92,22 @@ NAV_HARD_GATE_TOLERANCE_USD_FLOOR = 2500.0
 NAV_HARD_GATE_TOLERANCE_NAV_BPS = 15.0  # 0.15% of NAV
 
 
+
+def _log_paged(msg: str, *args) -> None:
+    """Log a condition that ``fd.report`` pages in the same breath.
+
+    WARNING, not ERROR, on purpose (alpha-engine-config-I10049): the root
+    ``FlowDoctorHandler`` (attached at ERROR by ``setup_logging``) turns every
+    ERROR record into its own flow-doctor report, so an ERROR line beside an
+    ``fd.report`` of the same condition pages the operator TWICE and auto-files
+    two issues for one event — measured 2026-09-04, reports 0.2 ms apart
+    (I10018 + I10019). The severity of record lives on the ``fd.report`` call,
+    which also carries the classification-dependent severity and the context
+    dict the log line cannot. The text stays in the run log at WARNING so a
+    reader of the box log still sees it; only the duplicate page is removed.
+    """
+    logger.warning(msg, *args)
+
 def _nav_hard_gate_tolerance_usd(nav: float) -> float:
     """Dollar tolerance for the NAV three-way hard gate at this NAV level."""
     return max(NAV_HARD_GATE_TOLERANCE_USD_FLOOR, NAV_HARD_GATE_TOLERANCE_NAV_BPS / 10000.0 * nav)
@@ -2135,7 +2151,7 @@ def run(
                     " IB mark outside traded range — "
                     f"{_format_mark_range_detail(ib_mark_range_flags)}."
                 )
-            logger.error(
+            _log_paged(
                 "NAV three-way reconcile BREACH [%s]: pricing&timing=$%+.0f "
                 "(%.3f%% of NAV) exceeds hard-gate tolerance $%.0f "
                 "(%.1fbps of NAV) — broker-reported NAV vs settled/system "
@@ -2366,7 +2382,7 @@ def run(
         breach["basis"] = residual_basis
         breach["window_sessions"] = residual_window_sessions
         breach["window_sessions_expected"] = RESIDUAL_CUMULATIVE_WINDOW_SESSIONS
-        logger.error("P&L INTEGRITY BREACH: %s", breach["message"])
+        _log_paged("P&L INTEGRITY BREACH: %s", breach["message"])
         data_warnings.append(breach["message"])
     integrity_breaches.extend(residual_breaches)
 
@@ -2394,7 +2410,7 @@ def run(
         if breach.get("severity") == "unevaluated":
             logger.warning("P&L ATTRIBUTION CLOSURE NOT EVALUATED: %s", breach["message"])
         else:
-            logger.error("P&L ATTRIBUTION CLOSURE BREACH: %s", breach["message"])
+            _log_paged("P&L ATTRIBUTION CLOSURE BREACH: %s", breach["message"])
         data_warnings.append(breach["message"])
     integrity_breaches.extend(closure_breaches)
 
@@ -2407,7 +2423,7 @@ def run(
         corrected_tickers=mark_correction["corrected_tickers"],
     )
     for breach in mark_breaches:
-        logger.error("CUSTODIAN MARK BREACH: %s", breach["message"])
+        _log_paged("CUSTODIAN MARK BREACH: %s", breach["message"])
         data_warnings.append(breach["message"])
     integrity_breaches.extend(mark_breaches)
 
@@ -2520,14 +2536,14 @@ def run(
             f"{refusal['from_pct']:+.4f}% vs NAV-implied {refusal['to_pct']:+.4f}% "
             f"— {refusal['reason']}"
         )
-        logger.error(msg)
+        _log_paged(msg)
         data_warnings.append(msg)
         integrity_breaches.append({"kind": "twr_self_heal_refused", **refusal,
                                    "message": msg})
 
     twr = verify_twr_closes(twr_rows)
     if twr.get("status") == "ok" and not twr["closes"]:
-        logger.error("TWR CLOSURE BREACH: %s", twr["message"])
+        _log_paged("TWR CLOSURE BREACH: %s", twr["message"])
         data_warnings.append(twr["message"])
         integrity_breaches.append({"kind": "twr_closure", **{
             k: twr[k] for k in
@@ -2561,7 +2577,7 @@ def run(
     ]
     nc_basis = verify_nav_change_basis_closes(nc_rows)
     if nc_basis.get("status") == "ok" and not nc_basis["closes"]:
-        logger.error("TWR CLOSURE BREACH (nav_change_usd basis): %s", nc_basis["message"])
+        _log_paged("TWR CLOSURE BREACH (nav_change_usd basis): %s", nc_basis["message"])
         data_warnings.append(nc_basis["message"])
         integrity_breaches.append({"kind": "twr_closure_nav_change_basis", **{
             k: nc_basis[k] for k in
@@ -2796,7 +2812,7 @@ def run(
                 data_warnings.append(breach["message"])
         write_eod_report(report, trades_bucket=trades_bucket, run_date=run_date)
     except Exception as e:
-        logger.error("EOD report artifact build/write failed: %s", e)
+        _log_paged("EOD report artifact build/write failed: %s", e)
         if fd:
             fd.report(e, severity="error", context={
                 "site": "eod_report_artifact", "run_date": run_date})
@@ -2822,7 +2838,7 @@ def run(
                 console_base_url=config.get("console_base_url"),
             )
         except Exception as e:
-            logger.error(f"EOD email failed: {e}")
+            _log_paged("EOD email failed: %s", e)
             if fd:
                 fd.report(e, severity="error", context={
                     "site": "eod_email", "run_date": run_date})
