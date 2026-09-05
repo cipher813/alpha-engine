@@ -22,6 +22,29 @@
 # ── Short-sale prevention ────────────────────────────────────────────────────
 allow_shorts: false              # true = allow sells that create short positions (use with caution)
 
+# ── NAV basis (alpha-engine-config-I9638) ────────────────────────────────────
+# Which figure is the headline portfolio NAV — the number daily_return_pct,
+# daily_alpha_pct and position weights are struck on.
+#
+#   ib_netliq      IB Gateway's NetLiquidation, after the I9627 broker-mark
+#                  correction. Today's behaviour, and the default when the key
+#                  is absent entirely.
+#   settled_close  total_cash + accrued_interest + Σ shares × settled close,
+#                  rebuilt from broker cash and ArcticDB settled closes.
+#
+# BOTH figures are computed and published every run under either value
+# (eod_pnl.nav_ib_usd / nav_settled_usd / nav_basis_diff_usd /
+# nav_basis_diff_bps, and eod_report.json::nav_reconciliation). The flag
+# decides only which one is the headline. IB NetLiquidation is retained as the
+# broker cross-check under BOTH bases — the NAV three-way hard gate and the
+# attribution basis-level gate always compare IB against the settled rebuild,
+# so neither loses its power after a cut-over.
+#
+# Ruled 2026-08-31 (alpha-engine-config#9638), option (b) STAGED: publish the
+# difference for two weeks, then flip this default in a separate change.
+# An unrecognised value RAISES at load — it never falls back to the default.
+nav_basis: ib_netliq
+
 # ── Position limits ──────────────────────────────────────────────────────────
 max_position_pct: 0.05           # 5% NAV per position (hard cap)
 max_sector_pct: 0.25             # 25% NAV per sector

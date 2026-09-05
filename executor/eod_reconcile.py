@@ -68,7 +68,12 @@ _FLOW_DOCTOR_YAML = get_flow_doctor_yaml_path()  # experiment-package-first (con
 setup_logging("eod", flow_doctor_yaml=_FLOW_DOCTOR_YAML, exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS)
 logger = logging.getLogger(__name__)
 
-from executor.config_loader import load_config  # noqa: E402 -- must follow setup_logging above
+from executor.config_loader import (  # noqa: E402 -- must follow setup_logging above
+    NAV_BASIS_IB_NETLIQ,
+    NAV_BASIS_SETTLED_CLOSE,
+    load_config,
+    resolve_nav_basis,
+)
 
 # ── NAV three-way reconcile — hard-gate tolerance (config#2457) ────────────
 # `pricing_timing_usd` (mark_basis_today − mark_basis_prior, computed below)
@@ -198,6 +203,42 @@ NAV_BREACH_RESIDUAL_FLOOR_USD = 500.0  # matches the pre-existing soft data_warn
 # $935.39, −1.32%, inside the range, −$1,331 of basis on 108 shares).
 IB_MARK_OFF_CLOSE_PCT_FLOOR = 0.10  # 10bp — beyond this the mark is not the close
 MARK_BASIS_TOP_CONTRIBUTORS = 5     # names carried into the alert text
+
+
+def _settled_position_value_usd(
+    positions: dict,
+    closing_prices: dict,
+) -> tuple[float, list[str]]:
+    """``Σ shares × settled close`` over the held book, and the names that missed.
+
+    Returns ``(settled_mv_usd, fallback_tickers)``. A held name with no
+    ArcticDB settled close falls back to the broker's ``market_value`` — the
+    same fallback the positions loop below takes — and its ticker is RETURNED
+    rather than swallowed, because under ``nav_basis: settled_close`` that
+    fallback means the headline NAV silently contains a broker mark. The
+    caller decides what to do with the list; it is never dropped.
+
+    Runs BEFORE the positions loop applies the settled-close override, so it
+    reads ``closing_prices`` directly rather than the post-override
+    ``market_value``. The two agree by construction for every name that has a
+    close (alpha-engine-config-I9638).
+    """
+    settled_mv = 0.0
+    fallback: list[str] = []
+    for ticker, pos in (positions or {}).items():
+        try:
+            shares = float(pos.get("shares", 0) or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        if not shares:
+            continue
+        close = closing_prices.get(ticker)
+        if close is None:
+            fallback.append(ticker)
+            settled_mv += float(pos.get("market_value", 0) or 0)
+            continue
+        settled_mv += float(close) * shares
+    return settled_mv, fallback
 
 
 def _mark_basis_usd(pos: dict | None) -> float | None:
@@ -1237,6 +1278,9 @@ def run(
     _health_start = _time.time()
 
     config = load_config()
+    # Validated at the TOP of the run: an unrecognised nav_basis must refuse
+    # before any artifact is written, not after (alpha-engine-config-I9638).
+    nav_basis = resolve_nav_basis(config)
 
     db_path = config["db_path"]
     trades_bucket = config["trades_bucket"]
@@ -1385,13 +1429,19 @@ def run(
     # is missing because a weekday/EOD SF was skipped, which makes the
     # headline NAV daily return span multiple sessions.
     prior_row = conn.execute(
-        "SELECT date, portfolio_nav FROM eod_pnl WHERE date < ? ORDER BY date DESC LIMIT 1",
+        "SELECT date, portfolio_nav, nav_basis FROM eod_pnl "
+        "WHERE date < ? ORDER BY date DESC LIMIT 1",
         (run_date,),
     ).fetchone()
     prior_eod_date = (
         date.fromisoformat(prior_row[0]) if prior_row and prior_row[0] else None
     )
     prior_nav = prior_row[1] if prior_row else None
+    # NULL on every row written before alpha-engine-config-I9638, which by
+    # definition means the pre-flag basis: IB NetLiquidation.
+    prior_nav_basis = (
+        (prior_row[2] or NAV_BASIS_IB_NETLIQ) if prior_row else None
+    )
 
     # Headline gap guard: if the prior eod_pnl row is not the previous trading
     # day, the NAV-level daily return / alpha span more than one session. Per-
@@ -1667,6 +1717,107 @@ def run(
             logger.error("NAV MARK CORRECTION: %s", _msg)
             data_warnings.append(_msg)
 
+    # ── NAV basis: settled-close NAV computed BESIDE IB NetLiquidation ──────
+    # Ruled 2026-08-31 (alpha-engine-config#9638), option (b) STAGED. Both
+    # figures are computed here on EVERY run, whatever the basis:
+    #
+    #   nav_ib_usd       IB NetLiquidation after the I9627 mark correction —
+    #                    exactly what `nav` carried before this block existed.
+    #   nav_settled_usd  total_cash + accrued_interest + Σ shares × settled
+    #                    close, i.e. the same rebuild the attribution
+    #                    basis-level gate already strikes IB against. Measured
+    #                    faithful: `nav_identity_residual_usd` ≤ $64 on 48/48
+    #                    sessions.
+    #
+    # `nav_basis` decides only which one becomes the headline `nav`. IB is
+    # retained as the broker cross-check under BOTH bases (I6819 item 3): the
+    # three-way hard gate and the attribution basis-level gate are re-based
+    # onto `nav_ib_usd` below so neither goes tautological after a cut-over.
+    nav_ib_usd = nav
+    _basis_cash = account.get("total_cash")
+    settled_mv_today_usd, settled_fallback_tickers = _settled_position_value_usd(
+        positions, closing_prices,
+    )
+    if _basis_cash is None:
+        # Absent, never a silent zero: a settled NAV rebuilt without the cash
+        # leg is not a smaller number, it is a wrong one.
+        nav_settled_usd = None
+        nav_basis_unavailable_reason = (
+            "broker cash balance absent from the snapshot — cash + accrued + "
+            "Σ shares·settled close has no cash leg to rebuild from"
+        )
+    else:
+        nav_settled_usd = (
+            float(_basis_cash)
+            + float(account.get("accrued_interest") or 0.0)
+            + settled_mv_today_usd
+        )
+        nav_basis_unavailable_reason = None
+    nav_basis_diff_usd = (
+        nav_ib_usd - nav_settled_usd if nav_settled_usd is not None else None
+    )
+    nav_basis_diff_bps = (
+        (nav_basis_diff_usd / nav_ib_usd * 10000.0)
+        if (nav_basis_diff_usd is not None and nav_ib_usd) else None
+    )
+
+    if nav_basis == NAV_BASIS_SETTLED_CLOSE:
+        # Refuse rather than guess. Publishing a NAV labelled `settled_close`
+        # that is partly a broker mark — or that has no cash leg at all — is
+        # the untraceable outcome the flag exists to remove.
+        if nav_settled_usd is None:
+            raise RuntimeError(
+                f"nav_basis=settled_close but the settled NAV for {run_date} "
+                f"cannot be rebuilt: {nav_basis_unavailable_reason}. NAV is "
+                "not published. Set nav_basis to ib_netliq in risk.yaml to "
+                "fall back to the broker figure for this session."
+            )
+        if settled_fallback_tickers:
+            raise RuntimeError(
+                f"nav_basis=settled_close but {len(settled_fallback_tickers)} "
+                f"held name(s) carry no settled ArcticDB close for {run_date}: "
+                f"{', '.join(sorted(settled_fallback_tickers))}. The headline "
+                "NAV would silently contain the broker's mark for them while "
+                "claiming a settled-close basis. NAV is not published — "
+                "backfill the close(s), or set nav_basis to ib_netliq."
+            )
+        nav = nav_settled_usd
+    logger.info(
+        "NAV basis=%s | nav_ib_usd=$%s | nav_settled_usd=$%s | "
+        "nav_basis_diff_usd=$%s | nav_basis_diff_bps=%s",
+        nav_basis,
+        f"{nav_ib_usd:,.2f}" if nav_ib_usd is not None else "ABSENT",
+        f"{nav_settled_usd:,.2f}" if nav_settled_usd is not None else "ABSENT",
+        f"{nav_basis_diff_usd:+,.2f}" if nav_basis_diff_usd is not None else "ABSENT",
+        f"{nav_basis_diff_bps:+.2f}" if nav_basis_diff_bps is not None else "ABSENT",
+    )
+    # Shadow-stage detection (I9638 deliverable 4). The routine basis gap is an
+    # OBSERVATION — it is published on every row and in the report whatever its
+    # size. Only a gap past the NAV three-way hard-gate tolerance earns a line
+    # in data_warnings, and no new page: the level itself is already paged by
+    # the attribution basis-level gate below, and a second page for one fact is
+    # the I10049 defect.
+    if nav_basis_diff_usd is not None and nav_ib_usd and abs(
+        nav_basis_diff_usd
+    ) > _nav_hard_gate_tolerance_usd(nav_ib_usd):
+        data_warnings.append(
+            f"NAV basis divergence for {run_date}: IB NetLiquidation exceeds "
+            f"the settled-close rebuild by ${nav_basis_diff_usd:+,.0f} "
+            f"({nav_basis_diff_bps:+.1f}bp), past the "
+            f"${_nav_hard_gate_tolerance_usd(nav_ib_usd):,.0f} three-way "
+            f"tolerance. Headline NAV is on basis {nav_basis!r}."
+        )
+    # A basis change is a change in what the NAV series MEANS, so the first
+    # `daily_return_pct` after a cut-over is struck across two definitions.
+    # Named rather than left for a reader to infer from a one-day jump.
+    if prior_nav_basis is not None and prior_nav_basis != nav_basis:
+        data_warnings.append(
+            f"NAV basis changed for {run_date}: the prior eod_pnl row is on "
+            f"{prior_nav_basis!r} and this row is on {nav_basis!r}. This "
+            f"session's daily_return_pct and daily_alpha_pct span the basis "
+            f"change and are not comparable to the surrounding series."
+        )
+
     # ── NAV-derived headline figures (computed on the CORRECTED NAV) ────────
     if prior_nav is None:
         logger.info("First trading day — no prior NAV, daily return unavailable")
@@ -1687,7 +1838,7 @@ def run(
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
     prior_snapshot_row = conn.execute(
         "SELECT positions_snapshot, portfolio_nav, total_cash, accrued_interest, "
-        "nav_mark_correction_json "
+        "nav_mark_correction_json, nav_ib_usd "
         "FROM eod_pnl WHERE positions_snapshot IS NOT NULL AND date < ? "
         "ORDER BY date DESC LIMIT 1",
         (run_date,),
@@ -1704,7 +1855,18 @@ def run(
         try:
             prior_positions = json.loads(prior_snapshot_row[0])
             prior_snapshot_loaded = True
-            prior_snapshot_nav = prior_snapshot_row[1]
+            # The mark basis is IB-vs-settled by definition, so the prior leg
+            # must be the prior day's IB figure — NOT its headline
+            # portfolio_nav, which is the same number today but becomes the
+            # SETTLED number after a cut-over, collapsing the basis to a
+            # tautological zero (alpha-engine-config-I9638). nav_ib_usd is
+            # NULL on every pre-I9638 row, where portfolio_nav IS the IB
+            # figure, so the fallback is exact rather than approximate.
+            prior_snapshot_nav = (
+                prior_snapshot_row[5]
+                if prior_snapshot_row[5] is not None
+                else prior_snapshot_row[1]
+            )
             prior_snapshot_cash = prior_snapshot_row[2]
             prior_snapshot_accrued = prior_snapshot_row[3]
         except (json.JSONDecodeError, TypeError):
@@ -1925,7 +2087,27 @@ def run(
         # A constant cash/accrued offset cancels in the day-over-day difference.
         # When any prior input is missing the term is 0, the gap stays in
         # unattributed, and a warning fires (fail loud, never silently hide).
+        #
+        # TWO distinct quantities live here, and they were the same number
+        # until alpha-engine-config-I9638 split them:
+        #
+        #   mark_basis_delta_usd  the IB-vs-settled divergence, day-over-day
+        #                         differenced. A property of the BROKER DATA,
+        #                         computed on `nav_ib_usd` under either basis,
+        #                         and the input the three-way hard gate reads.
+        #   pricing_timing_usd    the mark-basis sleeve actually INSIDE the NAV
+        #                         series being attributed. Equal to
+        #                         mark_basis_delta_usd on the ib_netliq basis;
+        #                         ZERO BY CONSTRUCTION on settled_close, where
+        #                         the headline NAV *is* the settled rebuild and
+        #                         carries no broker mark to attribute.
+        #
+        # Subtracting a non-zero mark-basis term from a NAV change that never
+        # contained it would corrupt `unattributed_true_usd` — which is what
+        # the residual bounds gate is measured against — so the split is load
+        # bearing, not cosmetic.
         pricing_timing_usd = 0.0
+        mark_basis_delta_usd = 0.0
         pricing_timing_available = False
         today_cash = account.get("total_cash")
         if (
@@ -1952,9 +2134,13 @@ def run(
                 + float(prior_snapshot_accrued or 0.0)
                 + settled_mv_prior
             )
-            mark_basis_today = nav - nav_settled_today
+            mark_basis_today = nav_ib_usd - nav_settled_today
             mark_basis_prior = float(prior_snapshot_nav) - nav_settled_prior
-            pricing_timing_usd = mark_basis_today - mark_basis_prior
+            mark_basis_delta_usd = mark_basis_today - mark_basis_prior
+            pricing_timing_usd = (
+                0.0 if nav_basis == NAV_BASIS_SETTLED_CLOSE
+                else mark_basis_delta_usd
+            )
             pricing_timing_available = True
 
         # Realized P&L on shares rotated OUT today — also currently inside
@@ -2017,6 +2203,11 @@ def run(
             "unattributed_usd": unattributed_usd,
             "pricing_timing_usd": pricing_timing_usd,
             "pricing_timing_available": pricing_timing_available,
+            # The IB-vs-settled divergence itself, day-over-day differenced.
+            # Equal to pricing_timing_usd on the ib_netliq basis; the sleeve
+            # goes to zero on settled_close while this does not
+            # (alpha-engine-config-I9638).
+            "mark_basis_delta_usd": mark_basis_delta_usd,
             "rotation_realized_usd": rotation_realized_usd,
             "unattributed_true_usd": unattributed_true_usd,
             "commission_usd": costs["commission_usd"],
@@ -2055,13 +2246,25 @@ def run(
         )
         # Honesty warnings — surface each material term in data_warnings (EOD
         # email + console), never silently buried.
-        if pricing_timing_available and nav and abs(pricing_timing_usd) > max(
+        # Fires on `mark_basis_delta_usd`, not on the attribution sleeve
+        # (alpha-engine-config-I9638): identical on the default ib_netliq
+        # basis, where the two are the same number, but on settled_close the
+        # sleeve is zero by construction and this — the fleet's most sensitive
+        # IB-vs-settled detector at 5bp — would go permanently silent on the
+        # exact divergence it was built to see.
+        if pricing_timing_available and nav and abs(mark_basis_delta_usd) > max(
             500.0, 0.0005 * nav
         ):
             data_warnings.append(
-                f"Pricing & timing reconciliation: ${pricing_timing_usd:+,.0f} "
-                f"({pricing_timing_usd / nav * 100:+.3f}% of NAV) — IB marks vs "
-                "settled closes; isolated from Unattributed, not hidden."
+                f"Pricing & timing reconciliation: ${mark_basis_delta_usd:+,.0f} "
+                f"({mark_basis_delta_usd / nav * 100:+.3f}% of NAV) — IB marks vs "
+                "settled closes; "
+                + (
+                    "outside the headline NAV entirely on the settled_close "
+                    "basis, reported as a broker cross-check."
+                    if nav_basis == NAV_BASIS_SETTLED_CLOSE
+                    else "isolated from Unattributed, not hidden."
+                )
             )
         if not pricing_timing_available and prior_nav is not None:
             data_warnings.append(
@@ -2079,8 +2282,15 @@ def run(
         # for the routine/sub-hard-gate band. Decision logic lives in
         # `_check_nav_three_way_hard_gate` (pure function, unit-tested
         # directly); this call site owns dispatch (log + page flow-doctor).
+        #
+        # Re-based onto `mark_basis_delta_usd` (alpha-engine-config-I9638).
+        # Identical to `pricing_timing_usd` on the default ib_netliq basis, so
+        # the gate's behaviour is UNCHANGED today; on settled_close the sleeve
+        # is zero by construction and passing it here would silence the gate
+        # entirely — I6819 item 3 requires it keep firing on IB divergence
+        # after the cut-over. The tolerance is untouched.
         nav_hard_gate_breach = _check_nav_three_way_hard_gate(
-            pricing_timing_usd=pricing_timing_usd,
+            pricing_timing_usd=mark_basis_delta_usd,
             pricing_timing_available=pricing_timing_available,
             nav=nav,
             run_date=run_date,
@@ -2297,6 +2507,19 @@ def run(
     # values existed in logs + the email body but weren't queryable from
     # eod_pnl.csv. nav_reconciliation can be {} when prior_nav is None
     # (first-ever EOD run); .get() defaults to None for those columns.
+    # The NAV-basis shadow figures do NOT depend on a prior day, so they are
+    # merged in unconditionally — including on the first-ever EOD run, where
+    # `nav_reconciliation` is still {} (alpha-engine-config-I9638).
+    nav_reconciliation.update({
+        "nav_basis": nav_basis,
+        "nav_ib_usd": nav_ib_usd,
+        "nav_settled_usd": nav_settled_usd,
+        "nav_basis_diff_usd": nav_basis_diff_usd,
+        "nav_basis_diff_bps": nav_basis_diff_bps,
+        "nav_basis_unavailable_reason": nav_basis_unavailable_reason,
+        "nav_settled_fallback_tickers": sorted(settled_fallback_tickers),
+    })
+
     unattributed_for_log = nav_reconciliation.get("unattributed_usd")
     unattributed_pct_for_log = _compute_unattributed_residual_pct(
         unattributed_for_log, nav,
@@ -2394,8 +2617,15 @@ def run(
     # an independent source (broker cash + ArcticDB settled closes) — and it
     # sees the CONSTANT basis error that cancels exactly in the day-over-day
     # `_check_nav_three_way_hard_gate` above and is invisible to it.
+    #
+    # The left-hand side is `nav_ib_usd`, not the headline `nav`
+    # (alpha-engine-config-I9638). They are the same number on the default
+    # ib_netliq basis, so this gate is unchanged today; on settled_close the
+    # headline NAV *is* the settled rebuild, and comparing it to itself would
+    # return exactly $0 every session — the tautology this check was built to
+    # replace. The tolerance is untouched and still scales on the headline NAV.
     basis_level = nav_basis_level_usd(
-        nav=nav,
+        nav=nav_ib_usd,
         total_cash=account.get("total_cash"),
         accrued_interest=account.get("accrued_interest"),
         positions=positions,
@@ -2465,6 +2695,14 @@ def run(
         # unconditionally on a correction day so the published NAV can always be
         # traced back to what IB actually sent (alpha-engine-config-I9627).
         "nav_ib_raw_usd": nav_ib_raw,
+        # Which basis `portfolio_nav` above is struck on, plus both candidate
+        # figures and their gap — the two-week shadow series the ruled
+        # cut-over is graded from (alpha-engine-config-I9638).
+        "nav_basis": nav_basis,
+        "nav_ib_usd": nav_ib_usd,
+        "nav_settled_usd": nav_settled_usd,
+        "nav_basis_diff_usd": nav_basis_diff_usd,
+        "nav_basis_diff_bps": nav_basis_diff_bps,
         "nav_mark_correction_usd": (
             mark_correction["correction_usd"] if mark_correction["applied"] else None
         ),
