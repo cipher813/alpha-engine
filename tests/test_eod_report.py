@@ -439,8 +439,13 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_11(self):
-        """2.11 (alpha-engine-config-I10048): each position row gains
+    def test_schema_version_is_2_12(self):
+        """2.12 (alpha-engine-config-I9638): `nav_reconciliation` gains the
+        NAV-basis shadow block — `nav_basis`, `nav_ib_usd`, `nav_settled_usd`,
+        `nav_basis_diff_usd`, `nav_basis_diff_bps`, `mark_basis_delta_usd` and
+        the absent-measurement fields. Additive: no existing field changes
+        meaning while `nav_basis` is `ib_netliq`.
+        2.11 (alpha-engine-config-I10048): each position row gains
         `ib_market_value_raw` / `ib_mark_corrected` / `ib_mark_correction_usd`,
         and `ib_market_value` on a CORRECTED name becomes the mark the headline
         NAV was struck on. Not additive, deliberately: 2.8 corrected NAV and
@@ -449,7 +454,7 @@ class TestBuildEodReport:
         2.10 (I9637) carried `ib_mark_range_checked` onto each position row;
         2.9 added `integrity.mark_check_coverage`; 2.8 (I9627) added
         `integrity.nav_mark_correction`."""
-        assert SCHEMA_VERSION == "2.11"
+        assert SCHEMA_VERSION == "2.12"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -501,7 +506,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.11"
+        assert report["schema_version"] == "2.12"
         # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
         # and the integrity-gate verdict reach the artifact. Before this the
         # only cost figure anywhere in the P&L path was the portfolio

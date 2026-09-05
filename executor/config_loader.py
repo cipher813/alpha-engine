@@ -140,3 +140,48 @@ def get_flow_doctor_yaml_path() -> str:
         )
     except FileNotFoundError:
         return repo_root_copy
+
+
+# ── NAV basis (alpha-engine-config-I9638) ─────────────────────────────────
+# Which number is the headline portfolio NAV.
+#
+#   ib_netliq      IB Gateway's ``NetLiquidation``, after the I9627 broker-mark
+#                  correction. Today's behaviour; the default until the ruled
+#                  cut-over lands.
+#   settled_close  ``total_cash + accrued_interest + Σ shares × settled close``,
+#                  rebuilt from broker cash and ArcticDB settled closes.
+#
+# Operator ruling 2026-08-31 on alpha-engine-config#9638: option (b), STAGED —
+# compute both figures every run and publish the difference for two weeks
+# before flipping the default. Both figures are computed and published under
+# EITHER value; the flag decides only which one is the headline NAV that
+# ``daily_return_pct``, ``daily_alpha_pct`` and position weights are struck on.
+NAV_BASIS_IB_NETLIQ = "ib_netliq"
+NAV_BASIS_SETTLED_CLOSE = "settled_close"
+NAV_BASES = (NAV_BASIS_IB_NETLIQ, NAV_BASIS_SETTLED_CLOSE)
+NAV_BASIS_DEFAULT = NAV_BASIS_IB_NETLIQ
+
+
+def resolve_nav_basis(config: dict | None) -> str:
+    """Validate and return the configured ``nav_basis``.
+
+    An ABSENT key resolves to :data:`NAV_BASIS_DEFAULT` — every risk.yaml
+    deployed before this flag existed lacks it, and the default is today's
+    behaviour, so absence is a known state rather than a misconfiguration.
+
+    Anything else that is not one of :data:`NAV_BASES` RAISES. A typo
+    (``settled-close``, ``ib_netliquidation``) must never silently fall back to
+    the default: it would publish a NAV on a basis the operator did not choose
+    while the config file says otherwise, which is precisely the untraceable
+    outcome this flag exists to remove.
+    """
+    if not config or "nav_basis" not in config:
+        return NAV_BASIS_DEFAULT
+    value = config["nav_basis"]
+    if value in NAV_BASES:
+        return value
+    raise ValueError(
+        f"risk.yaml nav_basis={value!r} is not a recognised NAV basis. "
+        f"Valid values: {', '.join(NAV_BASES)}. Remove the key to take the "
+        f"default ({NAV_BASIS_DEFAULT}, IB NetLiquidation — today's behaviour)."
+    )

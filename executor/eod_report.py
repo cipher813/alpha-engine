@@ -104,7 +104,18 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.11"
+SCHEMA_VERSION = "2.12"
+# 2.12 (alpha-engine-config-I9638): ``nav_reconciliation`` gains the NAV-basis
+# shadow block — ``nav_basis`` (which figure ``summary.nav`` is struck on,
+# ``ib_netliq`` or ``settled_close``), ``nav_ib_usd`` (post-mark-correction IB
+# NetLiquidation), ``nav_settled_usd`` (cash + accrued + Σ shares·settled
+# close), ``nav_basis_diff_usd``/``nav_basis_diff_bps``, plus
+# ``mark_basis_delta_usd`` (the day-over-day IB-vs-settled divergence, which
+# equals ``pricing_timing_usd`` only while the basis is ``ib_netliq``) and the
+# absent-measurement fields ``nav_basis_unavailable_reason`` /
+# ``nav_settled_fallback_tickers``. Both figures are published under either
+# basis: this is the shadow stage of the ruled cut-over, and a reader grading
+# it must never have to infer which definition a row's NAV carries.
 # 2.11 (alpha-engine-config-I10048): each position row gains
 # ``ib_market_value_raw``, ``ib_mark_corrected`` and ``ib_mark_correction_usd``.
 # ``ib_market_value`` CHANGES MEANING on a corrected name only: it is now the
@@ -723,6 +734,22 @@ def build_eod_report(
             "unattributed_usd": recon.get("unattributed_usd"),
             "pricing_timing_usd": recon.get("pricing_timing_usd"),
             "pricing_timing_available": recon.get("pricing_timing_available"),
+            # ── NAV basis shadow (schema 2.12, alpha-engine-config-I9638) ──
+            # Both candidate NAV figures and their gap, published on every
+            # run under either basis. `nav_basis` names which one
+            # `summary.nav` — and therefore daily_return_pct,
+            # daily_alpha_pct and every position weight — is struck on.
+            "nav_basis": recon.get("nav_basis"),
+            "nav_ib_usd": recon.get("nav_ib_usd"),
+            "nav_settled_usd": recon.get("nav_settled_usd"),
+            "nav_basis_diff_usd": recon.get("nav_basis_diff_usd"),
+            "nav_basis_diff_bps": recon.get("nav_basis_diff_bps"),
+            # Non-null only when the settled rebuild could NOT be made, or was
+            # made with a broker mark standing in for a missing settled close.
+            # An absent measurement is reported as absent, never as agreement.
+            "nav_basis_unavailable_reason": recon.get("nav_basis_unavailable_reason"),
+            "nav_settled_fallback_tickers": recon.get("nav_settled_fallback_tickers"),
+            "mark_basis_delta_usd": recon.get("mark_basis_delta_usd"),
             "rotation_realized_usd": (
                 attribution.get("rotation_realized_usd") if attribution else None
             ),

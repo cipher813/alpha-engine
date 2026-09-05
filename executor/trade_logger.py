@@ -206,6 +206,20 @@ _EOD_MIGRATIONS = [
     # CREATE_DIVIDEND_ACCRUALS_TABLE above.
     "ALTER TABLE eod_pnl ADD COLUMN dividend_timing_usd REAL",
     "ALTER TABLE eod_pnl ADD COLUMN dividend_receivable_usd REAL",
+    # ── NAV basis shadow (alpha-engine-config-I9638) ──────────────────────
+    # The ruled cut-over from broker NetLiquidation to a settled-close NAV is
+    # staged: both figures are computed EVERY run under either basis and the
+    # difference is published for two weeks before the default flips.
+    # `nav_basis` names which one `portfolio_nav` above actually carries, so a
+    # row is never ambiguous about what its headline NAV means — including
+    # across the cut-over, where the NAV series changes definition mid-history.
+    # nav_ib_usd is the POST-correction broker figure (nav_ib_raw_usd is the
+    # pre-correction one), retained as the broker cross-check under both bases.
+    "ALTER TABLE eod_pnl ADD COLUMN nav_basis TEXT",
+    "ALTER TABLE eod_pnl ADD COLUMN nav_ib_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN nav_settled_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN nav_basis_diff_usd REAL",
+    "ALTER TABLE eod_pnl ADD COLUMN nav_basis_diff_bps REAL",
 ]
 
 CREATE_SHADOW_BOOK_TABLE = """
@@ -624,8 +638,10 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
              integrity_breach_json, dividend_timing_usd,
              dividend_receivable_usd,
              nav_ib_raw_usd, nav_mark_correction_usd, nav_mark_correction_json,
+             nav_basis, nav_ib_usd, nav_settled_usd, nav_basis_diff_usd,
+             nav_basis_diff_bps,
              created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             eod["date"],
@@ -662,6 +678,11 @@ def log_eod(conn: sqlite3.Connection, eod: dict) -> None:
             eod.get("nav_ib_raw_usd"),
             eod.get("nav_mark_correction_usd"),
             eod.get("nav_mark_correction_json"),
+            eod.get("nav_basis"),
+            eod.get("nav_ib_usd"),
+            eod.get("nav_settled_usd"),
+            eod.get("nav_basis_diff_usd"),
+            eod.get("nav_basis_diff_bps"),
             datetime.now(UTC).isoformat(),
         ),
     )
