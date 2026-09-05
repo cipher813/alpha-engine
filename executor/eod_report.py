@@ -104,7 +104,20 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2.10"
+SCHEMA_VERSION = "2.11"
+# 2.11 (alpha-engine-config-I10048): each position row gains
+# ``ib_market_value_raw``, ``ib_mark_corrected`` and ``ib_mark_correction_usd``.
+# ``ib_market_value`` CHANGES MEANING on a corrected name only: it is now the
+# mark the headline NAV was struck on (``shares × settled_close``) rather than
+# the broker's raw number, which moves to ``ib_market_value_raw``. This is the
+# only non-additive step since 2.4, and it is the point: 2.8 corrected NAV and
+# left the position row raw, so the two disagreed and the NEXT day's mark-basis
+# attribution differenced a corrected NAV against a raw prior mark, re-surfacing
+# the correction as ``nav_identity_residual_usd`` (+$1,605, HOOD 2026-09-03) and
+# mislabelling the breach ``reconcile_defect``. Every range flag
+# (``ib_mark_outside_range``, ``ib_mark_range_error_usd``,
+# ``ib_mark_range_checked``) is stamped BEFORE the correction and is unchanged,
+# so a repaired row is never readable as one that was never wrong.
 # 2.7 (alpha-engine-config-I8188, second pass): additive only.
 # ``transaction_costs`` gains ``gross_available`` and
 # ``gross_unavailable_reason``. When IB attaches no commissionReport to any
@@ -612,6 +625,19 @@ def build_eod_report(
             # settled-close override, so a NAV hard-gate breach is
             # self-diagnosing from the artifact instead of a by-hand trace.
             "ib_market_value": pos.get("ib_market_value"),
+            # Schema 2.9 (alpha-engine-config-I10048): when the I9627 mark
+            # correction applies, `ib_market_value` above is the mark the
+            # headline NAV was actually struck on (`shares × settled_close`),
+            # not the broker's. The broker's number is preserved here so the
+            # artifact still shows what IB sent, and `ib_mark_corrected` says
+            # the row was repaired rather than never wrong. Before this the
+            # two disagreed: NAV moved and the position row did not, so the
+            # next day's mark-basis attribution differenced a corrected NAV
+            # against a raw prior mark and re-surfaced the correction as
+            # `nav_identity_residual_usd` (+$1,605, HOOD 2026-09-03).
+            "ib_market_value_raw": pos.get("ib_market_value_raw"),
+            "ib_mark_corrected": pos.get("ib_mark_corrected", False),
+            "ib_mark_correction_usd": pos.get("ib_mark_correction_usd"),
             # `ib_mark_outside_range` alone cannot say whether the check RAN
             # (alpha-engine-config-I9637). Its `, False` default makes an
             # unevaluated mark read exactly like one that was checked and

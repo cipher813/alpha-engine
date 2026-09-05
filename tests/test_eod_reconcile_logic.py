@@ -13,6 +13,7 @@ from executor.eod_reconcile import (
     NAV_HARD_GATE_TOLERANCE_NAV_BPS,
     NAV_HARD_GATE_TOLERANCE_USD_FLOOR,
     _apply_dividend_delta,
+    _apply_mark_correction_to_positions,
     _attribute_mark_basis_divergence,
     _check_nav_three_way_hard_gate,
     _classify_nav_breach,
@@ -22,8 +23,10 @@ from executor.eod_reconcile import (
     _format_mark_basis_contributors,
     _format_mark_range_detail,
     _load_constituents_sector_map,
+    _mark_basis_usd,
     _nav_hard_gate_tolerance_usd,
     _resolve_prior_price,
+    _restate_prior_positions_for_mark_correction,
     _synthesize_rationales,
 )
 
@@ -975,3 +978,211 @@ class TestEodPnlSessionAxisGate:
         with pytest.raises(Exception) as exc:  # noqa: B017 — any downstream failure is fine
             run(run_date="2026-03-12", send_email=False, run_audit=False)
         assert "not an NYSE trading session" not in str(exc.value)
+
+
+class TestCorrectedMarkIsWrittenToThePosition:
+    """alpha-engine-config-I10048 — the correction reached NAV and stopped.
+
+    `plan_nav_mark_correction` (I9627 / PR524) removed HOOD's provably-wrong
+    2026-09-02 broker mark from the headline NAV ($1,027,254.75 ->
+    $1,025,649.99, −$1,604.76) and left the position row carrying the RAW
+    mark: `ib_market_value: 101426.43` against `market_value: 99821.67`.
+
+    Share count is not in the artifact; 909 is chosen so `shares × price`
+    reproduces both published market values to the cent
+    ($109.814818 settled, $111.579791 broker).
+    """
+
+    SHARES = 909
+    SETTLED_CLOSE = 99_821.67 / 909
+    IB_MARK = 101_426.43 / 909
+
+    def _raw_position_book(self):
+        # The book as `run()` holds it at the correction call site: the
+        # settled-close override has NOT run yet, so `market_value` is still
+        # IB's mark-to-market and `ib_market_value` was copied from it.
+        return {
+            "HOOD": {
+                "shares": self.SHARES,
+                "market_value": 101_426.43,
+                "ib_market_value": 101_426.43,
+            }
+        }
+
+    def test_the_repair_lands_on_the_position_not_only_on_nav(self):
+        from executor.pnl_integrity import plan_nav_mark_correction
+
+        positions = self._raw_position_book()
+        # The detector runs FIRST and stamps its evidence; the mark is above
+        # the day's high, the settled close is inside it.
+        flags = _detect_ib_mark_outside_range(
+            positions=positions,
+            day_low={"HOOD": 108.50},
+            day_high={"HOOD": 110.50},
+        )
+        assert flags and flags[0]["ticker"] == "HOOD"
+        plan = plan_nav_mark_correction(
+            flags,
+            settled_closes={"HOOD": self.SETTLED_CLOSE},
+            day_low={"HOOD": 108.50},
+            day_high={"HOOD": 110.50},
+            nav=1_027_254.75,
+            run_date="2026-09-02",
+        )
+        assert plan["applied"] is True
+        assert plan["correction_usd"] == pytest.approx(-1_604.76, abs=0.01)
+        assert plan["nav_corrected"] == pytest.approx(1_025_649.99, abs=0.01)
+
+        written = _apply_mark_correction_to_positions(positions, plan["corrections"])
+        assert written == ["HOOD"]
+        pos = positions["HOOD"]
+        assert pos["ib_market_value"] == pytest.approx(99_821.67, abs=0.01)
+        assert pos["ib_market_value_raw"] == pytest.approx(101_426.43)
+        assert pos["ib_mark_correction_usd"] == pytest.approx(-1_604.76, abs=0.01)
+        assert pos["ib_mark_corrected"] is True
+        # Detector evidence is UNTOUCHED — a repaired row must never be
+        # readable as one that was never wrong.
+        assert pos["ib_mark_outside_range"] is True
+        assert pos["ib_mark_range_error_usd"] == pytest.approx(
+            self.SHARES * (self.IB_MARK - 110.50), abs=0.01,
+        )
+        # After the settled-close override the basis is $0 by construction —
+        # the position is now on the same price the headline NAV is.
+        pos["market_value"] = self.SHARES * self.SETTLED_CLOSE
+        assert _mark_basis_usd(pos) == pytest.approx(0.0, abs=0.01)
+
+    def test_a_correction_naming_an_absent_position_raises(self):
+        """Fail loud: the plan is built from this very dict one call earlier,
+        so a name it carries that the book does not is a contract violation,
+        not a skippable row."""
+        with pytest.raises(RuntimeError, match="absent from the positions book"):
+            _apply_mark_correction_to_positions(
+                {}, [{"ticker": "HOOD", "shares": 909, "settled_close": 109.81}],
+            )
+
+
+class TestPriorDayCorrectionIsNotTodaysResidual:
+    """alpha-engine-config-I10048 — the classification defect, reproduced.
+
+    2026-09-03 measured: `pricing_timing_usd` differences the NAV-level mark
+    basis and therefore used the CORRECTED prior NAV (−$2,517), while
+    `compute_pricing_timing_by_ticker` and `_attribute_mark_basis_divergence`
+    differenced the RAW prior POSITION mark (full book −$4,122, explained
+    −$4,004). The gap is the previous day's correction to the dollar:
+    `nav_identity_residual_usd` = +$1,605, `residual_usd` = +$1,487, and the
+    breach was labelled `reconcile_defect` and paged at ERROR.
+
+    The book below is a three-name reduction that reproduces every one of
+    those figures: HOOD carries the correction, one name carries the genuine
+    off-close divergence (−$2,399) and one carries an on-close remainder
+    (−$118) that must stay OUT of the explanation term.
+    """
+
+    PRICING_TIMING_USD = -2_517.0  # struck from the CORRECTED prior NAV
+
+    # 2026-09-02, as PR524 persisted it: NAV corrected, HOOD's mark raw.
+    PRIOR_RAW = {
+        "HOOD": {"shares": 909, "ib_market_value": 101_426.43,
+                 "market_value": 99_821.67, "ib_mark_outside_range": True,
+                 "ib_mark_range_error_usd": 1_604.76},
+        "OFFCLOSE": _pos(1000, 101.20, 100.00),   # 1.20% off close
+        "ONCLOSE": _pos(2000, 100.00, 100.00),    # the mark IS the close
+    }
+    # 2026-09-03.
+    TODAY = {
+        "HOOD": _pos(909, 110.0110, 110.0110),    # back on the close
+        "OFFCLOSE": _pos(1000, 98.801, 100.00),   # −1.199%
+        "ONCLOSE": _pos(2000, 99.941, 100.00),    # −0.059%, below the 10bp floor
+    }
+
+    @staticmethod
+    def _corrected_prior():
+        """The same snapshot with HOOD restated to the mark NAV was struck on."""
+        prior = {t: dict(p) for t, p in
+                 TestPriorDayCorrectionIsNotTodaysResidual.PRIOR_RAW.items()}
+        prior["HOOD"]["ib_market_value_raw"] = 101_426.43
+        prior["HOOD"]["ib_market_value"] = 99_821.67
+        prior["HOOD"]["ib_mark_corrected"] = True
+        return prior
+
+    def _wire(self, prior):
+        """Exactly the composition `run()` performs at the hard-gate call site."""
+        from executor.eod_report import compute_pricing_timing_by_ticker
+
+        by_ticker, uncovered = compute_pricing_timing_by_ticker(self.TODAY, prior)
+        mb = _attribute_mark_basis_divergence(
+            positions=self.TODAY, prior_positions=prior,
+        )
+        return mb, _classify_nav_breach(
+            self.PRICING_TIMING_USD,
+            [],  # 2026-09-03 flagged nothing out of range
+            full_book_mark_basis_usd=sum(by_ticker.values()),
+            full_book_uncovered_names=uncovered,
+            mark_divergence_explained_usd=mb["explained_usd"],
+        )
+
+    def test_raw_prior_mark_reproduces_the_reconcile_defect_misclassification(self):
+        """The BUG, pinned to the live figures. This is what shipped."""
+        mb, result = self._wire(self.PRIOR_RAW)
+        assert result["full_book_mark_basis_usd"] == pytest.approx(-4_121.76, abs=1.0)
+        assert mb["explained_usd"] == pytest.approx(-4_003.76, abs=1.0)
+        assert result["nav_identity_residual_usd"] == pytest.approx(1_604.76, abs=1.0)
+        assert result["residual_usd"] == pytest.approx(1_486.76, abs=1.0)
+        assert result["classification"] == "reconcile_defect"
+
+    def test_corrected_prior_mark_ties_the_identity_and_classifies_broker_data(self):
+        """The FIX. Same day, same breach, consistent bookkeeping."""
+        mb, result = self._wire(self._corrected_prior())
+        assert result["full_book_mark_basis_usd"] == pytest.approx(-2_517.0, abs=1.0)
+        assert mb["explained_usd"] == pytest.approx(-2_399.0, abs=1.0)
+        assert abs(result["nav_identity_residual_usd"]) < 1.0
+        assert result["residual_usd"] == pytest.approx(-118.0, abs=1.0)
+        assert result["classification"] == "broker_data_quality"
+
+    def test_restating_a_pre_fix_snapshot_derives_the_corrected_prior_mark(self):
+        """Backward compatibility: a prior row written between PR524 and this
+        fix carries a corrected `portfolio_nav` and a raw position mark. The
+        correction plan was persisted whole on that same row, so the corrected
+        prior mark is DERIVED from its own `corrections` list — not guessed
+        from the NAV delta and not hand-edited in S3."""
+        prior = {t: dict(p) for t, p in self.PRIOR_RAW.items()}
+        blob = json.dumps({
+            "applied": True,
+            "correction_usd": -1_604.76,
+            "corrections": [{
+                "ticker": "HOOD", "shares": 909,
+                "ib_mark": 101_426.43 / 909, "settled_close": 99_821.67 / 909,
+                "correction_usd": -1_604.76,
+            }],
+        })
+        assert _restate_prior_positions_for_mark_correction(prior, blob) == ["HOOD"]
+        assert prior["HOOD"]["ib_market_value"] == pytest.approx(99_821.67, abs=0.01)
+        assert prior["HOOD"]["ib_market_value_raw"] == pytest.approx(101_426.43)
+        assert prior["HOOD"]["mark_basis_usd"] == pytest.approx(0.0, abs=0.01)
+        assert prior["HOOD"]["ib_mark_corrected"] is True
+        assert prior["HOOD"]["ib_mark_corrected_source"] == (
+            "prior_row_nav_mark_correction_json"
+        )
+        # And the restated snapshot classifies the way the fix requires.
+        _mb, result = self._wire(prior)
+        assert result["classification"] == "broker_data_quality"
+        assert abs(result["nav_identity_residual_usd"]) < 1.0
+
+    def test_a_row_with_no_correction_is_left_exactly_as_persisted(self):
+        prior = {t: dict(p) for t, p in self.PRIOR_RAW.items()}
+        assert _restate_prior_positions_for_mark_correction(prior, None) == []
+        assert _restate_prior_positions_for_mark_correction(
+            prior, json.dumps({"applied": False, "corrections": []}),
+        ) == []
+        assert prior["HOOD"]["ib_market_value"] == pytest.approx(101_426.43)
+        assert "ib_mark_corrected" not in prior["HOOD"]
+
+    def test_a_row_already_corrected_forward_is_not_restated_twice(self):
+        prior = self._corrected_prior()
+        blob = json.dumps({
+            "applied": True,
+            "corrections": [{"ticker": "HOOD", "shares": 909,
+                             "settled_close": 1.0, "correction_usd": -1.0}],
+        })
+        assert _restate_prior_positions_for_mark_correction(prior, blob) == []
+        assert prior["HOOD"]["ib_market_value"] == pytest.approx(99_821.67)

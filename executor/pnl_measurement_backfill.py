@@ -483,6 +483,15 @@ def reconstruct_mark_divergences(
     for ticker, pos in positions.items():
         settled_mv = _f((pos or {}).get("market_value"))
         ib_mv = _f((pos or {}).get("ib_market_value"))
+        if (pos or {}).get("ib_mark_corrected"):
+            # alpha-engine-config-I10048. A schema-2.11 corrected row carries
+            # the REPAIRED mark, so the divergence here is $0 by construction
+            # and the row's NAV already excludes the error — there is no
+            # residual contamination for this audit to name. The evidence that
+            # the mark WAS wrong is not lost: it stays on the same row as
+            # `ib_mark_outside_range`, `ib_mark_range_error_usd`,
+            # `ib_market_value_raw` and the row's `nav_mark_correction_json`.
+            continue
         if settled_mv is None or ib_mv is None:
             continue
         divergence = ib_mv - settled_mv
@@ -649,7 +658,15 @@ def audit_history(
             {
                 "ticker": t,
                 "mark_error_usd": p.get("ib_mark_range_error_usd"),
-                "ib_market_value": p.get("ib_market_value"),
+                # The RAW broker mark when the row was repaired in-session
+                # (schema 2.11 / alpha-engine-config-I10048): this flag list
+                # describes what the custodian gate SAW, which is the number
+                # IB sent, not the number NAV was restruck on.
+                "ib_market_value": (
+                    p.get("ib_market_value_raw")
+                    if p.get("ib_mark_corrected")
+                    else p.get("ib_market_value")
+                ),
                 "shares": p.get("shares"),
             }
             for t, p in positions.items()
@@ -797,6 +814,24 @@ def reconstruct_mark_correction_inputs(row: dict[str, Any]) -> dict[str, Any]:
         settled_mv = _f(pos.get("market_value"))
         ib_mv = _f(pos.get("ib_market_value"))
         shares = _f(pos.get("shares"))
+        if pos.get("ib_mark_corrected"):
+            # alpha-engine-config-I10048. Since schema 2.11 a corrected name's
+            # `ib_market_value` is the REPAIRED mark, so `ib_mv - settled_mv`
+            # is $0 here by construction. Reading that as "in range" would
+            # turn a session we KNOW carried a wrong mark into a clean one —
+            # the exact detection blindness this reconstruction exists to
+            # avoid. The row's NAV already excludes the error, so no
+            # restatement is due; it is NAMED rather than silently skipped.
+            out["refused"].append({
+                "date": date, "ticker": ticker,
+                "reason": "the broker mark for this name was already corrected "
+                          "in-session (alpha-engine-config-I9627) and the row's "
+                          "portfolio_nav already excludes the error — no "
+                          "restatement is due, and the $0 divergence here is "
+                          "the repair, not a clean mark. Raw broker mark: "
+                          f"{pos.get('ib_market_value_raw')}",
+            })
+            continue
         if ib_mv is None:
             out["refused"].append({
                 "date": date, "ticker": ticker,
