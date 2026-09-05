@@ -209,6 +209,129 @@ def _off_close_pct(pos: dict | None) -> float | None:
     return abs((float(ib_mv) - float(mv)) / float(mv)) * 100.0
 
 
+# ── Corrected-mark bookkeeping (alpha-engine-config-I10048) ────────────────
+# `plan_nav_mark_correction` (I9627) removes a provably-wrong broker mark from
+# the HEADLINE NAV, but PR524 left the per-position `ib_market_value` at the
+# raw broker number. The book therefore published a NAV struck on one price
+# and a position row carrying another, and the whole mark-basis apparatus
+# (`_mark_basis_usd`, `_off_close_pct`, `_attribute_mark_basis_divergence`,
+# `compute_pricing_timing_by_ticker`) reads the position rows.
+#
+# Measured cost, 2026-09-03: HOOD's 2026-09-02 correction was −$1,605.
+# `pricing_timing_usd` differences the NAV-level basis and so used the
+# CORRECTED prior NAV (−$2,517), while the per-name attribution differenced
+# the RAW prior position mark (−$4,122 full book, −$4,004 explained). The
+# difference is the correction to the dollar: `nav_identity_residual_usd` came
+# out at +$1,605, `residual_usd` at +$1,487, and the breach was labelled
+# `reconcile_defect` and paged at ERROR instead of `broker_data_quality` at
+# WARNING — on the day AFTER every correction, i.e. exactly when the class the
+# classifier exists to sort is most active.
+#
+# The repair is bookkeeping, not tolerance: the corrected position carries the
+# mark the headline NAV was actually struck on, and the raw broker mark is
+# preserved beside it so no evidence is lost. `_detect_ib_mark_outside_range`
+# and `check_mark_coverage` both run BEFORE this and keep their stamps
+# (`ib_mark_outside_range`, `ib_mark_range_error_usd`,
+# `ib_mark_range_checked`); nothing re-runs the detector on the corrected
+# value, so "repaired" can never be read back as "never wrong".
+def _apply_mark_correction_to_positions(
+    positions: dict,
+    corrections: list[dict] | None,
+) -> list[str]:
+    """Write an APPLIED mark correction onto the positions it repaired.
+
+    Mutates each corrected position: ``ib_market_value`` becomes
+    ``shares × settled_close`` (the mark NAV was struck on),
+    ``ib_market_value_raw`` preserves the broker's number,
+    ``ib_mark_correction_usd`` carries the per-name repair and
+    ``ib_mark_corrected`` is True. Returns the tickers written.
+
+    Called BEFORE the settled-close override in the positions loop, so
+    ``market_value`` converges on the same number and the name's
+    ``mark_basis_usd`` lands at $0 by construction.
+    """
+    written: list[str] = []
+    for c in corrections or []:
+        tkr = c.get("ticker")
+        pos = (positions or {}).get(tkr)
+        if pos is None:
+            # A correction naming a name that is not in the book is a contract
+            # violation, not a tolerable skip: the flags the plan was built
+            # from came from this very dict one call earlier.
+            raise RuntimeError(
+                f"NAV mark correction names {tkr!r}, which is absent from the "
+                "positions book it was planned from. The correction cannot be "
+                "written to the position and NAV would publish on a mark no "
+                "position row carries."
+            )
+        shares = float(c.get("shares") or 0)
+        settled_close = float(c["settled_close"])
+        if "ib_market_value_raw" not in pos:
+            pos["ib_market_value_raw"] = pos.get("ib_market_value")
+        pos["ib_market_value"] = shares * settled_close
+        pos["ib_mark_correction_usd"] = float(c.get("correction_usd") or 0.0)
+        pos["ib_mark_corrected"] = True
+        written.append(tkr)
+    return written
+
+
+def _restate_prior_positions_for_mark_correction(
+    prior_positions: dict | None,
+    nav_mark_correction_json: str | None,
+) -> list[str]:
+    """Backward compatibility for snapshots written BEFORE I10048.
+
+    A prior-day row persisted by PR524 (2026-08-31 → 2026-09-03) carries a
+    CORRECTED ``portfolio_nav`` and a RAW per-position ``ib_market_value``.
+    The correction itself was persisted whole on that row as
+    ``nav_mark_correction_json``, so the corrected prior mark is DERIVED —
+    ``shares × settled_close`` from the plan's own ``corrections`` list — not
+    guessed from the artifact or reverse-engineered from the NAV delta.
+
+    Mutates ``prior_positions`` in place and returns the tickers restated.
+    A row that already carries ``ib_mark_corrected`` (written forward by
+    :func:`_apply_mark_correction_to_positions`) is left untouched.
+    """
+    if not prior_positions or not nav_mark_correction_json:
+        return []
+    try:
+        plan = json.loads(nav_mark_correction_json)
+    except (json.JSONDecodeError, TypeError):
+        # Fail loud enough to be seen, but not fatal: an unparseable
+        # provenance blob must not stop today's reconcile. The classifier
+        # simply reverts to the pre-fix behaviour for this one prior day and
+        # the log names it, rather than the run dying on a history artifact.
+        logger.error(
+            "Prior-day nav_mark_correction_json is unparseable — the prior "
+            "positions are NOT restated and the mark-basis attribution will "
+            "carry the previous day's correction as a residual."
+        )
+        return []
+    if not isinstance(plan, dict) or not plan.get("applied"):
+        return []
+    restated: list[str] = []
+    for c in plan.get("corrections") or []:
+        tkr = c.get("ticker")
+        pos = prior_positions.get(tkr)
+        if pos is None or pos.get("ib_mark_corrected"):
+            continue
+        try:
+            shares = float(c.get("shares") or 0)
+            settled_close = float(c["settled_close"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if "ib_market_value_raw" not in pos:
+            pos["ib_market_value_raw"] = pos.get("ib_market_value")
+        pos["ib_market_value"] = shares * settled_close
+        pos["mark_basis_usd"] = _mark_basis_usd(pos)
+        pos["ib_mark_off_close_pct"] = _off_close_pct(pos)
+        pos["ib_mark_correction_usd"] = float(c.get("correction_usd") or 0.0)
+        pos["ib_mark_corrected"] = True
+        pos["ib_mark_corrected_source"] = "prior_row_nav_mark_correction_json"
+        restated.append(tkr)
+    return restated
+
+
 def _attribute_mark_basis_divergence(
     *,
     positions: dict,
@@ -1502,6 +1625,20 @@ def run(
                 "being repriced to their settled closes. The correction is "
                 "unsound on this data; NAV is not published."
             )
+        # Write the repaired mark onto the positions themselves
+        # (alpha-engine-config-I10048). Until this, only the headline NAV
+        # moved, so the position rows — and every per-name mark-basis reader
+        # downstream, today AND tomorrow via the persisted snapshot — still
+        # carried the broker's wrong number. See the block comment above
+        # `_apply_mark_correction_to_positions`.
+        _corrected_names = _apply_mark_correction_to_positions(
+            positions, mark_correction["corrections"],
+        )
+        logger.info(
+            "NAV mark correction written to %d position(s): %s — raw broker "
+            "mark preserved as ib_market_value_raw, range flags untouched",
+            len(_corrected_names), ", ".join(_corrected_names) or "none",
+        )
     elif mark_correction["refused"] or mark_correction["unrepairable"]:
         if mark_correction["message"]:
             logger.error("NAV MARK CORRECTION: %s", mark_correction["message"])
@@ -1533,7 +1670,8 @@ def run(
     # ── Per-position daily return & alpha contribution ──────────────────────
     # Look up prior day's positions_snapshot to get yesterday's price per ticker
     prior_snapshot_row = conn.execute(
-        "SELECT positions_snapshot, portfolio_nav, total_cash, accrued_interest "
+        "SELECT positions_snapshot, portfolio_nav, total_cash, accrued_interest, "
+        "nav_mark_correction_json "
         "FROM eod_pnl WHERE positions_snapshot IS NOT NULL AND date < ? "
         "ORDER BY date DESC LIMIT 1",
         (run_date,),
@@ -1555,6 +1693,25 @@ def run(
             prior_snapshot_accrued = prior_snapshot_row[3]
         except (json.JSONDecodeError, TypeError):
             pass
+        # Backward compatibility (alpha-engine-config-I10048). A prior row
+        # written between PR524 and this fix carries a CORRECTED
+        # `portfolio_nav` beside a RAW per-position `ib_market_value`.
+        # `prior_snapshot_nav` above is the corrected number, so leaving the
+        # positions raw makes the previous day's correction reappear today as
+        # `nav_identity_residual_usd` — the +$1,605 HOOD case. The correction
+        # plan was persisted whole on that same row, so the corrected prior
+        # mark is derived from its own `corrections` list rather than guessed.
+        if prior_snapshot_loaded:
+            _restated = _restate_prior_positions_for_mark_correction(
+                prior_positions, prior_snapshot_row[4],
+            )
+            if _restated:
+                logger.warning(
+                    "Restated %d prior-day position(s) to the corrected broker "
+                    "mark the prior NAV was struck on: %s (pre-I10048 snapshot "
+                    "— raw mark preserved as ib_market_value_raw)",
+                    len(_restated), ", ".join(_restated),
+                )
 
     from executor.eod_report import _buy_entry_prices
     from executor.trade_logger import get_todays_trades

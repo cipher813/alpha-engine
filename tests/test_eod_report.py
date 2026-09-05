@@ -439,14 +439,17 @@ class TestPricingTimingPerTicker:
 
 
 class TestBuildEodReport:
-    def test_schema_version_is_2_10(self):
-        """2.9 (alpha-engine-config-I9637): the `integrity` block gains
-        `mark_check_coverage` — how many held marks the range check could
-        actually evaluate. 2.8 (I9627) added `nav_mark_correction`: the
-        `nav_mark_correction` — the raw broker NAV and the repair applied to
-        it, so a corrected headline stays traceable to what IB sent.
-        Additive only."""
-        assert SCHEMA_VERSION == "2.10"
+    def test_schema_version_is_2_11(self):
+        """2.11 (alpha-engine-config-I10048): each position row gains
+        `ib_market_value_raw` / `ib_mark_corrected` / `ib_mark_correction_usd`,
+        and `ib_market_value` on a CORRECTED name becomes the mark the headline
+        NAV was struck on. Not additive, deliberately: 2.8 corrected NAV and
+        left the position row raw, so the next day's mark-basis attribution
+        re-surfaced the correction as `nav_identity_residual_usd`.
+        2.10 (I9637) carried `ib_mark_range_checked` onto each position row;
+        2.9 added `integrity.mark_check_coverage`; 2.8 (I9627) added
+        `integrity.nav_mark_correction`."""
+        assert SCHEMA_VERSION == "2.11"
 
     def test_payload_shape(self):
         conn = _conn()
@@ -498,7 +501,7 @@ class TestBuildEodReport:
             data_warnings=["NAV reconciliation gap: $-2,404 unattributed"],
             generated_at="2026-06-22T20:10:00Z",
         )
-        assert report["schema_version"] == "2.10"
+        assert report["schema_version"] == "2.11"
         # Schema 2.4 (alpha-engine-config-I8188): named transaction-cost lines
         # and the integrity-gate verdict reach the artifact. Before this the
         # only cost figure anywhere in the P&L path was the portfolio
@@ -699,3 +702,57 @@ class TestPerPositionMarkStampTravels:
                          "ib_mark_outside_range": True})
         assert row["ib_mark_range_checked"] is True
         assert row["ib_mark_outside_range"] is True
+
+
+class TestCorrectedMarkTravelsToTheArtifact:
+    """Schema 2.11 (alpha-engine-config-I10048).
+
+    On a correction day the position's ``ib_market_value`` is the mark the
+    headline NAV was struck on, not the broker's. The artifact has to carry
+    BOTH, or a reader cannot tell a repaired row from one that was never
+    wrong — and the day-after classifier cannot tie the per-name attribution
+    to the NAV series.
+
+    Live instance: HOOD 2026-09-02, broker MV $101,426.43 repriced to the
+    settled MV $99,821.67, a −$1,604.76 repair.
+    """
+
+    def _row(self, pos):
+        report = build_eod_report(
+            run_date="2026-09-02", nav=1_025_649.99, prior_nav=None,
+            daily_return=None, spy_return=None, alpha=None,
+            positions={"HOOD": dict(pos, shares=909)},
+            prior_positions={}, conn=_conn(),
+        )
+        return next(r for r in report["positions"] if r["ticker"] == "HOOD")
+
+    def test_corrected_row_carries_both_marks_and_says_it_was_repaired(self):
+        row = self._row({
+            "market_value": 99_821.67,
+            "ib_market_value": 99_821.67,
+            "ib_market_value_raw": 101_426.43,
+            "ib_mark_correction_usd": -1_604.76,
+            "ib_mark_corrected": True,
+            "ib_mark_range_checked": True,
+            "ib_mark_outside_range": True,
+            "ib_mark_range_error_usd": 1_604.76,
+        })
+        assert row["ib_market_value"] == pytest.approx(99_821.67)
+        assert row["ib_market_value_raw"] == pytest.approx(101_426.43)
+        assert row["ib_mark_correction_usd"] == pytest.approx(-1_604.76)
+        assert row["ib_mark_corrected"] is True
+        # The evidence the mark WAS wrong survives the repair — stamped by
+        # the detector BEFORE the correction and never re-evaluated.
+        assert row["ib_mark_outside_range"] is True
+        assert row["ib_mark_range_error_usd"] == pytest.approx(1_604.76)
+
+    def test_an_uncorrected_row_says_so_rather_than_going_silent(self):
+        row = self._row({
+            "market_value": 99_821.67,
+            "ib_market_value": 101_426.43,
+            "ib_mark_range_checked": True,
+            "ib_mark_outside_range": False,
+        })
+        assert row["ib_mark_corrected"] is False
+        assert row["ib_market_value_raw"] is None
+        assert row["ib_mark_correction_usd"] is None
