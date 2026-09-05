@@ -104,20 +104,48 @@ def fetch_ex_dividends(
     cash-basis: the ex-date accrual and the cash arrival are different days,
     and the accrual ledger needs to know when to release the receivable.
 
-    ``available`` is False when the fetch could not be performed at all (no
-    ``POLYGON_API_KEY``, client construction failure, or every per-ticker call
+    ONE date-filtered Polygon query (``/v3/reference/dividends?
+    ex_dividend_date.gte=<prior_date>&ex_dividend_date.lte=<run_date>``)
+    returns every dividend going ex in the window across all tickers; the held
+    book is intersected against it locally. Inject ``client`` (a
+    ``PolygonClient``-shaped object exposing ``get_dividends_for_window``) in
+    tests.
+
+    **Why the per-ticker loop is gone** (alpha-engine-config-I10047). The
+    client is constructed with ``calls_per_min=5`` (Polygon free tier) and the
+    loop issued one ``get_dividends`` per held ticker — thirteen per run date
+    (12 held names + SPY). A postclose runs two dates back to back, so on
+    2026-09-04 that was 28 requests in ~5 minutes: the log carries 16 ``Rate
+    limited (429)`` lines, CRUS and MU each failed after three retries and were
+    recorded as having no ex-dividend, and the split query that followed failed
+    outright. The varying names across runs are the signature of a rate
+    limiter, not of a per-ticker data problem. This mirrors what
+    ``reconciliation_audit.fetch_same_day_split_ratios`` did for splits (I9646).
+
+    ``available`` is False when the window query could not be performed at all
+    (no ``POLYGON_API_KEY``, client construction failure, or the query
     failing). It is NOT False for "no dividends today" — an empty dict with
     ``available=True`` is a real, positive statement that nothing went ex.
     Collapsing those two into the same ``{}`` is precisely the defect this
     module exists to fix, so they are returned as distinct facts and the caller
     persists ``dividend_accrual_available`` alongside ``dividend_usd``.
 
+    **Failure is ALL-OR-NOTHING**, as it is for splits after I9630. One query
+    covers the whole book, so either it succeeded — in which case every held
+    name is established, a name's absence from the result being a POSITIVE
+    finding of no ex-dividend — or it failed, in which case NO name is, and the
+    warning says so naming the date and the count. There is no longer a
+    per-ticker "treating as no ex-dividend" path: that was the shape that let
+    two rate-limited names be silently scored as non-payers.
+
     Deviation from the fail-loud default is deliberate and bounded (a) the
-    failure swallowed is a third-party HTTP/credential error on the dividend
-    feed; (b) the primary deliverable — the NAV row, the positions snapshot and
-    the EOD email — survives, and hard-failing the trading day's reconciliation
-    on a vendor outage would be a worse trade than carrying a named
-    degradation; (c) the recording surface is threefold: the returned
+    failure swallowed is a third-party HTTP/credential/rate-limit error on the
+    single dividend-window query, whose consequence is that NO held ticker's
+    ex-dividend status is established for this date — never a subset silently
+    rendered as clean; (b) the primary deliverable — the NAV row, the positions
+    snapshot and the EOD email — survives, and hard-failing the trading day's
+    reconciliation on a vendor outage would be a worse trade than carrying a
+    named degradation; (c) the recording surface is threefold: the returned
     ``warning`` (→ ``data_warnings`` → EOD email + console), the persisted
     ``dividend_accrual_available=0`` column, and the residual bound in
     ``pnl_integrity`` — with the accrual absent, the dividend sits back in the
@@ -145,62 +173,70 @@ def fetch_ex_dividends(
                 "unattributed residual for this session."
             )
 
+    # The lower bound is sent to Polygon as an INCLUSIVE `.gte` because the
+    # endpoint has no exclusive form; `_in_interval` re-applies the half-open
+    # `(prior_date, run_date]` edge locally, so a dividend going ex exactly on
+    # `prior_date` — already counted in the prior session — is dropped here.
+    window_start = prior_date or run_date
+    try:
+        events = client.get_dividends_for_window(window_start, run_date)
+    except Exception:  # noqa: BLE001 — see the recording surface in the docstring
+        # EVERY held ticker is unestablished, not zero of them. One query
+        # covers the whole book, so its failure leaves the whole book
+        # unmeasured (alpha-engine-config-I10047).
+        logger.error(
+            "[dividends] ex-dividend window query failed for (%s, %s] "
+            "(rate limit, HTTP or credential error) — NO held ticker's "
+            "ex-dividend status was established for %s; all %d name(s) stay "
+            "inside the bounded residual and dividend_accrual_available is "
+            "recorded False", prior_date, run_date, run_date, len(tickers),
+            exc_info=True,
+        )
+        return {}, {}, False, (
+            f"Dividend accrual unavailable for {run_date}: the Polygon "
+            f"ex-dividend window query for ({prior_date}, {run_date}] failed, "
+            f"so NO held ticker's ex-dividend status was established for "
+            f"{run_date} ({len(tickers)} name(s): {', '.join(tickers)}) — "
+            "dividends remain inside the unattributed residual for this "
+            "session."
+        )
+
+    held = set(tickers)
     out: dict[str, float] = {}
     pay_dates: dict[str, str | None] = {}
-    n_failed = 0
-    for ticker in tickers:
-        try:
-            events = client.get_dividends(ticker, start=prior_date or run_date)
-        except Exception:  # noqa: BLE001 — per-ticker isolation
-            n_failed += 1
-            logger.warning(
-                "[dividends] dividend fetch failed for %s; treating as no "
-                "ex-dividend on %s", ticker, run_date, exc_info=True,
-            )
+    for ev in events or []:
+        ticker = ev.get("ticker")
+        if ticker not in held:
             continue
-        total = 0.0
-        pay_date: str | None = None
-        for ev in events or []:
-            ex_date = ev.get("ex_dividend_date")
-            amount = ev.get("cash_amount")
-            if not ex_date or amount in (None, ""):
-                continue
-            if not _in_interval(str(ex_date), prior_date, run_date):
-                continue
-            try:
-                amount = float(amount)
-            except (TypeError, ValueError):
-                continue
-            if amount > 0:
-                total += amount
-                # Two distributions in one interval is rare (a special
-                # alongside a regular); the LATER pay date wins so the
-                # receivable is released once, late rather than early.
-                ev_pay = ev.get("pay_date") or None
-                if ev_pay and (pay_date is None or str(ev_pay) > pay_date):
-                    pay_date = str(ev_pay)
-        if total > 0:
-            out[ticker] = total
-            pay_dates[ticker] = pay_date
+        ex_date = ev.get("ex_dividend_date")
+        amount = ev.get("cash_amount")
+        if not ex_date or amount in (None, ""):
+            continue
+        if not _in_interval(str(ex_date), prior_date, run_date):
+            continue
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        out[ticker] = out.get(ticker, 0.0) + amount
+        # Two distributions in one interval is rare (a special alongside a
+        # regular); the LATER pay date wins so the receivable is released
+        # once, late rather than early.
+        ev_pay = ev.get("pay_date") or None
+        prior_pay = pay_dates.get(ticker)
+        if ev_pay and (prior_pay is None or str(ev_pay) > prior_pay):
+            pay_dates[ticker] = str(ev_pay)
+        else:
+            pay_dates.setdefault(ticker, prior_pay)
 
-    if n_failed == len(tickers):
-        return {}, {}, False, (
-            f"Dividend accrual unavailable for {run_date} (every per-ticker "
-            f"Polygon fetch failed, {n_failed}/{len(tickers)}) — dividends "
-            "remain inside the unattributed residual for this session."
-        )
-    warning = None
-    if n_failed:
-        warning = (
-            f"Dividend accrual partial for {run_date}: {n_failed}/{len(tickers)} "
-            "per-ticker Polygon fetches failed; those names' dividends remain "
-            "inside the unattributed residual."
-        )
     logger.info(
-        "[dividends] %s: %d ticker(s) went ex in (%s, %s] (%d fetch failure(s))",
-        run_date, len(out), prior_date, run_date, n_failed,
+        "[dividends] %s: %d of %d held ticker(s) went ex in (%s, %s] — "
+        "established by ONE window query",
+        run_date, len(out), len(tickers), prior_date, run_date,
     )
-    return out, pay_dates, True, warning
+    return out, pay_dates, True, None
 
 
 def accrue_position_dividends(

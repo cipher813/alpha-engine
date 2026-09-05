@@ -20,25 +20,31 @@ from executor.dividends import (
 
 
 class _FakeClient:
-    """Minimal PolygonClient stand-in: ``get_dividends(ticker, start=...)``."""
+    """Minimal PolygonClient stand-in: ``get_dividends_for_window(start, end)``.
 
-    def __init__(self, by_ticker, fail=()):
-        self._by_ticker = by_ticker
-        self._fail = set(fail)
+    ONE method, taking a window and no ticker — the shape the fix moved to
+    (alpha-engine-config-I10047). ``calls`` records every transport call, so a
+    test can assert the whole book costs exactly one.
+    """
+
+    def __init__(self, rows=(), fail=False):
+        self._rows = list(rows)
+        self._fail = fail
         self.calls = []
 
-    def get_dividends(self, ticker, start=None, limit=1000):
-        self.calls.append((ticker, start))
-        if ticker in self._fail:
-            raise RuntimeError("polygon 500")
-        return self._by_ticker.get(ticker, [])
+    def get_dividends_for_window(self, start, end, limit=1000):
+        self.calls.append((start, end))
+        if self._fail:
+            raise RuntimeError("polygon 429")
+        return list(self._rows)
 
 
 class TestFetch:
     def test_an_ex_date_in_the_interval_is_picked_up(self):
-        client = _FakeClient({
-            "LMT": [{"ex_dividend_date": "2026-08-21", "cash_amount": 3.30}],
-        })
+        client = _FakeClient([
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": 3.30},
+        ])
         out, pay_dates, available, warning = fetch_ex_dividends(
             ["LMT"], "2026-08-21", prior_date="2026-08-20", client=client,
         )
@@ -47,27 +53,36 @@ class TestFetch:
         assert available is True
         assert warning is None
 
+    def test_the_window_query_bounds_are_the_reconciliation_interval(self):
+        client = _FakeClient()
+        fetch_ex_dividends(["LMT"], "2026-08-21", prior_date="2026-08-20",
+                           client=client)
+        assert client.calls == [("2026-08-20", "2026-08-21")]
+
+    def test_no_prior_date_queries_the_run_date_alone(self):
+        client = _FakeClient()
+        fetch_ex_dividends(["LMT"], "2026-08-21", client=client)
+        assert client.calls == [("2026-08-21", "2026-08-21")]
+
     def test_the_pay_date_is_carried_for_the_receivable(self):
         """NAV is cash-basis on this account, so the accrual ledger has to know
         when the cash actually lands or the receivable never releases."""
-        client = _FakeClient({
-            "LMT": [{"ex_dividend_date": "2026-08-21", "cash_amount": 3.30,
-                     "pay_date": "2026-09-26"}],
-        })
+        client = _FakeClient([
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": 3.30, "pay_date": "2026-09-26"},
+        ])
         _out, pay_dates, _a, _w = fetch_ex_dividends(
             ["LMT"], "2026-08-21", prior_date="2026-08-20", client=client,
         )
         assert pay_dates["LMT"] == "2026-09-26"
 
     def test_two_distributions_in_one_interval_take_the_later_pay_date(self):
-        client = _FakeClient({
-            "LMT": [
-                {"ex_dividend_date": "2026-08-21", "cash_amount": 3.30,
-                 "pay_date": "2026-09-26"},
-                {"ex_dividend_date": "2026-08-21", "cash_amount": 1.00,
-                 "pay_date": "2026-10-02"},
-            ],
-        })
+        client = _FakeClient([
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": 3.30, "pay_date": "2026-09-26"},
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": 1.00, "pay_date": "2026-10-02"},
+        ])
         out, pay_dates, _a, _w = fetch_ex_dividends(
             ["LMT"], "2026-08-21", prior_date="2026-08-20", client=client,
         )
@@ -75,12 +90,15 @@ class TestFetch:
         assert pay_dates["LMT"] == "2026-10-02"
 
     def test_a_dividend_outside_the_interval_is_ignored(self):
-        client = _FakeClient({
-            "LMT": [
-                {"ex_dividend_date": "2026-08-20", "cash_amount": 3.30},
-                {"ex_dividend_date": "2026-08-25", "cash_amount": 3.30},
-            ],
-        })
+        """The endpoint's `.gte` bound is INCLUSIVE, so a dividend going ex on
+        `prior_date` — already counted in the prior session — comes back in the
+        payload and must be dropped by the local half-open filter."""
+        client = _FakeClient([
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-20",
+             "cash_amount": 3.30},
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-25",
+             "cash_amount": 3.30},
+        ])
         out, _pay, available, _ = fetch_ex_dividends(
             ["LMT"], "2026-08-21", prior_date="2026-08-20", client=client,
         )
@@ -91,61 +109,101 @@ class TestFetch:
         """The NAV baseline spans from the prior persisted eod_pnl row, so the
         dividend leg must span the same window or the two sides of the
         reconciliation measure different intervals."""
-        client = _FakeClient({
-            "CTAS": [{"ex_dividend_date": "2026-06-24", "cash_amount": 1.56}],
-        })
+        client = _FakeClient([
+            {"ticker": "CTAS", "ex_dividend_date": "2026-06-24",
+             "cash_amount": 1.56},
+        ])
         out, _pay, _, _ = fetch_ex_dividends(
             ["CTAS"], "2026-06-25", prior_date="2026-06-23", client=client,
         )
         assert out == {"CTAS": 1.56}
+        assert client.calls == [("2026-06-23", "2026-06-25")]
 
-    def test_spy_is_always_fetched_for_the_benchmark_leg(self):
-        client = _FakeClient({})
-        fetch_ex_dividends(["LMT"], "2026-08-21", prior_date="2026-08-20",
-                           client=client)
-        assert SPY_TICKER in {t for t, _ in client.calls}
+    def test_a_ticker_not_held_is_not_accrued(self):
+        """The window query returns EVERY ticker going ex that day; the book is
+        intersected locally."""
+        client = _FakeClient([
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": 3.30},
+            {"ticker": "XOM", "ex_dividend_date": "2026-08-21",
+             "cash_amount": 0.99},
+        ])
+        out, _pay, _, _ = fetch_ex_dividends(
+            ["LMT"], "2026-08-21", prior_date="2026-08-20", client=client,
+        )
+        assert out == {"LMT": 3.30}
+
+    def test_spy_is_included_for_the_benchmark_leg(self):
+        client = _FakeClient([
+            {"ticker": SPY_TICKER, "ex_dividend_date": "2026-08-21",
+             "cash_amount": 1.80},
+        ])
+        out, _pay, _, _ = fetch_ex_dividends(
+            ["LMT"], "2026-08-21", prior_date="2026-08-20", client=client,
+        )
+        assert out == {SPY_TICKER: 1.80}
+
+    def test_a_twelve_name_book_costs_exactly_one_transport_call(self):
+        """The defect (alpha-engine-config-I10047): thirteen calls per run date
+        against a 5-calls/min budget, twice per postclose."""
+        book = ["AMD", "AXP", "BRO", "COST", "CRUS", "CTAS", "FAST", "LMT",
+                "MA", "MU", "NVDA", "ORCL"]
+        client = _FakeClient([
+            {"ticker": "LMT", "ex_dividend_date": "2026-09-04",
+             "cash_amount": 3.30, "pay_date": "2026-09-26"},
+            {"ticker": SPY_TICKER, "ex_dividend_date": "2026-09-04",
+             "cash_amount": 1.80, "pay_date": "2026-09-30"},
+        ])
+        out, pay_dates, available, warning = fetch_ex_dividends(
+            book, "2026-09-04", prior_date="2026-09-03", client=client,
+        )
+        assert len(client.calls) == 1
+        assert out == {"LMT": 3.30, SPY_TICKER: 1.80}
+        assert pay_dates == {"LMT": "2026-09-26", SPY_TICKER: "2026-09-30"}
+        assert available is True
+        assert warning is None
 
     def test_no_dividends_today_is_available_true(self):
         """An empty result and an unavailable feed are DIFFERENT facts —
         collapsing them is exactly the defect being fixed."""
         out, _pay, available, warning = fetch_ex_dividends(
-            ["AMD"], "2026-08-21", prior_date="2026-08-20", client=_FakeClient({}),
+            ["AMD"], "2026-08-21", prior_date="2026-08-20", client=_FakeClient(),
         )
         assert out == {}
         assert available is True
         assert warning is None
 
-    def test_total_feed_failure_is_available_false_with_a_warning(self):
-        client = _FakeClient({}, fail={"AMD", SPY_TICKER})
-        out, _pay, available, warning = fetch_ex_dividends(
-            ["AMD"], "2026-08-21", prior_date="2026-08-20", client=client,
+    def test_query_failure_is_all_or_nothing_and_names_the_date(self):
+        """No per-ticker "treating as no ex-dividend": one query covers the
+        whole book, so its failure leaves the whole book unmeasured."""
+        book = ["AMD", "CRUS", "MU"]
+        client = _FakeClient(fail=True)
+        out, pay_dates, available, warning = fetch_ex_dividends(
+            book, "2026-09-04", prior_date="2026-09-03", client=client,
         )
         assert out == {}
+        assert pay_dates == {}
         assert available is False
+        assert "2026-09-04" in warning
+        assert "NO held ticker" in warning
+        assert "4 name(s)" in warning  # the book plus SPY
         assert "unattributed residual" in warning
 
-    def test_partial_failure_is_named_not_swallowed(self):
-        client = _FakeClient(
-            {SPY_TICKER: [{"ex_dividend_date": "2026-08-21", "cash_amount": 1.80}]},
-            fail={"AMD"},
-        )
-        out, _pay, available, warning = fetch_ex_dividends(
-            ["AMD"], "2026-08-21", prior_date="2026-08-20", client=client,
-        )
-        assert out == {SPY_TICKER: 1.80}
-        assert available is True
-        assert "partial" in warning.lower()
-
     def test_malformed_rows_are_skipped(self):
-        client = _FakeClient({
-            "LMT": [
-                {"ex_dividend_date": None, "cash_amount": 3.30},
-                {"ex_dividend_date": "2026-08-21", "cash_amount": None},
-                {"ex_dividend_date": "2026-08-21", "cash_amount": "x"},
-                {"ex_dividend_date": "2026-08-21", "cash_amount": -1.0},
-                {"ex_dividend_date": "2026-08-21", "cash_amount": 3.30},
-            ],
-        })
+        client = _FakeClient([
+            {"ticker": "LMT", "ex_dividend_date": None, "cash_amount": 3.30},
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": None},
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": "x"},
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": -1.0},
+            {"ticker": None, "ex_dividend_date": "2026-08-21",
+             "cash_amount": 3.30},
+            {"ex_dividend_date": "2026-08-21", "cash_amount": 3.30},
+            {"ticker": "LMT", "ex_dividend_date": "2026-08-21",
+             "cash_amount": 3.30},
+        ])
         out, _pay, _, _ = fetch_ex_dividends(
             ["LMT"], "2026-08-21", prior_date="2026-08-20", client=client,
         )

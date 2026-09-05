@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 
@@ -34,10 +35,98 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.polygon.io"
 _MAX_BARS_PER_REQUEST = 50_000  # polygon limit param max
+_WINDOW_SECONDS = 60.0  # Polygon's free-tier budget is per rolling minute
 
 
 class PolygonRateLimitError(Exception):
     """Raised when rate limit is exhausted and caller should backoff."""
+
+
+class PolygonAccessError(Exception):
+    """Raised when Polygon refuses the request (403) on a path whose caller
+    cannot distinguish "not authorized" from "nothing to report"."""
+
+
+# ── Shared per-API-key rate limiter ───────────────────────────────────────
+#
+# WHY THIS IS MODULE-LEVEL (alpha-engine-config-I10047). The budget Polygon
+# meters is per API KEY, not per client object. Every call site in this repo
+# constructs its own ``PolygonClient()`` — ``executor/dividends.py``,
+# ``executor/reconciliation_audit.py`` and three sites in
+# ``executor/pnl_measurement_backfill.py`` — and each carried its own
+# ``deque`` of call timestamps, so the split client began with an empty window
+# immediately after the dividend client had spent the whole minute's budget.
+# Measured on 2026-09-04: a two-date postclose issued 28 requests in ~5 minutes
+# against ``calls_per_min=5`` and logged 16 ``Rate limited (429)`` lines, after
+# which two dividend fetches and the whole split query failed.
+#
+# One window per key, shared by every instance in the process, is what makes
+# the limiter's view match the server's. It is keyed rather than a plain
+# singleton so a second key (a paid tier, a test key) is metered separately.
+
+
+class _SharedWindow:
+    """A sliding 60-second call window shared by every client on one API key.
+
+    Thread-safe: :meth:`acquire` reserves its slot under the lock, so two
+    threads cannot both observe the same free slot and take it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._call_times: deque[float] = deque()
+
+    def _purge(self, now: float) -> None:
+        while self._call_times and now - self._call_times[0] > _WINDOW_SECONDS:
+            self._call_times.popleft()
+
+    def seconds_until_slot(self, limit: int) -> float:
+        """Seconds until the window has room for one more call (0.0 if now)."""
+        with self._lock:
+            now = time.monotonic()
+            self._purge(now)
+            if len(self._call_times) < limit:
+                return 0.0
+            return _WINDOW_SECONDS - (now - self._call_times[0]) + 0.5
+
+    def acquire(self, limit: int) -> None:
+        """Block until a slot is free, then record this call in the window."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._purge(now)
+                if len(self._call_times) < limit:
+                    self._call_times.append(now)
+                    return
+                wait = _WINDOW_SECONDS - (now - self._call_times[0]) + 0.5
+            logger.debug("Rate limit: waiting %.1fs for a shared slot", wait)
+            time.sleep(wait)
+
+    def depth(self) -> int:
+        """Number of calls currently inside the window (diagnostics/tests)."""
+        with self._lock:
+            self._purge(time.monotonic())
+            return len(self._call_times)
+
+
+_windows: dict[str, _SharedWindow] = {}
+_windows_lock = threading.Lock()
+
+
+def shared_window(api_key: str) -> _SharedWindow:
+    """The process-wide call window for ``api_key`` (created on first use)."""
+    with _windows_lock:
+        window = _windows.get(api_key)
+        if window is None:
+            window = _SharedWindow()
+            _windows[api_key] = window
+        return window
+
+
+def reset_shared_windows() -> None:
+    """Drop every shared window. For test isolation only."""
+    with _windows_lock:
+        _windows.clear()
 
 
 class PolygonClient:
@@ -48,28 +137,22 @@ class PolygonClient:
         if not self._api_key:
             raise ValueError("POLYGON_API_KEY not set")
         self._calls_per_min = calls_per_min
-        self._call_times: deque[float] = deque()
+        # Shared with every other client on this key in this process — see
+        # the _SharedWindow comment above (alpha-engine-config-I10047).
+        self._window = shared_window(self._api_key)
         self._session = requests.Session()
         self._session.params = {"apiKey": self._api_key}  # type: ignore[assignment]
 
     # ── Rate limiter ──────────────────────────────────────────────────────
 
     def _wait_for_slot(self) -> None:
-        """Block until a rate limit slot is available."""
-        now = time.monotonic()
-        window = 60.0  # 1 minute window
-        # Purge old timestamps
-        while self._call_times and now - self._call_times[0] > window:
-            self._call_times.popleft()
-        if len(self._call_times) >= self._calls_per_min:
-            wait = window - (now - self._call_times[0]) + 0.5
-            logger.debug("Rate limit: waiting %.1fs", wait)
-            time.sleep(wait)
-            # Purge again after sleep
-            now = time.monotonic()
-            while self._call_times and now - self._call_times[0] > window:
-                self._call_times.popleft()
-        self._call_times.append(time.monotonic())
+        """Block until a rate limit slot is available in the SHARED window.
+
+        ``calls_per_min`` keeps its per-instance meaning — it is the ceiling
+        this client will let the shared window reach — but the timestamps it
+        counts are every call made on this API key in this process.
+        """
+        self._window.acquire(self._calls_per_min)
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         """Make a rate-limited GET request. Handles 429 with retry."""
@@ -78,10 +161,22 @@ class PolygonClient:
         for _attempt in range(3):
             resp = self._session.get(url, params=params or {}, timeout=30)
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 15))
-                logger.warning("Rate limited (429), waiting %ds", retry_after)
-                time.sleep(retry_after)
-                self._call_times.clear()  # Reset window after forced wait
+                retry_after = float(resp.headers.get("Retry-After", 15))
+                # Sleep the LONGER of Retry-After and the time until our own
+                # window frees a slot, and do NOT clear the window: the old
+                # code cleared it and retried into a 60s server window it had
+                # just forgotten, so three 15s retries never drained a window
+                # five calls deep (alpha-engine-config-I10047).
+                window_wait = self._window.seconds_until_slot(self._calls_per_min)
+                wait = max(retry_after, window_wait)
+                logger.warning(
+                    "Rate limited (429), waiting %.1fs (Retry-After=%.0fs, "
+                    "shared window frees a slot in %.1fs)",
+                    wait, retry_after, window_wait,
+                )
+                time.sleep(wait)
+                # The retry is another metered call — book it in the window.
+                self._wait_for_slot()
                 continue
             if resp.status_code == 403:
                 data = resp.json()
@@ -180,6 +275,62 @@ class PolygonClient:
             all_dividends.extend(resp.get("results", []))
             next_url = resp.get("next_url")
 
+        return all_dividends
+
+    def get_dividends_for_window(
+        self,
+        start: str,
+        end: str,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Fetch EVERY dividend going ex in ``[start, end]``, across all tickers.
+
+        One ``/v3/reference/dividends?ex_dividend_date.gte=<start>&
+        ex_dividend_date.lte=<end>`` call (plus any ``next_url`` pages) rather
+        than one call per held ticker. Returns the raw Polygon rows — each
+        carries ``ticker``, ``ex_dividend_date``, ``cash_amount`` and
+        ``pay_date`` — with the same semantics as :meth:`get_dividends`.
+
+        **Why this exists** (alpha-engine-config-I10047). The per-ticker loop in
+        ``executor/dividends.py`` issued 13 calls per run date (12 held names +
+        SPY) against a 5-calls/min free-tier budget; a two-date postclose on
+        2026-09-04 therefore issued 28 requests in ~5 minutes, logged 16
+        ``Rate limited (429)`` lines and left CRUS and MU unmeasured. The book
+        is intersected against this result locally, so the cost is one call
+        regardless of how many positions are held. This is the exact shape
+        :meth:`get_splits_for_date` took for the same reason (I9646).
+
+        Note the bounds are a RANGE, not the exact-match filter the splits
+        endpoint takes: the dividend interval the caller reconciles over is
+        ``(prior_date, run_date]``, which can span a skipped session, so both
+        ``.gte`` and ``.lte`` are sent and the half-open lower edge is applied
+        locally by ``executor.dividends._in_interval``.
+
+        Raises (``PolygonRateLimitError``, ``PolygonAccessError``, HTTP error)
+        rather than returning an empty list it could not measure. An empty
+        return from this method is a POSITIVE finding that nothing went ex in
+        the window; the caller is entitled to treat it as one.
+        """
+        params: dict = {
+            "ex_dividend_date.gte": start,
+            "ex_dividend_date.lte": end,
+            "limit": limit,
+            "sort": "ex_dividend_date",
+        }
+        data = self._get("/v3/reference/dividends", params=params)
+        if data.get("status") == "FORBIDDEN":
+            # _get renders a 403 as an empty result set, which on this path is
+            # indistinguishable from "no dividends" — refuse rather than guess.
+            raise PolygonAccessError(
+                f"Polygon refused /v3/reference/dividends for [{start}, {end}] "
+                "(403) — the window is UNMEASURED, not empty"
+            )
+        all_dividends: list[dict] = list(data.get("results", []))
+        next_url: str | None = data.get("next_url")
+        while next_url:
+            resp = self._get_raw_url(next_url)
+            all_dividends.extend(resp.get("results", []))
+            next_url = resp.get("next_url")
         return all_dividends
 
     def get_splits(
